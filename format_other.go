@@ -7,9 +7,9 @@ package hfsplus
 
 import "fmt"
 
-// formatImage on non-darwin platforms reports that the best-effort Mkfs needs
-// macOS tooling (hdiutil). A from-scratch pure-Go formatter is not yet
-// implemented.
-func formatImage(_ string, _ int64, _ FormatConfig) error {
-	return fmt.Errorf("%w: pure-Go Mkfs not yet implemented (darwin uses hdiutil)", ErrUnsupported)
+// formatImageHdiutil on non-darwin platforms reports that the hdiutil escape
+// hatch needs macOS. The primary Format uses the cross-platform pure-Go Mkfs,
+// so this only affects the optional FormatAppleDmg alternative.
+func formatImageHdiutil(_ string, _ int64, _ FormatConfig) error {
+	return fmt.Errorf("%w: FormatAppleDmg needs macOS hdiutil; use Format (pure-Go) instead", ErrUnsupported)
 }

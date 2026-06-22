@@ -10,7 +10,13 @@ import (
 	"strings"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/safeio"
 )
+
+// maxImageBytes caps the in-memory image a writable open will allocate. HFS+
+// volumes addressed here are disk-image sized; 64 GiB is a generous ceiling
+// that still defeats a bogus stat size triggering a wild allocation.
+const maxImageBytes = 64 << 30
 
 // Unix mode type bits used when synthesising a Stat mode for entries whose
 // BSD info is absent.
@@ -30,7 +36,12 @@ const (
 	ftSymlink = 7
 )
 
-// Volume is an opened, read-only HFS+ (or HFSX) volume.
+// Volume is an opened HFS+ (or HFSX) volume. When opened read-only (Open /
+// OpenFile) the mutating methods return ErrReadOnly. When opened writable
+// (OpenWritable / OpenFileWritable / Format) the whole image is held in an
+// in-memory byte slice that the write path edits in place; Sync (and the
+// mutators, which Sync implicitly) flush the bytes back to the backing
+// io.WriterAt when one is present.
 type Volume struct {
 	rs          io.ReaderAt
 	size        int64
@@ -38,7 +49,17 @@ type Volume struct {
 	catalogTree *btree
 	extentsTree *btree
 	closer      io.Closer
+
+	// img is the full mutable image. Non-nil only for writable volumes; the
+	// write engine edits it in place and rebuilds catalogTree/vh from it.
+	img []byte
+	// wa is the optional backing store flushed by Sync. nil for purely
+	// in-memory writable volumes (OpenWritable on a []byte).
+	wa io.WriterAt
 }
+
+// writable reports whether the volume was opened for writing.
+func (v *Volume) writable() bool { return v.img != nil }
 
 var _ filesystem.Filesystem = (*Volume)(nil)
 
@@ -89,6 +110,121 @@ func OpenFile(path string) (*Volume, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// OpenWritable opens an HFS+ image held entirely in img for read/write. The
+// volume edits img in place; callers can retrieve the mutated bytes with
+// Bytes() or, if wa is non-nil, flush them with Sync. Pass wa = nil for a
+// purely in-memory writable volume.
+func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
+	v, err := Open(bytesReaderAt(img), int64(len(img)))
+	if err != nil {
+		return nil, err
+	}
+	v.img = img
+	v.wa = wa
+	// Rebind the reader to the in-memory image so the write path sees its own
+	// edits immediately.
+	v.rs = bytesReaderAt(img)
+	return v, nil
+}
+
+// OpenFileWritable opens the image at path for read/write. The whole image is
+// read into memory; mutations are flushed back to the file by Sync (and
+// implicitly by every mutator).
+func OpenFileWritable(path string) (*Volume, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("hfsplus: open %s: %w", path, err)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("hfsplus: stat %s: %w", path, err)
+	}
+	// Bound the in-memory image allocation against a generous ceiling so a
+	// bogus stat size cannot trigger a wild allocation (safeio class A).
+	img, err := safeio.MakeBytes(st.Size(), maxImageBytes)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("hfsplus: image size %d: %w", st.Size(), err)
+	}
+	if _, err := io.ReadFull(f, img); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("hfsplus: read %s: %w", path, err)
+	}
+	v, err := OpenWritable(img, &fileWriterAt{f})
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	v.closer = f
+	return v, nil
+}
+
+// Bytes returns the current (possibly mutated) image bytes for a writable
+// volume, or nil for a read-only one. The slice aliases the volume's internal
+// buffer; copy it if you need a stable snapshot.
+func (v *Volume) Bytes() []byte { return v.img }
+
+// Sync flushes the in-memory image back to the backing store, if any. It is a
+// no-op for read-only or purely in-memory volumes.
+func (v *Volume) Sync() error {
+	if v.wa == nil || v.img == nil {
+		return nil
+	}
+	if _, err := v.wa.WriteAt(v.img, 0); err != nil {
+		return fmt.Errorf("hfsplus: sync: %w", err)
+	}
+	if s, ok := v.wa.(interface{ Sync() error }); ok {
+		return s.Sync()
+	}
+	return nil
+}
+
+// reopen rebuilds the parsed view (volume header + catalog/extents trees) from
+// the current image bytes after a mutation rewrote on-disk structures.
+func (v *Volume) reopen() error {
+	vh, err := readVolumeHeader(v.rs)
+	if err != nil {
+		return err
+	}
+	v.vh = vh
+	v.extentsTree = nil
+	if ef := newSpecialFork(v, vh.ExtentsFile); ef.size > 0 {
+		if bt, err := openBTree(ef); err == nil {
+			v.extentsTree = bt
+		}
+	}
+	cf := newSpecialFork(v, vh.CatalogFile)
+	bt, err := openBTree(cf)
+	if err != nil {
+		return err
+	}
+	v.catalogTree = bt
+	return nil
+}
+
+// fileWriterAt adapts an *os.File to io.WriterAt with a Sync method.
+type fileWriterAt struct{ f *os.File }
+
+func (w *fileWriterAt) WriteAt(p []byte, off int64) (int, error) { return w.f.WriteAt(p, off) }
+func (w *fileWriterAt) Sync() error                              { return w.f.Sync() }
+
+// bytesReaderAt is a minimal io.ReaderAt over a byte slice (avoids importing
+// bytes for a one-method shim and lets the writable volume re-bind to a live
+// image buffer).
+type bytesReaderAt []byte
+
+func (b bytesReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(b)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 // VolumeHeader exposes the decoded volume header (owned by Volume).
@@ -281,10 +417,8 @@ const kFileFlagCompressed = 0x0020
 
 func isCompressed(flags uint16) bool { return flags&kFileFlagCompressed != 0 }
 
-// --- Mutating methods: the reader is read-only. ---
-
-func (v *Volume) WriteFile(string, []byte, os.FileMode) error { return ErrReadOnly }
-func (v *Volume) MkDir(string, os.FileMode) error             { return ErrReadOnly }
-func (v *Volume) DeleteFile(string) error                     { return ErrReadOnly }
-func (v *Volume) DeleteDir(string) error                      { return ErrReadOnly }
-func (v *Volume) Rename(string, string) error                 { return ErrReadOnly }
+// Mutating methods (WriteFile, MkDir, DeleteFile, DeleteDir, Rename) plus the
+// optional Symlinker/Truncater/Labeller capabilities live in write.go. On a
+// read-only volume (Open / OpenFile) they return ErrReadOnly; on a writable
+// volume (OpenWritable / OpenFileWritable / Format) they edit the image and
+// flush via Sync.

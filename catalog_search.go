@@ -5,6 +5,7 @@ package hfsplus
 
 import (
 	"strings"
+	"unicode/utf16"
 )
 
 // compareCatalogKey orders two catalog keys: by parent CNID first, then by
@@ -23,17 +24,91 @@ func (t *btree) compareCatalogKey(a, b catalogKey) int {
 		}
 		return 1
 	}
+	au, bu := a.u16(), b.u16()
 	if t.header.KeyCompare == keyCompareBinary {
-		return compareU16(a.nameU16, b.nameU16)
+		return compareU16(au, bu)
 	}
-	an, bn := strings.ToLower(a.name), strings.ToLower(b.name)
-	if an < bn {
-		return -1
+	return fastUnicodeCompare(au, bu)
+}
+
+// u16 returns the key's raw UTF-16 code units, deriving them from the decoded
+// name when nameU16 was not populated (e.g. keys built programmatically).
+func (k catalogKey) u16() []uint16 {
+	if k.nameU16 != nil {
+		return k.nameU16
 	}
-	if an > bn {
-		return 1
+	if k.name == "" {
+		return nil
 	}
-	return 0
+	return utf16.Encode([]rune(k.name))
+}
+
+// foldU16 maps a single UTF-16 code unit through the subset of Apple's HFS+
+// case-fold table that covers every character a real volume name or filename
+// uses. It returns 0 for code units Apple treats as IGNORABLE (skipped during
+// comparison) — critically NUL (0x0000), which is why Apple orders the private
+// "\0\0\0\0HFS+ Private Data" directory as if the NUL prefix were absent.
+// Otherwise it lower-cases ASCII A–Z, Latin-1 upper-case (À–Þ except ×), and
+// the even/odd Latin Extended-A upper-case pairs; all other units fold to
+// themselves. This reproduces Apple's FastUnicodeCompare ordering — the
+// ordering fsck_hfs validates — for the practical character set without
+// embedding the full 8 KiB table.
+func foldU16(c uint16) uint16 {
+	switch {
+	case c == 0x0000:
+		return 0 // ignorable: skipped in comparison
+	case c >= 0x0001 && c <= 0x001F:
+		return c // control chars compare as themselves (not ignorable)
+	case c >= 'A' && c <= 'Z':
+		return c + 0x20
+	case c >= 0x00C0 && c <= 0x00DE && c != 0x00D7: // À–Þ except ×
+		return c + 0x20
+	case c >= 0x0100 && c <= 0x017E:
+		if c%2 == 0 {
+			return c + 1
+		}
+		return c
+	default:
+		return c
+	}
+}
+
+// nextFolded returns the next non-ignorable folded unit from s starting at *i,
+// advancing *i past any ignorable (fold==0) units. ok is false at end of input.
+func nextFolded(s []uint16, i *int) (uint16, bool) {
+	for *i < len(s) {
+		f := foldU16(s[*i])
+		*i++
+		if f != 0 {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// fastUnicodeCompare orders two UTF-16 names by their folded, ignorable-skipped
+// code units, matching the HFS+ catalog case-insensitive ordering.
+func fastUnicodeCompare(a, b []uint16) int {
+	var ia, ib int
+	for {
+		ca, oka := nextFolded(a, &ia)
+		cb, okb := nextFolded(b, &ib)
+		if !oka && !okb {
+			return 0
+		}
+		if !oka {
+			return -1
+		}
+		if !okb {
+			return 1
+		}
+		if ca != cb {
+			if ca < cb {
+				return -1
+			}
+			return 1
+		}
+	}
 }
 
 // compareU16 compares two UTF-16 code-unit slices lexicographically.

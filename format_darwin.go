@@ -12,9 +12,11 @@ import (
 	"strings"
 )
 
-// formatImage creates a raw HFS+ image via hdiutil (layout NONE → a bare
-// volume with the header at offset 1024, exactly what Open expects).
-func formatImage(path string, sizeBytes int64, cfg FormatConfig) error {
+// formatImageHdiutil creates a raw HFS+ image via hdiutil (layout NONE → a
+// bare volume with the header at offset 1024, exactly what Open expects). It
+// backs the optional FormatAppleDmg escape hatch; the primary Format is the
+// pure-Go Mkfs.
+func formatImageHdiutil(path string, sizeBytes int64, cfg FormatConfig) error {
 	label := cfg.Label
 	if label == "" {
 		label = "GOTEST"

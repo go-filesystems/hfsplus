@@ -1,8 +1,8 @@
 // Copyright (c) 2026, go-filesystems
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package hfsplus is a pure-Go, CGO-free reader for the HFS+ (Mac OS
-// Extended) on-disk format, including its HFSX (case-sensitive) variant.
+// Package hfsplus is a pure-Go, CGO-free read/write driver for the HFS+ (Mac
+// OS Extended) on-disk format, including its HFSX (case-sensitive) variant.
 //
 // HFS+ stores every multi-byte field big-endian. The volume header lives at
 // byte offset 1024 and carries the block size, block counts, and the special
@@ -12,33 +12,54 @@
 // blocks via up to eight inline extents per fork, spilling into the
 // extents-overflow B-tree for fragmented files.
 //
-// This package implements the read path against the shared
-// github.com/go-filesystems/interface Filesystem contract: Open an image,
-// list directories, stat paths, and read file data back byte-for-byte.
+// The package implements the full shared github.com/go-filesystems/interface
+// Filesystem contract:
 //
-// Scope and honest limitations:
+//   - Open / OpenFile open a volume read-only.
+//   - OpenWritable / OpenFileWritable open it for read/write; the whole image
+//     is held in memory, mutated in place, and flushed by Sync.
+//   - Format (and the lower-level Mkfs) lay down a fresh, empty HFS+/HFSX
+//     volume in pure Go — no host tooling — that passes fsck_hfs -n clean and
+//     mounts read/write on macOS.
+//   - WriteFile, MkDir, DeleteFile, DeleteDir, Rename mutate the catalog
+//     B-tree (insert/delete with node splitting and tree-height growth),
+//     manage the allocation bitmap, and keep the volume-header counters in
+//     sync. The optional Labeller (SetLabel), Symlinker (Symlink), and
+//     Truncater (Truncate) capabilities are implemented too.
 //
-//   - Read is implemented and validated against real macOS HFS+ images
-//     (hdiutil-created). Directory listing, path lookup, Stat, and full file
-//     read (inline extents plus extents-overflow continuation) work.
-//   - Case-insensitive name comparison uses a documented simplification: a
-//     pragmatic Unicode case fold rather than Apple's full HFS+ fast
-//     case-fold table. This resolves ASCII and common Latin names; exotic
-//     case-folding corner cases may not match.
-//   - Mutating methods (WriteFile, MkDir, ...) return ErrReadOnly. A minimal
-//     Format/Mkfs producing a valid empty volume is provided best-effort and
-//     is gated/documented as such.
-//   - Journaling, hardlink (indirect-node) following, HFS+ decmpfs
-//     compression, resource forks, and the full write path are not yet
-//     implemented; see the README Status section.
+// Every write path is validated against the native macOS tooling: fsck_hfs -n
+// reports the volume clean and macOS mounts the image read/write and reads the
+// exact files and bytes the Go side wrote, in both directions (Go-formatted →
+// macOS-read and macOS-created → Go-written → macOS-read). The cross-arch,
+// big-endian (s390x) round-trip runs in pure Go on every architecture.
+//
+// Case-folding: case-insensitive name comparison implements Apple's
+// FastUnicodeCompare for the practical character set (ASCII, Latin-1, Latin
+// Extended-A, and the ignorable-NUL handling fsck requires) rather than
+// embedding the full 8 KiB fold table; exotic case-folding corner cases
+// outside that range fall back to identity ordering.
+//
+// Documented simplifications (kept honest, like the btrfs/xfs siblings):
+//
+//   - A file's data fork is stored as one contiguous run using the inline
+//     extents; the extents-overflow insert path (>8 fragments) is not
+//     implemented — such a write returns ErrUnsupported. Reading fragmented
+//     forks via the extents-overflow tree is fully supported.
+//   - Deletion frees the record/thread and its blocks but does not strictly
+//     re-merge underflowing B-tree nodes; the tree stays fsck-clean.
+//   - The catalog fork is pre-sized by the formatter; growing it past that
+//     reservation (a fragmented/relocated catalog) returns ErrNoSpace.
+//   - Journaling, decmpfs compression, resource forks, and indirect-node
+//     hardlink following are not implemented; see the README Status section.
 package hfsplus
 
 import "errors"
 
 // Sentinel errors. Compare with errors.Is so wrapped errors keep matching.
 var (
-	// ErrReadOnly is returned by every mutating method of the Filesystem
-	// contract. The HFS+ reader does not yet write through these.
+	// ErrReadOnly is returned by every mutating method when the volume was
+	// opened read-only (Open / OpenFile). Open it writable (OpenWritable /
+	// OpenFileWritable / Format) to mutate it.
 	ErrReadOnly = errors.New("hfsplus: filesystem is read-only")
 
 	// ErrBadHeader is returned when the volume header at offset 1024 lacks a
@@ -61,7 +82,18 @@ var (
 	// ErrCorrupt is returned when an on-disk structure fails a sanity check.
 	ErrCorrupt = errors.New("hfsplus: corrupt image")
 
-	// ErrUnsupported is returned for on-disk features the reader does not yet
-	// decode (e.g. compressed forks).
+	// ErrUnsupported is returned for on-disk features the driver does not yet
+	// decode/encode (e.g. compressed forks).
 	ErrUnsupported = errors.New("hfsplus: unsupported feature")
+
+	// ErrNoSpace is returned by the write path when the volume has no free
+	// allocation blocks (or no contiguous run) to satisfy a request.
+	ErrNoSpace = errors.New("hfsplus: no space left on volume")
+
+	// ErrExists is returned by mutators when the target path already exists.
+	ErrExists = errors.New("hfsplus: path already exists")
+
+	// ErrNotEmpty is returned by DeleteDir when the directory still has
+	// children.
+	ErrNotEmpty = errors.New("hfsplus: directory not empty")
 )
