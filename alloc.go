@@ -85,6 +85,57 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 	return 0, fmt.Errorf("%w: no contiguous run of %d blocks", ErrNoSpace, count)
 }
 
+// allocFragments allocates count free blocks, contiguously when a single run
+// fits, otherwise as multiple fragments (in ascending block order). It marks
+// every allocated block used and returns the runs. Returns ErrNoSpace if the
+// volume lacks count free blocks in total.
+func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
+	if count == 0 {
+		return nil, nil
+	}
+	if start, err := a.allocContiguous(count); err == nil {
+		return []extentDescriptor{{StartBlock: start, BlockCount: count}}, nil
+	}
+	// Fall back to multiple fragments: walk free runs, taking each in turn.
+	var runs []extentDescriptor
+	remaining := count
+	var runStart uint32
+	var runLen uint32
+	flush := func() {
+		if runLen > 0 {
+			for i := runStart; i < runStart+runLen; i++ {
+				a.set(i)
+			}
+			runs = append(runs, extentDescriptor{StartBlock: runStart, BlockCount: runLen})
+			remaining -= runLen
+			runLen = 0
+		}
+	}
+	for n := uint32(0); n < a.bits && remaining > 0; n++ {
+		if a.test(n) {
+			flush()
+			continue
+		}
+		if runLen == 0 {
+			runStart = n
+		}
+		runLen++
+		if runLen == remaining {
+			flush()
+			break
+		}
+	}
+	flush()
+	if remaining > 0 {
+		// Not enough total free space: roll back what we took.
+		for _, r := range runs {
+			a.freeRun(r.StartBlock, r.BlockCount)
+		}
+		return nil, fmt.Errorf("%w: need %d blocks, short by %d", ErrNoSpace, count, remaining)
+	}
+	return runs, nil
+}
+
 // freeRun clears count blocks starting at start.
 func (a *allocator) freeRun(start, count uint32) {
 	for i := start; i < start+count; i++ {

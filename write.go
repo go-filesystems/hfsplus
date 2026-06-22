@@ -36,18 +36,26 @@ type txn struct {
 	v   *Volume
 	cw  *catWriter
 	alc *allocator
+	ew  *extentsWriter
 }
 
 func (v *Volume) begin() (*txn, error) {
-	cw, err := v.newCatWriter()
-	if err != nil {
-		return nil, err
-	}
 	alc, err := v.newAllocator()
 	if err != nil {
 		return nil, err
 	}
-	return &txn{v: v, cw: cw, alc: alc}, nil
+	// The extents-overflow writer is bound first: both the catalog writer's
+	// fork-growth path and the data-fork spill path insert through it.
+	ew, err := v.newExtentsWriter(alc)
+	if err != nil {
+		return nil, err
+	}
+	v.extentsWriter = ew
+	cw, err := v.newCatWriter(alc)
+	if err != nil {
+		return nil, err
+	}
+	return &txn{v: v, cw: cw, alc: alc, ew: ew}, nil
 }
 
 // commit flushes the allocator bitmap, reparses the volume from the mutated
@@ -56,6 +64,7 @@ func (t *txn) commit() error {
 	if err := t.alc.flush(); err != nil {
 		return err
 	}
+	t.v.extentsWriter = nil
 	if err := t.v.reopen(); err != nil {
 		return err
 	}
@@ -186,11 +195,12 @@ func (v *Volume) threadKeyOf(cnid uint32) (uint32, string, bool, error) {
 
 // --- mutators ---
 
-// WriteFile creates or overwrites the regular file at path with data. The file
-// is stored contiguously across freshly-allocated allocation blocks (its data
-// fork uses the inline extents). Files needing more than numInlineExtents
-// extents return ErrUnsupported (extents-overflow insert is a documented
-// simplification); a contiguous allocation always fits in one inline extent.
+// WriteFile creates or overwrites the regular file at path with data. The data
+// fork is allocated across the volume's free allocation blocks: a single
+// contiguous run when one is available, otherwise multiple fragments. The first
+// numInlineExtents runs are stored in the inline extent descriptors and any
+// remaining runs are inserted into the extents-overflow B-tree, so an arbitrarily
+// fragmented file (more than numInlineExtents extents) round-trips correctly.
 func (v *Volume) WriteFile(p string, data []byte, perm os.FileMode) error {
 	if !v.writable() {
 		return ErrReadOnly
@@ -230,32 +240,41 @@ func (v *Volume) WriteFile(p string, data []byte, perm os.FileMode) error {
 }
 
 // createFile allocates blocks, writes the data fork, and inserts the catalog
-// file + thread records.
+// file + thread records. The data fork may be fragmented: up to eight runs are
+// stored in the inline extent descriptors and any further runs are recorded in
+// the extents-overflow B-tree.
 func (t *txn) createFile(parent uint32, name string, data []byte, mode uint16) error {
 	v := t.v
 	bs := int64(v.vh.BlockSize)
 	nblocks := uint32((int64(len(data)) + bs - 1) / bs)
+	cnid := v.nextCNID()
 	var df forkData
 	df.LogicalSize = uint64(len(data))
 	df.ClumpSize = v.vh.BlockSize
 	df.TotalBlocks = nblocks
 	if nblocks > 0 {
-		start, err := t.alc.allocContiguous(nblocks)
+		runs, err := t.alc.allocFragments(nblocks)
 		if err != nil {
 			return err
 		}
-		df.Extents[0] = extentDescriptor{StartBlock: start, BlockCount: nblocks}
-		// Write data into the image.
-		off := int64(start) * bs
-		copy(v.img[off:off+int64(len(data))], data)
-		// Zero any tail of the last block beyond the data.
-		tail := off + int64(len(data))
-		end := off + int64(nblocks)*bs
-		for i := tail; i < end; i++ {
-			v.img[i] = 0
+		// Write data across the runs in order.
+		if err := t.writeForkData(runs, data); err != nil {
+			return err
+		}
+		// Fill the eight inline extents; spill the rest into the extents tree.
+		for i := 0; i < numInlineExtents && i < len(runs); i++ {
+			df.Extents[i] = runs[i]
+		}
+		if len(runs) > numInlineExtents {
+			var startBlock uint32
+			for i := 0; i < numInlineExtents; i++ {
+				startBlock += runs[i].BlockCount
+			}
+			if err := t.ew.insertExtentRecords(cnid, forkTypeData, startBlock, runs[numInlineExtents:]); err != nil {
+				return err
+			}
 		}
 	}
-	cnid := v.nextCNID()
 	fileRec := encodeFileRecord(cnid, time.Now(), mode, df)
 	key := encodeCatalogKey(parent, name)
 	rec := assembleCatalogRecord(key, fileRec)
@@ -271,14 +290,47 @@ func (t *txn) createFile(parent uint32, name string, data []byte, mode uint16) e
 	return t.adjustParentValence(parent, +1, 0)
 }
 
-// removeFile frees the file's data-fork blocks and removes its catalog +
-// thread records.
+// writeForkData copies data sequentially across the allocation-block runs,
+// zero-filling the tail of the final block past the data.
+func (t *txn) writeForkData(runs []extentDescriptor, data []byte) error {
+	v := t.v
+	bs := int64(v.vh.BlockSize)
+	pos := 0
+	for _, r := range runs {
+		off := int64(r.StartBlock) * bs
+		span := int64(r.BlockCount) * bs
+		n := len(data) - pos
+		if int64(n) > span {
+			n = int(span)
+		}
+		if n > 0 {
+			copy(v.img[off:off+int64(n)], data[pos:pos+n])
+			pos += n
+		}
+		// Zero the remainder of this run.
+		for i := off + int64(n); i < off+span; i++ {
+			v.img[i] = 0
+		}
+	}
+	return nil
+}
+
+// removeFile frees the file's data-fork blocks (inline + extents-overflow) and
+// removes its catalog + thread records.
 func (t *txn) removeFile(parent uint32, name string, cf *catalogFile) error {
 	v := t.v
 	for _, e := range cf.dataFork.Extents {
 		if e.BlockCount == 0 {
 			break
 		}
+		t.alc.freeRun(e.StartBlock, e.BlockCount)
+	}
+	// Reclaim any extents recorded in the overflow tree, then drop the records.
+	overflow, err := t.ew.deleteAllForFork(cf.fileID, forkTypeData)
+	if err != nil {
+		return err
+	}
+	for _, e := range overflow {
 		t.alc.freeRun(e.StartBlock, e.BlockCount)
 	}
 	if _, err := t.cw.deleteRecord(catalogKey{parentID: parent, name: name}); err != nil {

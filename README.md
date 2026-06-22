@@ -48,18 +48,16 @@ correctness test.
 
 - Volume header decode/encode (`H+` / `HX`, primary + alternate, block counts, special-file fork descriptors, clean-unmount attributes).
 - Generic HFS+ B-tree node read/write (descriptor + trailing record-offset table) shared by the catalog and extents-overflow trees.
-- Catalog B-tree: index descent, leaf scan, **insert/delete with leaf and index node splitting, index-record propagation, and new-root growth**; folder/file/thread records; valence and HasFolderCount maintenance.
-- Allocation bitmap allocate/free of contiguous runs with `freeBlocks` sync.
+- Catalog & extents-overflow B-trees: index descent, leaf scan, **insert/delete with leaf and index node splitting, index-record propagation, new-root growth, node-underflow rebalancing (rotate/merge), emptied-node freeing, and tree-height shrink**; folder/file/thread records; valence and HasFolderCount maintenance.
+- **Growable B-tree files** — when a tree exhausts its node reservation it allocates more blocks, extends its backing fork's extents (inline, then spilling into the extents-overflow tree), grows the node-allocation bitmap (adding map nodes), and updates the header-node `totalNodes`/`freeNodes` and the volume-header special-file fork descriptor + `freeBlocks`.
+- Allocation bitmap allocate/free of contiguous runs **and multi-fragment allocations** with `freeBlocks` sync.
 - Pure-Go `Format`/`Mkfs`; `WriteFile`/`MkDir`/`DeleteFile`/`DeleteDir`/`Rename`; `SetLabel`/`Symlink`/`Truncate`.
-- File read/write: data-fork inline extents plus extents-overflow continuation for reading fragmented files.
+- File read/write: data-fork **inline extents plus extents-overflow continuation for both reading and writing** fragmented forks — a written file needing more than eight extents fills the inline descriptors and inserts the remainder into the extents-overflow B-tree, round-tripping exactly.
 
-**Documented simplifications** (kept honest, like the `btrfs`/`xfs` siblings):
+**Out of scope** (as with the `btrfs`/`xfs` siblings — these are deliberate non-goals, not partial implementations):
 
-- **Write extents** — a written file's data fork is a single contiguous run via the inline extents; the extents-overflow *insert* path (>8 fragments) is not implemented and returns `ErrUnsupported`. Reading fragmented forks is fully supported.
-- **Catalog growth** — the catalog fork is pre-sized by the formatter; growing it past that reservation returns `ErrNoSpace`.
-- **Node merge** — deletion frees the record/thread and blocks but does not strictly re-merge underflowing nodes (stays `fsck`-clean).
 - **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted).
-- **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not yet handled (compression is detected and rejected rather than returning wrong bytes).
+- **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not handled (compression is detected and rejected rather than returning wrong bytes).
 
 ## Module
 

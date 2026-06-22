@@ -53,6 +53,10 @@ type Volume struct {
 	// img is the full mutable image. Non-nil only for writable volumes; the
 	// write engine edits it in place and rebuilds catalogTree/vh from it.
 	img []byte
+	// extentsWriter is the active extents-overflow tree writer during a
+	// mutation; the catalog-fork growth path spills its extents through it.
+	// Bound by txn.begin and cleared on commit.
+	extentsWriter *extentsWriter
 	// wa is the optional backing store flushed by Sync. nil for purely
 	// in-memory writable volumes (OpenWritable on a []byte).
 	wa io.WriterAt
@@ -74,23 +78,55 @@ func Open(rs io.ReaderAt, size int64) (*Volume, error) {
 	if c, ok := rs.(io.Closer); ok {
 		v.closer = c
 	}
-	// Build the extents-overflow tree first so file-fork resolution can use
-	// it; tolerate an absent/empty extents file.
-	if ef := newSpecialFork(v, vh.ExtentsFile); ef.size > 0 {
+	if err := v.openTrees(); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// openTrees (re)builds the extents-overflow and catalog B-trees from the
+// current volume header. The extents tree is opened first (from its inline
+// extents) so the catalog fork — which may have spilled past its eight inline
+// extents — can resolve its full extent list through it.
+func (v *Volume) openTrees() error {
+	v.extentsTree = nil
+	if ef := newSpecialFork(v, v.vh.ExtentsFile); ef.size > 0 {
 		if bt, err := openBTree(ef); err == nil {
 			v.extentsTree = bt
 		}
 	}
-	cf := newSpecialFork(v, vh.CatalogFile)
+	// If the extents file itself spilled past its inline extents, re-resolve it
+	// through the (now-open) extents tree and reopen.
+	if v.extentsTree != nil && extentsForkNeedsOverflow(v.vh.ExtentsFile) {
+		if ef, err := newSpecialForkResolved(v, kHFSExtentsFileID, v.vh.ExtentsFile); err == nil {
+			if bt, err := openBTree(ef); err == nil {
+				v.extentsTree = bt
+			}
+		}
+	}
+	cf, err := newSpecialForkResolved(v, kHFSCatalogFileID, v.vh.CatalogFile)
+	if err != nil {
+		return err
+	}
 	if cf.size == 0 {
-		return nil, fmt.Errorf("%w: empty catalog file", ErrCorrupt)
+		return fmt.Errorf("%w: empty catalog file", ErrCorrupt)
 	}
 	bt, err := openBTree(cf)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	v.catalogTree = bt
-	return v, nil
+	return nil
+}
+
+// extentsForkNeedsOverflow reports whether a special file's inline extents do
+// not cover its total blocks (so a continuation lives in the overflow tree).
+func extentsForkNeedsOverflow(fd forkData) bool {
+	var covered uint32
+	for _, e := range fd.Extents {
+		covered += e.BlockCount
+	}
+	return covered < fd.TotalBlocks
 }
 
 // OpenFile opens the image at path read-only.
@@ -190,19 +226,7 @@ func (v *Volume) reopen() error {
 		return err
 	}
 	v.vh = vh
-	v.extentsTree = nil
-	if ef := newSpecialFork(v, vh.ExtentsFile); ef.size > 0 {
-		if bt, err := openBTree(ef); err == nil {
-			v.extentsTree = bt
-		}
-	}
-	cf := newSpecialFork(v, vh.CatalogFile)
-	bt, err := openBTree(cf)
-	if err != nil {
-		return err
-	}
-	v.catalogTree = bt
-	return nil
+	return v.openTrees()
 }
 
 // fileWriterAt adapts an *os.File to io.WriterAt with a Sync method.

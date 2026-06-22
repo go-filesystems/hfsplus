@@ -82,10 +82,9 @@ func (f *fork) readAll() ([]byte, error) {
 }
 
 // newSpecialFork builds a fork for a special file (catalog/extents/allocation)
-// from the volume header's inline fork descriptor. Special files in practice
-// fit within their eight inline extents for the small images this reader
-// targets; if a special file were fragmented beyond that the extents-overflow
-// would also be needed, which we note but do not chase for special files.
+// from the volume header's inline fork descriptor's eight inline extents only.
+// Used during bootstrap (the extents-overflow tree is not yet open) and for
+// special files that fit inline.
 func newSpecialFork(vol *Volume, fd forkData) *fork {
 	exts := make([]extentDescriptor, 0, numInlineExtents)
 	for _, e := range fd.Extents {
@@ -95,4 +94,16 @@ func newSpecialFork(vol *Volume, fd forkData) *fork {
 		exts = append(exts, e)
 	}
 	return &fork{vol: vol, size: int64(fd.LogicalSize), extents: exts}
+}
+
+// newSpecialForkResolved builds a fork for a special file resolving its full
+// extent list — the eight inline extents plus any continuation recorded in the
+// extents-overflow B-tree (keyed by the special file's CNID). This is required
+// once a special file (notably the catalog) grows past eight extents.
+func newSpecialForkResolved(vol *Volume, fileID uint32, fd forkData) (*fork, error) {
+	exts, err := vol.resolveForkExtents(fileID, forkTypeData, fd)
+	if err != nil {
+		return nil, err
+	}
+	return &fork{vol: vol, size: int64(fd.LogicalSize), extents: exts}, nil
 }

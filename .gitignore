@@ -2,3 +2,7 @@
 *.out
 coverprofile.out
 /bin/
+
+# local gopls workspace (not committed)
+go.work
+go.work.sum

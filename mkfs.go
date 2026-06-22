@@ -157,10 +157,11 @@ func (b *mkfsBuilder) layout() {
 	}
 
 	b.catStart = b.extStart + b.extBlocks
-	// Reserve catalogReserveNodes nodes for the catalog so the write path can
-	// split leaves and grow the tree height without having to grow the catalog
-	// fork itself (which would require relocating it). Growing past this
-	// reservation returns ErrNoSpace — a documented simplification.
+	// Reserve catalogReserveNodes nodes for the catalog so the common case (a
+	// modest number of entries) needs no fork growth. When the reservation is
+	// exhausted the write path grows the catalog fork itself — allocating more
+	// blocks, extending its extents (inline, then into the extents-overflow
+	// tree), and enlarging the node bitmap — so there is no hard cap.
 	catNodeBytes := int64(b.nodeSize) * catalogReserveNodes
 	b.catBlocks = uint32((catNodeBytes + int64(b.blockSize) - 1) / int64(b.blockSize))
 	if b.catBlocks == 0 {

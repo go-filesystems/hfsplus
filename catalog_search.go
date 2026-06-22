@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"fmt"
 	"strings"
 	"unicode/utf16"
 )
@@ -160,7 +161,7 @@ func (t *btree) findLeaf(key catalogKey) (uint32, error) {
 			return cur, nil
 		}
 		if nd.desc.Kind != kindIndexNode {
-			return 0, ErrCorrupt
+			return 0, fmt.Errorf("%w: findLeaf node %d kind %d", ErrCorrupt, cur, nd.desc.Kind)
 		}
 		// Pick the last index record whose key <= search key.
 		var child uint32
@@ -182,17 +183,17 @@ func (t *btree) findLeaf(key catalogKey) (uint32, error) {
 		if !chosen {
 			// Search key precedes all records; take the first child.
 			if len(nd.records) == 0 {
-				return 0, ErrCorrupt
+				return 0, fmt.Errorf("%w: findLeaf empty index node %d", ErrCorrupt, cur)
 			}
 			c, ok := indexChild(nd.records[0])
 			if !ok {
-				return 0, ErrCorrupt
+				return 0, fmt.Errorf("%w: findLeaf bad child node %d", ErrCorrupt, cur)
 			}
 			child = c
 		}
 		cur = child
 	}
-	return 0, ErrCorrupt
+	return 0, fmt.Errorf("%w: findLeaf depth overflow", ErrCorrupt)
 }
 
 // lookup finds the leaf record matching key exactly (parentID + name under the

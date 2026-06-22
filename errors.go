@@ -39,18 +39,17 @@
 // embedding the full 8 KiB fold table; exotic case-folding corner cases
 // outside that range fall back to identity ordering.
 //
-// Documented simplifications (kept honest, like the btrfs/xfs siblings):
+// Out of scope (deliberate non-goals, as with the btrfs/xfs siblings):
 //
-//   - A file's data fork is stored as one contiguous run using the inline
-//     extents; the extents-overflow insert path (>8 fragments) is not
-//     implemented — such a write returns ErrUnsupported. Reading fragmented
-//     forks via the extents-overflow tree is fully supported.
-//   - Deletion frees the record/thread and its blocks but does not strictly
-//     re-merge underflowing B-tree nodes; the tree stays fsck-clean.
-//   - The catalog fork is pre-sized by the formatter; growing it past that
-//     reservation (a fragmented/relocated catalog) returns ErrNoSpace.
 //   - Journaling, decmpfs compression, resource forks, and indirect-node
 //     hardlink following are not implemented; see the README Status section.
+//
+// Fragmented data forks (more than eight extents), catalog and
+// extents-overflow B-tree growth, and node-underflow rebalancing/merging on
+// delete ARE implemented: a written fork fills its eight inline extents and
+// spills the remainder into the extents-overflow tree, the B-tree files grow
+// their backing forks when their node reservation is exhausted, and deletion
+// rebalances/merges underflowing nodes and frees emptied ones.
 package hfsplus
 
 import "errors"
