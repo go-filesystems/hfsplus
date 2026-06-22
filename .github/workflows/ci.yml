@@ -1,0 +1,189 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Native runners: full build + vet + test (coverage) for the two
+  # architectures GitHub provides natively. The committed gzipped raw HFS+
+  # fixture (testdata/hfsplus.dmg.gz) is decoded in-process, so the reader
+  # tests run with no macOS tooling. The COVERAGE_FLOOR gate is enforced here.
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      # Coverage floor enforced on the standard profile. Measured at ~83.5% on
+      # a Linux run (the darwin-only Format/round-trip code is build-tagged out
+      # and its tests skip), floored several points below to absorb variance.
+      COVERAGE_FLOOR: "80.0"
+    steps:
+      - name: Checkout hfsplus
+        uses: actions/checkout@v4
+        with:
+          path: go-filesystems/hfsplus
+
+      # go.mod carries a relative replace:
+      #   replace github.com/go-filesystems/interface => ../interface
+      # so the sibling module must sit at the matching relative path.
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: go-filesystems/interface
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: go-filesystems/hfsplus/go.mod
+
+      - name: Build
+        working-directory: go-filesystems/hfsplus
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet
+        working-directory: go-filesystems/hfsplus
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Test (coverage)
+        working-directory: go-filesystems/hfsplus
+        env:
+          CGO_ENABLED: "0"
+        run: go test -coverpkg=./... -coverprofile=cover.out -count=1 -timeout=20m ./...
+
+      - name: Enforce coverage floor
+        working-directory: go-filesystems/hfsplus
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "total coverage: ${total}% (floor: ${COVERAGE_FLOOR}%)"
+          awk -v t="$total" -v f="$COVERAGE_FLOOR" \
+            'BEGIN { if (t+0 < f+0) { printf "coverage %.1f%% below floor %.1f%%\n", t, f; exit 1 } }'
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.arch }}
+          path: go-filesystems/hfsplus/cover.out
+          if-no-files-found: ignore
+
+  # Emulated runners: cross-compile a static (CGO_ENABLED=0) test binary per
+  # package and run it under QEMU for each non-native 64-bit arch.
+  #
+  # HFS+ is a big-endian on-disk format and every metadata decoder uses
+  # explicit binary.BigEndian. The committed fixture is therefore the
+  # endianness test: on the big-endian s390x host the parsed values (volume
+  # header, B-tree nodes, catalog keys, fork extents) must still come out
+  # correct and read the known files back byte-for-byte. The darwin-only
+  # Format path is build-tagged out on linux, so nothing here needs hdiutil.
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    steps:
+      - name: Checkout hfsplus
+        uses: actions/checkout@v4
+        with:
+          path: go-filesystems/hfsplus
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: go-filesystems/interface
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: go-filesystems/hfsplus/go.mod
+
+      - name: Register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile per-package test binaries
+        working-directory: go-filesystems/hfsplus
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tests
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            go test -c -cover -o "/tmp/tests/${name}.test" "$pkg"
+            if [ -f "/tmp/tests/${name}.test" ]; then
+              echo "built ${name}.test"
+            fi
+          done
+          ls -la /tmp/tests
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        env:
+          QEMU_CPU: ${{ matrix.qemu }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(/tmp/tests/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"; exit 0
+          fi
+          # The fixture is read from testdata/, so mount the repo and run from
+          # there; bind the test binaries dir too.
+          rc=0
+          for bin in "${bins[@]}"; do
+            echo "::group::$(basename "$bin")"
+            if ! docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              --user 1000:1000 \
+              -e QEMU_CPU="${QEMU_CPU}" \
+              -v "$PWD/go-filesystems/hfsplus:/work" \
+              -v /tmp/tests:/t \
+              -w /work \
+              ${{ matrix.image }} \
+              "/t/$(basename "$bin")" -test.v -test.short -test.timeout=20m; then
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
