@@ -33,7 +33,7 @@ jobs:
       COVERAGE_FLOOR: "80.0"
     steps:
       - name: Checkout hfsplus
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: go-filesystems/hfsplus
 
@@ -41,13 +41,13 @@ jobs:
       #   replace github.com/go-filesystems/interface => ../interface
       # so the sibling module must sit at the matching relative path.
       - name: Checkout interface (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-filesystems/interface
           path: go-filesystems/interface
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
@@ -119,18 +119,18 @@ jobs:
             qemu: qemu
     steps:
       - name: Checkout hfsplus
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: go-filesystems/hfsplus
 
       - name: Checkout interface (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-filesystems/interface
           path: go-filesystems/interface
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
