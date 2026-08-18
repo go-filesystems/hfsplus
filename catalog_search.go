@@ -203,6 +203,7 @@ func (t *btree) lookup(key catalogKey) (catalogRecord, bool, error) {
 	if err != nil {
 		return catalogRecord{}, false, err
 	}
+	steps := 0
 	for leaf != 0 {
 		nd, err := t.readNode(leaf)
 		if err != nil {
@@ -229,7 +230,7 @@ func (t *btree) lookup(key catalogKey) (catalogRecord, bool, error) {
 				return catalogRecord{}, false, nil
 			}
 		}
-		leaf = nd.desc.FLink
+		leaf = leafStep(t, nd.desc.FLink, &steps)
 	}
 	return catalogRecord{}, false, nil
 }
@@ -246,6 +247,7 @@ func (t *btree) listChildren(parentID uint32) ([]childEntry, error) {
 	}
 	var out []childEntry
 	seen := false
+	steps := 0
 	for leaf != 0 {
 		nd, err := t.readNode(leaf)
 		if err != nil {
@@ -278,7 +280,7 @@ func (t *btree) listChildren(parentID uint32) ([]childEntry, error) {
 			}
 			out = append(out, childEntry{key: k, rec: cr})
 		}
-		leaf = nd.desc.FLink
+		leaf = leafStep(t, nd.desc.FLink, &steps)
 	}
 	_ = seen
 	return out, nil

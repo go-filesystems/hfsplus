@@ -554,6 +554,7 @@ func (v *Volume) recordBody(parent uint32, name string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	steps := 0
 	for leaf != 0 {
 		nd, err := v.catalogTree.readNode(leaf)
 		if err != nil {
@@ -575,7 +576,7 @@ func (v *Volume) recordBody(parent uint32, name string) ([]byte, bool, error) {
 				return nil, false, nil
 			}
 		}
-		leaf = nd.desc.FLink
+		leaf = leafStep(v.catalogTree, nd.desc.FLink, &steps)
 	}
 	return nil, false, nil
 }
@@ -678,6 +679,7 @@ func (v *Volume) Label() string {
 	if err != nil {
 		return ""
 	}
+	steps := 0
 	for leaf != 0 {
 		nd, err := v.catalogTree.readNode(leaf)
 		if err != nil {
@@ -695,7 +697,7 @@ func (v *Volume) Label() string {
 				return ""
 			}
 		}
-		leaf = nd.desc.FLink
+		leaf = leafStep(v.catalogTree, nd.desc.FLink, &steps)
 	}
 	return ""
 }

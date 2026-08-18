@@ -49,6 +49,10 @@ const mkfsNodeSize = 4096
 // to grow (growing the catalog fork is a documented unsupported simplification).
 const catalogReserveNodes = 256
 
+// minCatalogNodes is the smallest usable catalog B-tree: a header node and one
+// leaf. A volume that cannot afford even this is rejected by layout.
+const minCatalogNodes = 2
+
 // firstUserCatalogID is the first CNID the formatter and write path hand out;
 // macOS reserves CNIDs 0..15 for the volume's special files and private data.
 const firstUserCatalogID = 16
@@ -104,7 +108,9 @@ func Mkfs(sizeBytes int64, cfg FormatConfig) ([]byte, error) {
 		label:         label,
 		now:           time.Now(),
 	}
-	b.layout()
+	if err := b.layout(); err != nil {
+		return nil, err
+	}
 	b.writeAllocationBitmap()
 	b.writeExtentsTree()
 	b.writeCatalogTree()
@@ -140,8 +146,9 @@ func (b *mkfsBuilder) blockBytes(n uint32) []byte {
 	return b.img[off : off+int64(b.blockSize)]
 }
 
-// layout assigns allocation blocks to the special files.
-func (b *mkfsBuilder) layout() {
+// layout assigns allocation blocks to the special files. It fails when the
+// volume is too small to hold them.
+func (b *mkfsBuilder) layout() error {
 	bitmapBytes := (int64(b.totalBlocks) + 7) / 8
 	bitmapBlocks := uint32((bitmapBytes + int64(b.blockSize) - 1) / int64(b.blockSize))
 	if bitmapBlocks == 0 {
@@ -168,7 +175,28 @@ func (b *mkfsBuilder) layout() {
 		b.catBlocks = 1
 	}
 
+	// The reservation is a convenience, not a requirement, and it must never be
+	// larger than the volume. Block 0 holds the boot area and volume header, the
+	// final block holds the alternate header, and the bitmap and extents tree
+	// take their share; the catalog gets what is left.
+	//
+	// Without this clamp a volume smaller than the reservation was laid out with
+	// a catalog fork running past the end of the image, and the header's
+	// freeBlocks -- totalBlocks minus usedBlocks, both uint32 -- underflowed in
+	// silence: a 32 KiB volume reported 4294967043 free blocks, and the catalog
+	// claimed blocks 4 through 259 of an image that held 8.
+	minCat := uint32((int64(b.nodeSize)*minCatalogNodes + int64(b.blockSize) - 1) / int64(b.blockSize))
+	fixed := 1 + b.allocBlocks + b.extBlocks + 1
+	if fixed+b.catBlocks > b.totalBlocks {
+		if fixed+minCat > b.totalBlocks {
+			return fmt.Errorf("%w: image too small: %d blocks of %d bytes cannot hold the volume header, allocation bitmap, extents tree and a minimal catalog (%d blocks needed)",
+				ErrCorrupt, b.totalBlocks, b.blockSize, fixed+minCat)
+		}
+		b.catBlocks = b.totalBlocks - fixed
+	}
+
 	b.nextCatalogID = firstUserCatalogID
+	return nil
 }
 
 // markUsed sets bits [start, start+count) in the bitmap held in the allocation
@@ -405,7 +433,12 @@ func (b *mkfsBuilder) encodeVolumeHeader(vh []byte) {
 	binary.BigEndian.PutUint32(vh[36:40], 0)             // folderCount (root not counted)
 	binary.BigEndian.PutUint32(vh[40:44], b.blockSize)   // blockSize
 	binary.BigEndian.PutUint32(vh[44:48], b.totalBlocks) // totalBlocks
-	freeBlocks := b.totalBlocks - b.usedBlocks
+	// Defensive: the layout clamp above keeps usedBlocks within totalBlocks, and
+	// a header claiming 4 billion free blocks is worse than one claiming none.
+	var freeBlocks uint32
+	if b.totalBlocks > b.usedBlocks {
+		freeBlocks = b.totalBlocks - b.usedBlocks
+	}
 	binary.BigEndian.PutUint32(vh[48:52], freeBlocks)             // freeBlocks
 	binary.BigEndian.PutUint32(vh[52:56], b.catStart+b.catBlocks) // nextAllocation hint (first free block)
 	binary.BigEndian.PutUint32(vh[56:60], b.blockSize)            // rsrcClumpSize

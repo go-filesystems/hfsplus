@@ -180,3 +180,39 @@ func indexChild(rec []byte) (uint32, bool) {
 	}
 	return binary.BigEndian.Uint32(data[0:4]), true
 }
+
+// maxNodes is how many nodes the fork behind the tree can physically hold.
+// Every count in the B-tree header is a number off the disk; the extents that
+// actually back the fork are the only bound that is not, so they are what the
+// chain walks are limited by. The absolute ceiling keeps the bound meaningful
+// even when the extent list is itself nonsense -- 2^24 nodes is a 64 GB tree at
+// the usual 4 KiB node size, far past anything real.
+func (t *btree) maxNodes() int {
+	ns := int64(t.header.NodeSize)
+	if ns <= 0 {
+		return 0
+	}
+	const ceiling = 1 << 24
+	n := t.f.extentBytes() / ns
+	if n < 1 {
+		return 1
+	}
+	if n > ceiling {
+		return ceiling
+	}
+	return int(n)
+}
+
+// leafStep advances a walk along the leaf chain, returning the next node number
+// or 0 to stop. It stops once the walk has taken more steps than the tree can
+// hold, which is what makes a corrupted chain terminate: FLink comes off the
+// disk, so a link pointing backwards turns the chain into a cycle. Before this
+// guard a 21-byte corruption of a single node made Label and the catalog
+// searches spin forever on an otherwise valid image -- a hang, not a slow path.
+func leafStep(t *btree, next uint32, steps *int) uint32 {
+	*steps++
+	if *steps >= t.maxNodes() {
+		return 0
+	}
+	return next
+}
