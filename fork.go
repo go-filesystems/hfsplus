@@ -68,10 +68,52 @@ func (f *fork) readAt(p []byte, off int64) (int, error) {
 	return total, nil
 }
 
+// maxForkBytes caps a single fork at 1 PiB. HFS+ logical sizes are uint64 and
+// come straight off the disk; this keeps the int64 arithmetic below in range
+// whatever the image claims.
+const maxForkBytes = 1 << 50
+
+// extentBytes is the number of bytes the fork's extents actually cover. It is
+// the one bound on a fork's size that is not itself a number read off the disk,
+// so it is what the claimed logical size gets checked against. The running
+// total saturates rather than wrapping: BlockCount and BlockSize are both
+// uint32 and their product over several extents can overflow an int64.
+func (f *fork) extentBytes() int64 {
+	bs := int64(f.vol.vh.BlockSize)
+	var n int64
+	for _, e := range f.extents {
+		if int64(e.BlockCount) > (maxForkBytes-n)/bs {
+			return maxForkBytes
+		}
+		n += int64(e.BlockCount) * bs
+	}
+	return n
+}
+
 // readAll returns the entire fork contents.
 func (f *fork) readAll() ([]byte, error) {
 	if f.size == 0 {
 		return []byte{}, nil
+	}
+	// Allocate from the extents, never from the claimed size. A catalog record
+	// saying a 12-byte file is 2^63 bytes long used to reach make() directly:
+	// int64(uint64) of a hostile logicalSize is either enormous or negative,
+	// and both panic with "makeslice: len out of range".
+	if f.size < 0 || f.size > maxForkBytes {
+		return nil, fmt.Errorf("%w: fork claims %d bytes", ErrCorrupt, f.size)
+	}
+	if covered := f.extentBytes(); f.size > covered {
+		return nil, fmt.Errorf("%w: fork claims %d bytes but its extents cover only %d", ErrCorrupt, f.size, covered)
+	}
+	// The extents can themselves point past the end of the image, so covering
+	// the size on paper is not enough: the last byte the fork claims has to be
+	// readable before a single byte is allocated. One ReadAt -- the image
+	// either has it or the fork is lying. Without this a 21-byte corruption of
+	// the extent list made the driver spend 17 seconds zeroing a slice for a
+	// 4 MiB image.
+	var probe [1]byte
+	if _, err := f.readAt(probe[:], f.size-1); err != nil {
+		return nil, fmt.Errorf("%w: fork claims %d bytes, past the end of the image", ErrCorrupt, f.size)
 	}
 	buf := make([]byte, f.size)
 	n, err := f.readAt(buf, 0)

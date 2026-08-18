@@ -119,6 +119,7 @@ func (t *btree) overflowExtents(fileID uint32, forkType uint8, startBlock uint32
 		return nil, err
 	}
 	var out []extentDescriptor
+	steps := 0
 	for leaf != 0 {
 		nd, err := t.readNode(leaf)
 		if err != nil {
@@ -157,7 +158,7 @@ func (t *btree) overflowExtents(fileID uint32, forkType uint8, startBlock uint32
 				out = append(out, ed)
 			}
 		}
-		leaf = nd.desc.FLink
+		leaf = leafStep(t, nd.desc.FLink, &steps)
 	}
 	return out, nil
 }
