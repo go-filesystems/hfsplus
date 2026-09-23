@@ -52,7 +52,11 @@
 // rebalances/merges underflowing nodes and frees emptied ones.
 package hfsplus
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	iofs "io/fs"
+)
 
 // Sentinel errors. Compare with errors.Is so wrapped errors keep matching.
 var (
@@ -67,7 +71,7 @@ var (
 
 	// ErrNotFound is returned when a path component cannot be located in the
 	// catalog.
-	ErrNotFound = errors.New("hfsplus: path not found")
+	ErrNotFound = fmt.Errorf("hfsplus: path not found: %w", iofs.ErrNotExist)
 
 	// ErrNotDirectory is returned when ListDir targets a non-directory.
 	ErrNotDirectory = errors.New("hfsplus: not a directory")
