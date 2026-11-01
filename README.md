@@ -150,6 +150,22 @@ read/write and compares the files and bytes macOS sees against what Go wrote.
 The cross-arch pure-Go round-trip (format → write → read) in `write_test.go`
 runs on every architecture, including big-endian s390x.
 
+## Untrusted images
+
+An image is attacker-controlled input and every size in it is a claim. Each
+input-driven allocation is bounded before it is made (`bombs_test.go` measures
+each road with `runtime.MemStats`):
+
+| Claim in the image | Bound |
+|---|---|
+| a fork's logical size (`ReadFile`, `ReadLink`) | at most the image size, every extent the fork uses must lie inside the image (checked before the buffer is made); the last byte is probed as well |
+| the same with the image size unknown (`Open(rs, -1)`) | the buffer grows (1 MiB steps, doubling) with the bytes the reader delivers, so a forged 512 MiB claim over a 4 MiB volume costs 4 MiB |
+| the B-tree leaf-chain walk (cycles) | at most image size / node size steps (was: the extents' claim, up to 2^24) |
+| a B-tree node | `nodeSize` is a power of two in [512, 32768] |
+
+Fuzz targets: `FuzzOpenHeader`, `FuzzOpenPatched`, `FuzzBombs` (asserts a
+per-input allocation budget).
+
 ## References
 
 - Apple TN1150, *HFS Plus Volume Format*.

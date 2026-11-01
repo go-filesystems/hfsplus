@@ -6,6 +6,7 @@ package hfsplus
 import (
 	"fmt"
 	"io"
+	"slices"
 )
 
 // fork is a logical byte stream addressed by a list of allocation-block
@@ -99,7 +100,7 @@ func (f *fork) readAll() ([]byte, error) {
 	// saying a 12-byte file is 2^63 bytes long used to reach make() directly:
 	// int64(uint64) of a hostile logicalSize is either enormous or negative,
 	// and both panic with "makeslice: len out of range".
-	if f.size < 0 || f.size > maxForkBytes {
+	if f.size < 0 || f.size > maxForkBytes || f.size > int64(^uint(0)>>1) {
 		return nil, fmt.Errorf("%w: fork claims %d bytes", ErrCorrupt, f.size)
 	}
 	if covered := f.extentBytes(); f.size > covered {
@@ -115,12 +116,86 @@ func (f *fork) readAll() ([]byte, error) {
 	if _, err := f.readAt(probe[:], f.size-1); err != nil {
 		return nil, fmt.Errorf("%w: fork claims %d bytes, past the end of the image", ErrCorrupt, f.size)
 	}
+	capacity := f.vol.capacity()
+	if capacity < 0 {
+		// The image size is unknown, so nothing says the extents before the last
+		// one exist: grow with the bytes the reader delivers.
+		return f.readGrow()
+	}
+	// The last byte being readable proves only the LAST extent. An earlier
+	// extent may lie outside the image (an 8-extent fork whose first extent
+	// starts at block 2^30 passed the probe above and reserved its whole claimed
+	// size), and extents may alias, so a fork can claim more bytes than the
+	// volume holds. Both are refused before the buffer is made: the fork must
+	// fit in the image and every extent it uses must lie inside it.
+	if f.size > capacity {
+		return nil, fmt.Errorf("%w: fork claims %d bytes, the image holds %d", ErrCorrupt, f.size, capacity)
+	}
+	if err := f.checkExtentsInside(capacity); err != nil {
+		return nil, err
+	}
 	buf := make([]byte, f.size)
 	n, err := f.readAt(buf, 0)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	return buf[:n], nil
+}
+
+// checkExtentsInside reports ErrCorrupt unless every extent that holds part of
+// the fork's first f.size bytes lies inside an image of capacity bytes. No I/O.
+func (f *fork) checkExtentsInside(capacity int64) error {
+	bs := int64(f.vol.vh.BlockSize)
+	var logical int64
+	for _, e := range f.extents {
+		if logical >= f.size {
+			break
+		}
+		if e.BlockCount == 0 {
+			continue
+		}
+		start, length := int64(e.StartBlock)*bs, int64(e.BlockCount)*bs
+		if start > capacity-length {
+			return fmt.Errorf("%w: extent [%d,+%d) lies outside the %d-byte image", ErrCorrupt, start, length, capacity)
+		}
+		logical += length
+	}
+	return nil
+}
+
+// growChunk is the first step of a read that cannot be checked against an image
+// size; the buffer then doubles as the reader delivers.
+const growChunk = 1 << 20
+
+// readGrow reads the whole fork into a buffer that grows with the bytes
+// actually delivered rather than being sized from the claimed length.
+func (f *fork) readGrow() ([]byte, error) {
+	buf := make([]byte, 0, min(f.size, growChunk))
+	for int64(len(buf)) < f.size {
+		step := min(f.size-int64(len(buf)), max(growChunk, int64(len(buf))))
+		old := len(buf)
+		buf = slices.Grow(buf, int(step))[:old+int(step)]
+		n, err := f.readAt(buf[old:], int64(old))
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if int64(n) < step {
+			return buf[:old+n], nil
+		}
+	}
+	return buf, nil
+}
+
+// capacity returns the number of bytes the image holds, or -1 when unknown (Open
+// with size <= 0 over a reader).
+func (v *Volume) capacity() int64 {
+	if v.img != nil {
+		return int64(len(v.img))
+	}
+	if v.size > 0 {
+		return v.size
+	}
+	return -1
 }
 
 // newSpecialFork builds a fork for a special file (catalog/extents/allocation)
