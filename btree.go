@@ -193,7 +193,15 @@ func (t *btree) maxNodes() int {
 		return 0
 	}
 	const ceiling = 1 << 24
-	n := t.f.extentBytes() / ns
+	// The extents are numbers off the disk too (eight of them can claim 2^32
+	// blocks each): a tree cannot hold more nodes than the image holds bytes.
+	// Without this a two-node leaf cycle was walked 2^24 times, appending the
+	// same children each lap.
+	span := t.f.extentBytes()
+	if c := t.f.vol.capacity(); c >= 0 && c < span {
+		span = c
+	}
+	n := span / ns
 	if n < 1 {
 		return 1
 	}
