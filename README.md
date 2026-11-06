@@ -125,6 +125,7 @@ memory). The returned `*Volume` implements
 | `(*Volume) SetLabel / Symlink / Truncate` | Optional `Labeller` / `Symlinker` / `Truncater` capabilities |
 | `(*Volume) Sync() error` | Flush the in-memory image to the backing store |
 | `(*Volume) ListDir / ReadFile / Stat / ReadLink` | Read paths |
+| `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
 
 ## Validation
