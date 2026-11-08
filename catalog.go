@@ -69,11 +69,13 @@ type catalogFolder struct {
 	folderID uint32
 	valence  uint32
 	flags    uint16
+	dates    [20]byte // createDate..backupDate, raw big-endian (record bytes 12..32)
 }
 
 type catalogFile struct {
 	fileID   uint32
 	flags    uint16
+	dates    [20]byte // createDate..backupDate, raw big-endian (record bytes 12..32)
 	dataFork forkData
 	rsrcFork forkData
 	permMode uint16 // BSD mode from HFSPlusBSDInfo
@@ -100,14 +102,15 @@ func parseCatalogRecord(data []byte) (catalogRecord, bool) {
 		if len(data) < 14 {
 			return catalogRecord{}, false
 		}
-		return catalogRecord{
-			recType: rt,
-			folder: &catalogFolder{
-				flags:    binary.BigEndian.Uint16(data[2:4]),
-				valence:  binary.BigEndian.Uint32(data[4:8]),
-				folderID: binary.BigEndian.Uint32(data[8:12]),
-			},
-		}, true
+		cfo := &catalogFolder{
+			flags:    binary.BigEndian.Uint16(data[2:4]),
+			valence:  binary.BigEndian.Uint32(data[4:8]),
+			folderID: binary.BigEndian.Uint32(data[8:12]),
+		}
+		if len(data) >= 32 {
+			copy(cfo.dates[:], data[12:32])
+		}
+		return catalogRecord{recType: rt, folder: cfo}, true
 	case recordFile:
 		// HFSPlusCatalogFile layout (offsets within record data):
 		//   0  recordType (2)
@@ -131,6 +134,7 @@ func parseCatalogRecord(data []byte) (catalogRecord, bool) {
 		// fileMode lives at offset 42 within the record (HFSPlusBSDInfo starts
 		// at 32; fileMode is at +10).
 		cf.permMode = binary.BigEndian.Uint16(data[42:44])
+		copy(cf.dates[:], data[12:32])
 		cf.dataFork = parseForkData(data[88 : 88+forkDataLen])
 		if len(data) >= 168+forkDataLen {
 			cf.rsrcFork = parseForkData(data[168 : 168+forkDataLen])
