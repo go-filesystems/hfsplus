@@ -126,6 +126,13 @@ func (cw *catWriter) deleteRecord(key catalogKey) (bool, error) {
 // mutate to its data (the bytes after the key), re-storing the leaf node. Used
 // to keep a parent folder's valence/folderCount in sync.
 func (cw *catWriter) patchFolderRecord(parent uint32, name string, mutate func(folder []byte)) error {
+	return cw.patchRecord(parent, name, mutate)
+}
+
+// patchRecord is patchFolderRecord for any catalog record, file or folder: it
+// locates the record keyed (parent, name) and applies mutate to the bytes after
+// the key, which must not change the record's length.
+func (cw *catWriter) patchRecord(parent uint32, name string, mutate func(data []byte)) error {
 	key := catalogKey{parentID: parent, name: name}
 	probe := assembleProbe(encodeCatalogKey(parent, name))
 	path, _, err := cw.bw.descend(probe)
@@ -151,5 +158,5 @@ func (cw *catWriter) patchFolderRecord(parent uint32, name string, mutate func(f
 			return cw.bw.storeNode(en)
 		}
 	}
-	return fmt.Errorf("%w: folder record (%d,%q) not found", ErrCorrupt, parent, name)
+	return fmt.Errorf("%w: record (%d,%q) not found", ErrCorrupt, parent, name)
 }
