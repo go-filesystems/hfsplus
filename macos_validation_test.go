@@ -33,12 +33,31 @@ func attachRaw(t *testing.T, path string, readonly bool) string {
 	if readonly {
 		args = append(args, "-readonly")
 	}
-	out, err := exec.Command("hdiutil", args...).CombinedOutput()
+	// stdout only: hdiutil prints deprecation warnings on stderr, and the
+	// first word of a combined stream was "hdiutil:" rather than the device.
+	cmd := exec.Command("hdiutil", args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("hdiutil attach %s: %v: %s", path, err, out)
+		t.Fatalf("hdiutil attach %s: %v: %s%s", path, err, out, stderr.String())
 	}
 	dev := strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
 	return dev
+}
+
+// mountRaw attaches and mounts a raw image and returns its /dev node, reading
+// the device from stdout only (see attachRaw).
+func mountRaw(t *testing.T, path string) string {
+	t.Helper()
+	cmd := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", path)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("hdiutil mount %s: %v: %s%s", path, err, out, stderr.String())
+	}
+	return strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
 }
 
 func detach(dev string) { _ = exec.Command("hdiutil", "detach", dev).Run() }
@@ -123,11 +142,7 @@ func TestDarwinWriteRoundTrip(t *testing.T) {
 	detach(dev)
 
 	// macOS mounts RW and reads back.
-	out, err := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", p).CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil mount: %v: %s", err, out)
-	}
-	dev = strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev = mountRaw(t, p)
 	defer detach(dev)
 	mnt := "/Volumes/GORW"
 	// Wait briefly for the mount to settle.
@@ -170,11 +185,7 @@ func TestDarwinWriteIntoAppleImage(t *testing.T) {
 		}
 	}
 	// macOS writes one file.
-	out, err := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("attach apple: %v: %s", err, out)
-	}
-	dev := strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev := mountRaw(t, img)
 	mnt := "/Volumes/APPLEMADE"
 	time.Sleep(300 * time.Millisecond)
 	if err := os.WriteFile(filepath.Join(mnt, "orig.txt"), []byte("orig from apple\n"), 0o644); err != nil {
@@ -205,11 +216,7 @@ func TestDarwinWriteIntoAppleImage(t *testing.T) {
 	detach(dev)
 
 	// macOS reads the Go additions and the original.
-	out, err = exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", img).CombinedOutput()
-	if err != nil {
-		t.Fatalf("remount apple: %v: %s", err, out)
-	}
-	dev = strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev = mountRaw(t, img)
 	defer detach(dev)
 	time.Sleep(300 * time.Millisecond)
 	for name, want := range map[string]string{
@@ -294,11 +301,7 @@ func TestDarwinFragmentedForkFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	out, err := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", p).CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil mount: %v: %s", err, out)
-	}
-	dev = strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev = mountRaw(t, p)
 	defer detach(dev)
 	mnt := "/Volumes/FRAG"
 	waitMount(mnt)
@@ -354,11 +357,7 @@ func TestDarwinCatalogGrowthFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	out, err := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", p).CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil mount: %v: %s", err, out)
-	}
-	dev = strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev = mountRaw(t, p)
 	defer detach(dev)
 	mnt := "/Volumes/GROW"
 	waitMount(mnt)
@@ -425,11 +424,7 @@ func TestDarwinChurnFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	out, err := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", p).CombinedOutput()
-	if err != nil {
-		t.Fatalf("hdiutil mount: %v: %s", err, out)
-	}
-	dev = strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev = mountRaw(t, p)
 	defer detach(dev)
 	mnt := "/Volumes/CHURN"
 	waitMount(mnt)
