@@ -40,6 +40,12 @@ func TestDarwinChtimes(t *testing.T) {
 	if err := v.Chtimes("/sub", dirT, dirT); err != nil {
 		t.Fatal(err)
 	}
+	if err := v.Chmod("/a.txt", 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Chmod("/sub", 0o750); err != nil {
+		t.Fatal(err)
+	}
 	v.Close()
 
 	// hdiutil warns on stderr on some hosts, so only its stdout names the device
@@ -86,7 +92,14 @@ func TestDarwinChtimes(t *testing.T) {
 			t.Errorf("%s: macOS atime %d, want %d", name, a, unix(v2[0]))
 		}
 	}
+	// Chtimes ran before Chmod on /sub and /a.txt: the mtime survives Chmod.
 	if a, m := stat("/sub"); m != dirT.Unix() || a != dirT.Unix() {
 		t.Errorf("/sub: macOS atime %d mtime %d, want %d", a, m, dirT.Unix())
+	}
+	for name, want := range map[string]string{"/a.txt": "640", "/sub": "750"} {
+		o, err := exec.Command("stat", "-f", "%Lp", filepath.Join(mnt, name)).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(o)) != want {
+			t.Errorf("%s: macOS mode %q (%v), want %s", name, o, err, want)
+		}
 	}
 }

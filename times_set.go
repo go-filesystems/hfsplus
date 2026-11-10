@@ -7,12 +7,6 @@ import (
 	"time"
 )
 
-// The driver has Chtimes but not Chmod or Chown, so it does not satisfy the
-// bundled filesystem.MetadataSetter; callers probe for the single method.
-var _ interface {
-	Chtimes(path string, atime, mtime time.Time) error
-} = (*Volume)(nil)
-
 // hfsNow is the clock Chtimes stamps attributeModDate with.
 var hfsNow = time.Now
 
