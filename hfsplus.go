@@ -368,7 +368,11 @@ func (v *Volume) Stat(path string) (filesystem.Stat, error) {
 	}
 	switch {
 	case r.rec.folder != nil:
-		return filesystem.NewStat(modeDirDefault, 0, uint64(r.rec.folder.folderID)), nil
+		mode := r.rec.folder.permMode
+		if mode == 0 {
+			mode = modeDirDefault
+		}
+		return filesystem.NewStat(mode, 0, uint64(r.rec.folder.folderID)), nil
 	case r.rec.file != nil:
 		mode := r.rec.file.permMode
 		if mode == 0 {

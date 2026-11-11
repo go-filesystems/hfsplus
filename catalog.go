@@ -70,6 +70,7 @@ type catalogFolder struct {
 	valence  uint32
 	flags    uint16
 	dates    [20]byte // createDate..backupDate, raw big-endian (record bytes 12..32)
+	permMode uint16   // BSD mode from HFSPlusBSDInfo (record bytes 42..44), 0 if absent
 }
 
 type catalogFile struct {
@@ -109,6 +110,9 @@ func parseCatalogRecord(data []byte) (catalogRecord, bool) {
 		}
 		if len(data) >= 32 {
 			copy(cfo.dates[:], data[12:32])
+		}
+		if len(data) >= 44 {
+			cfo.permMode = binary.BigEndian.Uint16(data[42:44])
 		}
 		return catalogRecord{recType: rt, folder: cfo}, true
 	case recordFile:
