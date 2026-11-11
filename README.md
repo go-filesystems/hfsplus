@@ -56,7 +56,8 @@ correctness test.
 
 **Out of scope** (as with the `btrfs`/`xfs` siblings — these are deliberate non-goals, not partial implementations):
 
-- **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted).
+- **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted). A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were. One whose journal holds transactions, or whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused. To make such a volume writable, mount and unmount it on macOS first so its journal is replayed.
+- **Do not write an image that is mounted.** The whole image is read into memory and written back by `Sync`; macOS keeps its own view of a mounted volume and the two clobber each other (see `detach` in `macos_validation_test.go`).
 - **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not handled (compression is detected and rejected rather than returning wrong bytes).
 
 ## Module
@@ -130,6 +131,7 @@ memory). The returned `*Volume` implements
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
+| `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending, or unreadable / off-volume / other-device / bad checksum); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written |
 
 ## Validation
 
@@ -146,7 +148,16 @@ The write path is validated by darwin-only tests
 go test -run TestDarwinWriteRoundTrip
 # hdiutil-created image → Go writes into it → fsck clean + macOS reads it
 go test -run TestDarwinWriteIntoAppleImage
+# journaled image with an empty journal → Go writes → macOS replays nothing and reads it
+go test -run TestDarwinWriteIntoJournaledImage
 ```
+
+The tests take the mount point from `hdiutil attach`'s output, never from a
+spelled `/Volumes/<name>`: a volume of the same name left mounted by an earlier
+run (or another session) pushes the new one to `/Volumes/<name> 1`, and a test
+that read the spelled path read the stale volume, which is how
+`TestDarwinWriteIntoAppleImage` reported the driver's files as missing
+(#29; `TestDarwinMountPointsAreNotShared` keeps it fixed).
 
 Each test formats/writes with the pure-Go driver, attaches the raw image with
 `hdiutil`, asserts `fsck_hfs -n` reports the volume **clean**, then mounts it
@@ -168,11 +179,14 @@ each road with `runtime.MemStats`):
 | a B-tree node | `nodeSize` is a power of two in [512, 32768] |
 
 Fuzz targets: `FuzzOpenHeader`, `FuzzOpenPatched`, `FuzzBombs` (asserts a
-per-input allocation budget).
+per-input allocation budget), `FuzzJournalHeader` and `FuzzCheckJournal` (the
+journal header and journal info block that decide whether a journaled volume is
+writable).
 
 ## References
 
-- Apple TN1150, *HFS Plus Volume Format*.
+- Apple TN1150, *HFS Plus Volume Format* (Journal, Journal Info Block, Journal Checksums, Replaying the Journal).
+- Linux `fs/hfsplus/super.c`: a journaled volume is mounted read-only unless forced.
 - `man hdiutil`, `man fsck_hfs`, `man newfs_hfs`.
 
 ## License

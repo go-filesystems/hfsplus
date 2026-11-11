@@ -64,9 +64,8 @@ func TestDarwinChtimes(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	dev = attach(p)
+	dev, mnt := mountRaw(t, p)
 	defer detach(dev)
-	mnt := "/Volumes/GOCT"
 	waitMount(mnt)
 	stat := func(p string) (a, m int64) {
 		// stat -f %a/%m: seconds since the epoch (negative before 1970).

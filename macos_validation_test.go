@@ -7,6 +7,7 @@ package hfsplus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -46,9 +47,16 @@ func attachRaw(t *testing.T, path string, readonly bool) string {
 	return dev
 }
 
-// mountRaw attaches and mounts a raw image and returns its /dev node, reading
-// the device from stdout only (see attachRaw).
-func mountRaw(t *testing.T, path string) string {
+// mountRaw attaches and mounts a raw image and returns its /dev node and the
+// mount point macOS actually chose, both read from stdout only (see attachRaw).
+//
+// The mount point must come from hdiutil, never be spelled "/Volumes/<name>":
+// when a volume of that name is already mounted (a leaked attachment from an
+// earlier run, another session on the same host) macOS mounts the new one at
+// "/Volumes/<name> 1", and a test that reads the spelled path reads the OTHER
+// volume. That was go-filesystems/hfsplus#29: orig.txt was found, in the stale
+// volume, and the Go-written files were "missing".
+func mountRaw(t *testing.T, path string) (dev, mnt string) {
 	t.Helper()
 	cmd := exec.Command("hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", path)
 	var stderr strings.Builder
@@ -57,10 +65,43 @@ func mountRaw(t *testing.T, path string) string {
 	if err != nil {
 		t.Fatalf("hdiutil mount %s: %v: %s%s", path, err, out, stderr.String())
 	}
-	return strings.Fields(strings.SplitN(string(out), "\n", 2)[0])[0]
+	dev, mnt, err = parseAttach(string(out))
+	if err != nil {
+		t.Fatalf("hdiutil mount %s: %v", path, err)
+	}
+	return dev, mnt
 }
 
-func detach(dev string) { _ = exec.Command("hdiutil", "detach", dev).Run() }
+// parseAttach reads `hdiutil attach` stdout: lines of "<dev>\t<type>\t<mount>".
+func parseAttach(out string) (dev, mnt string, err error) {
+	for _, line := range strings.Split(out, "\n") {
+		cols := strings.Split(line, "\t")
+		if len(cols) < 3 {
+			continue
+		}
+		if m := strings.TrimSpace(cols[len(cols)-1]); strings.HasPrefix(m, "/Volumes/") {
+			return strings.TrimSpace(cols[0]), m, nil
+		}
+	}
+	return "", "", fmt.Errorf("no mount point in %q", out)
+}
+
+// detach unmounts and detaches dev. It does not swallow a failure: a volume
+// that stays attached (Spotlight or fseventsd still holding a freshly written
+// volume) holds a stale view of the image and keeps its name, so it is retried
+// and finally forced; a volume that cannot be detached at all is a test error.
+func detach(dev string) {
+	var err error
+	for i := 0; i < 5; i++ {
+		if err = exec.Command("hdiutil", "detach", dev).Run(); err == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err = exec.Command("hdiutil", "detach", "-force", dev).Run(); err != nil {
+		panic(fmt.Sprintf("hfsplus tests: cannot detach %s, its mount would shadow later volumes: %v", dev, err))
+	}
+}
 
 // fsckClean runs fsck_hfs -n on a /dev node and fails unless the volume is
 // reported OK. fsck_hfs cannot open the raw character device for *write* in the
@@ -142,9 +183,8 @@ func TestDarwinWriteRoundTrip(t *testing.T) {
 	detach(dev)
 
 	// macOS mounts RW and reads back.
-	dev = mountRaw(t, p)
+	dev, mnt := mountRaw(t, p)
 	defer detach(dev)
-	mnt := "/Volumes/GORW"
 	// Wait briefly for the mount to settle.
 	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(mnt); err == nil {
@@ -185,8 +225,7 @@ func TestDarwinWriteIntoAppleImage(t *testing.T) {
 		}
 	}
 	// macOS writes one file.
-	dev := mountRaw(t, img)
-	mnt := "/Volumes/APPLEMADE"
+	dev, mnt := mountRaw(t, img)
 	time.Sleep(300 * time.Millisecond)
 	if err := os.WriteFile(filepath.Join(mnt, "orig.txt"), []byte("orig from apple\n"), 0o644); err != nil {
 		detach(dev)
@@ -216,7 +255,7 @@ func TestDarwinWriteIntoAppleImage(t *testing.T) {
 	detach(dev)
 
 	// macOS reads the Go additions and the original.
-	dev = mountRaw(t, img)
+	dev, mnt = mountRaw(t, img)
 	defer detach(dev)
 	time.Sleep(300 * time.Millisecond)
 	for name, want := range map[string]string{
@@ -232,6 +271,120 @@ func TestDarwinWriteIntoAppleImage(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("macOS read %s = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// appleImage creates a 16 MiB HFS+ image with hdiutil (fs is "HFS+" or
+// "Journaled HFS+") and returns its path.
+func appleImage(t *testing.T, fs, volname string) string {
+	t.Helper()
+	dir := t.TempDir()
+	dmg := filepath.Join(dir, "apple.dmg")
+	if out, err := exec.Command("hdiutil", "create", "-size", "16m", "-fs", fs,
+		"-volname", volname, "-layout", "NONE", "-ov", dmg).CombinedOutput(); err != nil {
+		t.Skipf("hdiutil create unavailable in sandbox: %v: %s", err, out)
+	}
+	img := filepath.Join(dir, "apple.img")
+	if err := os.Rename(dmg, img); err != nil {
+		t.Fatalf("locate created image: %v", err)
+	}
+	return img
+}
+
+// TestDarwinWriteIntoJournaledImage: a journaled volume (kHFSVolumeJournaledBit,
+// a journal info block, a journal) whose journal macOS left empty is written by
+// the Go side, and macOS then mounts it, replays the empty journal, and sees the
+// additions. The journal itself is untouched by the write. (hfsplus#29 suspected
+// the journal of hiding writes; it does not, see journal.go.)
+func TestDarwinWriteIntoJournaledImage(t *testing.T) {
+	requireTools(t)
+	img := appleImage(t, "Journaled HFS+", "JNLMADE")
+	dev, mnt := mountRaw(t, img)
+	time.Sleep(300 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(mnt, "orig.txt"), []byte("orig from apple\n"), 0o644); err != nil {
+		detach(dev)
+		t.Fatalf("macOS write orig: %v", err)
+	}
+	detach(dev)
+
+	before, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := OpenFileWritable(img)
+	if err != nil {
+		t.Fatalf("OpenFileWritable on a journaled volume with an empty journal: %v", err)
+	}
+	if v.vh.Attributes&kHFSVolumeJournaledBit == 0 {
+		t.Fatal("hdiutil made a volume that is not journaled; the test proves nothing")
+	}
+	if err := v.WriteFile("/go_added.txt", []byte("written by pure-go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MkDir("/godir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.WriteFile("/godir/inner.txt", []byte("inner go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v.Close()
+
+	after, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vh, err := readVolumeHeader(bytesReaderAt(after))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jo := uint64(vh.JournalInfoBlock) * uint64(vh.BlockSize)
+	jib := after[jo : jo+journalInfoBlockLen]
+	joff := binary.BigEndian.Uint64(jib[36:44])
+	if !bytes.Equal(after[jo:jo+journalInfoBlockLen], before[jo:jo+journalInfoBlockLen]) ||
+		!bytes.Equal(after[joff:joff+512], before[joff:joff+512]) {
+		t.Error("the write changed the journal info block or the journal header")
+	}
+
+	dev, mnt = mountRaw(t, img)
+	defer detach(dev)
+	time.Sleep(300 * time.Millisecond)
+	for name, want := range map[string]string{
+		"orig.txt":        "orig from apple\n",
+		"go_added.txt":    "written by pure-go\n",
+		"godir/inner.txt": "inner go\n",
+	} {
+		got, err := os.ReadFile(filepath.Join(mnt, name))
+		if err != nil {
+			t.Errorf("macOS read %s: %v", name, err)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("macOS read %s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestDarwinMountPointsAreNotShared is the regression test for hfsplus#29: two
+// images with the same volume name mounted at once land on different mount
+// points, and mountRaw reports each its own, so a test never reads a stale
+// volume that kept the plain name.
+func TestDarwinMountPointsAreNotShared(t *testing.T) {
+	requireTools(t)
+	a := appleImage(t, "HFS+", "SAMENAME")
+	b := appleImage(t, "HFS+", "SAMENAME")
+	devA, mntA := mountRaw(t, a)
+	defer detach(devA)
+	devB, mntB := mountRaw(t, b)
+	defer detach(devB)
+	if mntA == mntB {
+		t.Fatalf("both volumes mounted at %s", mntA)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(mntA, "only-in-a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(mntB, "only-in-a.txt")); err == nil {
+		t.Errorf("%s shows a file written to %s", mntB, mntA)
 	}
 }
 
@@ -301,9 +454,8 @@ func TestDarwinFragmentedForkFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	dev = mountRaw(t, p)
+	dev, mnt := mountRaw(t, p)
 	defer detach(dev)
-	mnt := "/Volumes/FRAG"
 	waitMount(mnt)
 	got, err := os.ReadFile(filepath.Join(mnt, "frag_big.bin"))
 	if err != nil {
@@ -357,9 +509,8 @@ func TestDarwinCatalogGrowthFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	dev = mountRaw(t, p)
+	dev, mnt := mountRaw(t, p)
 	defer detach(dev)
-	mnt := "/Volumes/GROW"
 	waitMount(mnt)
 	ents, err := os.ReadDir(mnt)
 	if err != nil {
@@ -424,9 +575,8 @@ func TestDarwinChurnFsck(t *testing.T) {
 	fsckClean(t, dev)
 	detach(dev)
 
-	dev = mountRaw(t, p)
+	dev, mnt := mountRaw(t, p)
 	defer detach(dev)
-	mnt := "/Volumes/CHURN"
 	waitMount(mnt)
 	ents, err := os.ReadDir(mnt)
 	if err != nil {

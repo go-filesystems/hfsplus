@@ -43,6 +43,8 @@
 //
 //   - Journaling, decmpfs compression, resource forks, and indirect-node
 //     hardlink following are not implemented; see the README Status section.
+//     A journaled volume with an empty journal is written directly; one with
+//     transactions in its journal is refused read/write with ErrJournaled.
 //
 // Fragmented data forks (more than eight extents), catalog and
 // extents-overflow B-tree growth, and node-underflow rebalancing/merging on
