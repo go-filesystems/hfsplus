@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 )
 
 // memStore is a readerWriterAt over a byte slice with an fsync that does nothing:
@@ -59,6 +60,10 @@ func fuzzOps(v *Volume) []bool {
 // adjustParentValence on a patched image.)
 func FuzzWritable(f *testing.F) {
 	base := fuzzSeed(f)
+	// The two runs must stamp the same time on what they create.
+	fixed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	timeNow = func() time.Time { return fixed }
+	f.Cleanup(func() { timeNow = time.Now })
 	f.Add(int64(volumeHeaderOffset+112), []byte{0xff, 0xff, 0xff, 0xff})
 	f.Add(int64(5*4096), []byte{0, 0, 0, 9})
 	f.Add(int64(6*4096), []byte{0xff, 0xff})

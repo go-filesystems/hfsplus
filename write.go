@@ -31,6 +31,9 @@ var (
 	_ filesystem.Truncater  = (*Volume)(nil)
 )
 
+// timeNow is the clock stamped on new records; a variable so a test can pin it.
+var timeNow = time.Now
+
 // txn bundles the mutable state a single operation touches.
 type txn struct {
 	v   *Volume
@@ -314,7 +317,7 @@ func (t *txn) createFile(parent uint32, name string, data []byte, mode uint16) e
 			}
 		}
 	}
-	fileRec := encodeFileRecord(cnid, time.Now(), mode, df)
+	fileRec := encodeFileRecord(cnid, timeNow(), mode, df)
 	key := encodeCatalogKey(parent, name)
 	rec := assembleCatalogRecord(key, fileRec)
 	if err := t.cw.insertRecord(rec); err != nil {
@@ -411,7 +414,7 @@ func (v *Volume) MkDir(p string, perm os.FileMode) error {
 	}
 	cnid := v.nextCNID()
 	mode := uint16(sIFDIR) | uint16(perm.Perm())
-	folderRec := encodeFolderRecord(cnid, time.Now(), 0)
+	folderRec := encodeFolderRecord(cnid, timeNow(), 0)
 	binary.BigEndian.PutUint16(folderRec[42:44], mode)
 	if v.CaseSensitive() {
 		setHasFolderCount(folderRec, 0)
