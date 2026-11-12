@@ -9,14 +9,10 @@ import (
 	"os"
 	"strings"
 
-	filesystem "github.com/go-filesystems/interface"
-	"github.com/go-volumes/safeio"
-)
+	"sync"
 
-// maxImageBytes caps the in-memory image a writable open will allocate. HFS+
-// volumes addressed here are disk-image sized; 64 GiB is a generous ceiling
-// that still defeats a bogus stat size triggering a wild allocation.
-const maxImageBytes = 64 << 30
+	filesystem "github.com/go-filesystems/interface"
+)
 
 // Unix mode type bits used when synthesising a Stat mode for entries whose
 // BSD info is absent.
@@ -38,10 +34,9 @@ const (
 
 // Volume is an opened HFS+ (or HFSX) volume. When opened read-only (Open /
 // OpenFile) the mutating methods return ErrReadOnly. When opened writable
-// (OpenWritable / OpenFileWritable / Format) the whole image is held in an
-// in-memory byte slice that the write path edits in place; Sync (and the
-// mutators, which Sync implicitly) flush the bytes back to the backing
-// io.WriterAt when one is present.
+// (OpenWritable / OpenFileWritable / Format) the image is read and written in
+// place: nothing but the structures one mutation touches is held in memory, and
+// each mutation writes only the sectors it changed (see store.go).
 type Volume struct {
 	rs          io.ReaderAt
 	size        int64
@@ -50,20 +45,57 @@ type Volume struct {
 	extentsTree *btree
 	closer      io.Closer
 
-	// img is the full mutable image. Non-nil only for writable volumes; the
-	// write engine edits it in place and rebuilds catalogTree/vh from it.
+	// wr is set for a writable volume.
+	wr bool
+	// img is the optional in-memory image of OpenWritable (nil for a file-backed
+	// volume): the store mirrors every write into it, so Bytes() stays current.
 	img []byte
+	// under is the image as it is on the backing store; rs is under with the
+	// current transaction's regions laid over it (writable volumes only).
+	under io.ReaderAt
 	// extentsWriter is the active extents-overflow tree writer during a
 	// mutation; the catalog-fork growth path spills its extents through it.
 	// Bound by txn.begin and cleared on commit.
 	extentsWriter *extentsWriter
-	// wa is the optional backing store flushed by Sync. nil for purely
+	// wa is the optional backing store the write path writes to. nil for purely
 	// in-memory writable volumes (OpenWritable on a []byte).
 	wa io.WriterAt
+
+	// Transaction state, see store.go.
+	regions     map[int64]*region
+	regionBytes int64
+	werr        error // first error of a setter that cannot return one
+	dataDirty   bool  // file data was written since the last fsync
+	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
+	// every commit with the unmounted bit cleared, then set again.
+	cleanOnDisk bool
+	// failed is the error of the write or fsync that failed; every later mutation
+	// is refused with ErrVolumeFailed (see there).
+	failed error
+	// touched: the flush in progress has begun writing (a failure now leaves the
+	// disk in an unknown state, unlike one before the first write).
+	touched bool
+	// reconciled: freeBlocks has been checked against the bitmap (first write).
+	reconciled bool
+	cacheOn    bool
+	rcMu       sync.Mutex
+	rcache     map[int64][]byte
 }
 
 // writable reports whether the volume was opened for writing.
-func (v *Volume) writable() bool { return v.img != nil }
+func (v *Volume) writable() bool { return v.wr }
+
+// mutable is the check every mutator starts with: ErrReadOnly for a read-only
+// volume, ErrVolumeFailed once a write to the backing store has failed.
+func (v *Volume) mutable() error {
+	if !v.wr {
+		return ErrReadOnly
+	}
+	if v.failed != nil {
+		return fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
+	}
+	return nil
+}
 
 var _ filesystem.Filesystem = (*Volume)(nil)
 
@@ -163,17 +195,28 @@ func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
 	if _, err := checkJournal(img, v.vh); err != nil {
 		return nil, err
 	}
+	v.enableWrites(bytesReaderAt(img), int64(len(img)), false)
 	v.img = img
 	v.wa = wa
-	// Rebind the reader to the in-memory image so the write path sees its own
-	// edits immediately.
-	v.rs = bytesReaderAt(img)
 	return v, nil
 }
 
-// OpenFileWritable opens the image at path for read/write. The whole image is
-// read into memory; mutations are flushed back to the file by Sync (and
-// implicitly by every mutator).
+// enableWrites turns a freshly opened volume into a writable one over under.
+func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) {
+	v.wr = true
+	v.under = under
+	v.size = size
+	v.rs = overlayReader{v}
+	v.cleanOnDisk = v.vh.Attributes&kHFSVolumeUnmountedBit != 0
+	if cache {
+		v.cacheOn = true
+		v.rcache = make(map[int64][]byte)
+	}
+}
+
+// OpenFileWritable opens the image at path for read/write, in place: the image
+// is not copied into memory. Each mutation reads what it needs from the file and
+// writes back only what it changed (see store.go); the mutators sync as they go.
 func OpenFileWritable(path string) (*Volume, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -184,42 +227,56 @@ func OpenFileWritable(path string) (*Volume, error) {
 		f.Close()
 		return nil, fmt.Errorf("hfsplus: stat %s: %w", path, err)
 	}
-	// Bound the in-memory image allocation against a generous ceiling so a
-	// bogus stat size cannot trigger a wild allocation (safeio class A).
-	img, err := safeio.MakeBytes(st.Size(), maxImageBytes)
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("hfsplus: image size %d: %w", st.Size(), err)
-	}
-	if _, err := io.ReadFull(f, img); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("hfsplus: read %s: %w", path, err)
-	}
-	v, err := OpenWritable(img, &fileWriterAt{f})
+	v, err := openInPlace(f, st.Size())
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	v.closer = f
+	v.wa = &fileWriterAt{f}
 	return v, nil
 }
 
-// Bytes returns the current (possibly mutated) image bytes for a writable
-// volume, or nil for a read-only one. The slice aliases the volume's internal
-// buffer; copy it if you need a stable snapshot.
+// readerWriterAt is a store that can be read and written at an offset (an
+// *os.File; the in-memory store of the fuzzer).
+type readerWriterAt interface {
+	io.ReaderAt
+	io.WriterAt
+}
+
+// openInPlace opens the size-byte image held by rw for read/write without
+// copying it: the path of OpenFileWritable, over any readerWriterAt. If rw is an
+// io.Closer, Close releases it.
+func openInPlace(rw readerWriterAt, size int64) (*Volume, error) {
+	v, err := Open(rw, size)
+	if err != nil {
+		return nil, err
+	}
+	// The write path bypasses the journal; see OpenWritable.
+	if _, err := checkJournalAt(rw, size, v.vh); err != nil {
+		return nil, err
+	}
+	v.enableWrites(rw, size, true)
+	v.wa = rw
+	return v, nil
+}
+
+// Bytes returns the current (possibly mutated) image bytes of a volume opened
+// with OpenWritable over a []byte, or nil for any other volume (read-only, or
+// file-backed, which holds no copy of the image). The slice aliases the
+// volume's buffer; copy it if you need a stable snapshot.
 func (v *Volume) Bytes() []byte { return v.img }
 
-// Sync flushes the in-memory image back to the backing store, if any. It is a
-// no-op for read-only or purely in-memory volumes.
+// Sync makes what the volume has written durable. Every mutator has already
+// written its changes (data, then B-trees and bitmap, then the alternate and the
+// primary volume header, with an fsync after each stage), so this is a final
+// fsync; it is a no-op for read-only or purely in-memory volumes.
 func (v *Volume) Sync() error {
-	if v.wa == nil || v.img == nil {
+	if !v.wr {
 		return nil
 	}
-	if _, err := v.wa.WriteAt(v.img, 0); err != nil {
-		return fmt.Errorf("hfsplus: sync: %w", err)
-	}
-	if s, ok := v.wa.(interface{ Sync() error }); ok {
-		return s.Sync()
+	if err := v.fsync(); err != nil {
+		v.failed = err
+		return err
 	}
 	return nil
 }

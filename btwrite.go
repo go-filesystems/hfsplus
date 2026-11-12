@@ -113,9 +113,10 @@ const (
 	kHFSCatalogFileID = 4
 )
 
-// nodeBytes returns the live image slice for node n, mapping it through the
-// fork's extent list. Returns nil if n is out of range (caller must have grown
-// the fork first).
+// nodeBytes returns the live, editable bytes of node n, mapping it through the
+// fork's extent list: the transaction's private copy of the node (loaded from the
+// image on first use; at commit only its changed sectors are written back).
+// Returns nil if n is out of range (caller must have grown the fork first).
 func (bw *btreeWriter) nodeBytes(n uint32) []byte {
 	logical := int64(n) * int64(bw.nodeSize)
 	var base int64
@@ -123,7 +124,12 @@ func (bw *btreeWriter) nodeBytes(n uint32) []byte {
 		span := int64(e.BlockCount) * bw.bs
 		if logical < base+span {
 			abs := int64(e.StartBlock)*bw.bs + (logical - base)
-			return bw.v.img[abs : abs+int64(bw.nodeSize)]
+			b, err := bw.v.region(abs, bw.nodeSize)
+			if err != nil {
+				bw.v.noteErr(err)
+				return nil
+			}
+			return b
 		}
 		base += span
 	}
@@ -145,7 +151,25 @@ func (bw *btreeWriter) forkBlocks() uint32 {
 // hdr returns the live BTHeaderRec bytes (record 0 of the header node).
 func (bw *btreeWriter) hdrRec() []byte {
 	b := bw.nodeBytes(0)
+	if b == nil {
+		// The header node cannot be addressed: hand back scratch space so the
+		// accessors do not index nil, and make the commit refuse.
+		if bw.v.werr == nil {
+			bw.v.werr = fmt.Errorf("%w: btree header node unmapped", ErrCorrupt)
+		}
+		return make([]byte, bw.nodeSize-nodeDescriptorLen)
+	}
 	return b[nodeDescriptorLen:]
+}
+
+// descriptorOf returns the node descriptor of node n, or ErrCorrupt when n
+// cannot be addressed.
+func (bw *btreeWriter) descriptorOf(n uint32) (nodeDescriptor, error) {
+	b := bw.nodeBytes(n)
+	if b == nil {
+		return nodeDescriptor{}, fmt.Errorf("%w: node %d unmapped", ErrCorrupt, n)
+	}
+	return parseNodeDescriptor(b), nil
 }
 
 // The structural setters (rootNode, firstLeaf, lastLeaf) update BOTH the

@@ -32,7 +32,7 @@ correctness test.
 | Feature | Status | Notes |
 |---|---:|---|
 | Open / OpenFile / Close | ✅ | Read-only; volume header at offset 1024; `H+` (HFS+) and `HX` (HFSX) signatures |
-| OpenWritable / OpenFileWritable / Sync | ✅ | Read/write; image held in memory, mutated in place, flushed by `Sync` |
+| OpenWritable / OpenFileWritable / Sync | ✅ | Read/write **in place**: no copy of the image; each mutation writes only the sectors it changed (see "Cost of a write") |
 | ListDir / Stat / ReadFile / ReadLink | ✅ | Catalog walk; BSD perms; data fork via 8 inline extents **+ extents-overflow**; `S_IFLNK` targets |
 | **Format / Mkfs (pure Go)** | ✅ | Lays down a valid empty HFS+/HFSX volume on **every arch**; `fsck_hfs -n` clean + macOS mounts RW |
 | **WriteFile** | ✅ | Allocates blocks, writes the data fork, inserts catalog file + thread records |
@@ -57,8 +57,54 @@ correctness test.
 **Out of scope** (as with the `btrfs`/`xfs` siblings — these are deliberate non-goals, not partial implementations):
 
 - **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted). A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were. One whose journal holds transactions, or whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused. To make such a volume writable, mount and unmount it on macOS first so its journal is replayed.
-- **Do not write an image that is mounted.** The whole image is read into memory and written back by `Sync`; macOS keeps its own view of a mounted volume and the two clobber each other (see `detach` in `macos_validation_test.go`).
+- **Do not write an image that is mounted.** macOS keeps its own view of a mounted volume (cached nodes, bitmap and headers) and the two clobber each other (see `detach` in `macos_validation_test.go`).
 - **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not handled (compression is detected and rejected rather than returning wrong bytes).
+
+## Cost of a write
+
+`OpenFileWritable` reads and writes the image **in place** over the file; it never holds a copy of it, so
+opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceiling is gone.
+
+- **Memory** is what one mutation touches (the B-tree nodes and bitmap chunks it edits, the two volume
+  headers; refused beyond 64 MiB) plus a read cache of at most 8 MiB. It does not grow with the image.
+  The bitmap is read in chunks of at most 4 KiB, never loaded whole. (`OpenWritable` over a `[]byte` is
+  the caller's own copy, kept current for `Bytes()`; `Format`/`Mkfs` still build the new image in memory.)
+- **Bytes written** per mutation are the file's data blocks plus the 512-byte sectors that changed:
+  a 1-byte `WriteFile` is a data block, a few catalog and bitmap sectors and the two 512-byte headers
+  (tens of KiB at the most); `Chtimes` is one catalog node's changed sectors and the headers. Not the image.
+  Measured on a 1 GiB sparse image by `TestInPlaceLargeSparseImage`.
+- **Order** of each mutation (Apple TN1150, "Volume Header", "Allocation File"): file data, then the
+  primary header rewritten with `kHFSVolumeUnmountedBit` cleared, fsync; the B-tree and bitmap sectors,
+  fsync; then the alternate header and, last, the primary header (bit set again), fsync. A crash anywhere
+  in between leaves the bit clear, so the next mount runs `fsck_hfs` instead of trusting a half-written
+  volume (go-filesystems/hfsplus#32, finding 6). A volume that was already not cleanly unmounted when
+  opened is left that way. The cost is three fsyncs per mutation. The guarantee is exactly that the
+  fsyncs separate the three groups (data and the cleared bit; B-tree and bitmap sectors; both headers);
+  the alternate and the primary header are written back to back with no fsync between them, and the
+  B-tree sectors are edited in place, so a crash is repaired by `fsck_hfs`, not by the driver (there is
+  no journal). Commit latency is tracked in hfsplus#35.
+- **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
+  journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
+  the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
+  `kHFSVolumeJournaledBit` in its first header write, whether or not the volume was cleanly unmounted at open
+  (a journaled volume left dirty with an empty journal is a real state; the journal was empty at open
+  and is never written), and the final header restores it. Measured with `fsck_hfs` on crash images of
+  Go-made, Apple HFS+, Apple Journaled HFS+ and Apple Journaled HFS+ left dirty
+  (`TestDarwinCrashImagesFsck`): every dirty image makes `-q` exit non-zero (for the volume dirty at
+  open, every image with the journaled bit cleared mid-commit), every image still marked clean passes `-fn`. What macOS does with a volume left
+  mid-commit (`TestDarwinMountOfCrashedJournaled`, opt-in): it mounts it read/write as plain
+  "HFS+", not journaled, sets the unmounted bit when it unmounts it, and `fsck_hfs -fn` is clean
+  afterwards; the journal is not re-enabled (the volume stays non-journaled until
+  `diskutil enableJournal`) and nothing is lost. Whether macOS ran a full check at mount was not
+  observed directly. Restoring the bit is safe in every state: the journal is never written.
+- **A failed write** (a `WriteAt` or an fsync error after the first write of a mutation) leaves the disk
+  in an unknown state, so the volume is latched: every later mutation returns `ErrVolumeFailed` and
+  writes nothing until the volume is closed and opened again; reads still work. A failure before the
+  first write (while writing the file's data) latches nothing.
+- **`freeBlocks`** is counted from the bitmap at the first write of a volume (one pass over the bitmap,
+  in chunks), then kept in step bit by bit, so a wrong count in the header is put right.
+- **Allocation** scans the bitmap from block 0 for a free run, so a very full large volume reads more
+  bitmap per write (reads only; the bytes written stay O(change)).
 
 ## Module
 
@@ -118,13 +164,13 @@ memory). The returned `*Volume` implements
 | `Open(rs io.ReaderAt, size int64) (*Volume, error)` | Parse an HFS+/HFSX volume read-only from a `ReaderAt` |
 | `OpenFile(path string) (*Volume, error)` | Open an image file read-only |
 | `OpenWritable(img []byte, wa io.WriterAt) (*Volume, error)` | Open an in-memory image read/write |
-| `OpenFileWritable(path string) (*Volume, error)` | Open an image file read/write (mutations flushed by `Sync`) |
+| `OpenFileWritable(path string) (*Volume, error)` | Open an image file read/write in place (no copy of the image; each mutation writes and fsyncs what it changed) |
 | `Mkfs(size int64, cfg FormatConfig) ([]byte, error)` | Build a fresh empty HFS+/HFSX image in pure Go |
 | `Format(path string, size int64, cfg FormatConfig) (filesystem.Filesystem, error)` | Pure-Go format + open read/write |
 | `FormatAppleDmg(path, size, cfg)` | Optional darwin-only `hdiutil` alternative |
 | `(*Volume) WriteFile / MkDir / DeleteFile / DeleteDir / Rename` | Mutate the volume |
 | `(*Volume) SetLabel / Symlink / Truncate` | Optional `Labeller` / `Symlinker` / `Truncater` capabilities |
-| `(*Volume) Sync() error` | Flush the in-memory image to the backing store |
+| `(*Volume) Sync() error` | Final fsync (every mutator has already written and fsynced its changes) |
 | `(*Volume) ListDir / ReadFile / Stat / ReadLink` | Read paths |
 | `(*Volume) Chtimes` | `Chtimes(path, atime, mtime)`: contentModDate and accessDate as whole GMT seconds since 1904 (rounded down), attributeModDate (ctime) set to the clock, createDate untouched; a zero time leaves its field unchanged; a time outside 1904-01-01 00:00:01 .. 2040-02-06 06:28:15 GMT (the date 0 reads as "not recorded") is a `*TimeRangeError` (`errors.Is(err, ErrTimeOutOfRange)`), nothing written; the catalog record is patched in place, so the B-tree is unchanged in shape. Checked with `fsck_hfs` and a macOS mount |
 | `(*Volume) Chmod`, `Chown` | with `Chtimes`, the whole `filesystem.MetadataSetter` (what SMB/NFS/SFTP servers probe for). `Chmod` replaces the 12 permission bits (setuid/setgid/sticky included) of `HFSPlusBSDInfo.fileMode`, keeping the type bits; `Chown` sets ownerID/groupID; both patch the catalog record in place (file or folder), set attributeModDate to the clock, refuse the root folder, and `Stat` now reports a folder's recorded mode. Checked with a macOS mount (`stat -f %Lp`) |

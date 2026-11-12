@@ -64,9 +64,16 @@ func (bw *btreeWriter) walkMap(fn func(bitBase uint32, m []byte) (stop bool, err
 	}
 	bitBase += uint32(len(m)) * 8
 	// Follow the map-node chain from the header node's FLink.
-	hdr := parseNodeDescriptor(bw.nodeBytes(0))
+	hdr, err := bw.descriptorOf(0)
+	if err != nil {
+		return err
+	}
 	cur := hdr.FLink
-	for cur != 0 {
+	// FLink comes off the disk: bound the chain so a cycle cannot spin.
+	for steps := 0; cur != 0; steps++ {
+		if steps >= bw.maxChain() {
+			return fmt.Errorf("%w: map node chain does not end", ErrCorrupt)
+		}
 		ms, err := bw.mapNodeSlice(cur)
 		if err != nil {
 			return err
@@ -76,9 +83,19 @@ func (bw *btreeWriter) walkMap(fn func(bitBase uint32, m []byte) (stop bool, err
 			return err
 		}
 		bitBase += uint32(len(ms)) * 8
-		cur = parseNodeDescriptor(bw.nodeBytes(cur)).FLink
+		d, err := bw.descriptorOf(cur)
+		if err != nil {
+			return err
+		}
+		cur = d.FLink
 	}
 	return nil
+}
+
+// maxChain bounds a walk along a node chain by the nodes the fork can hold.
+func (bw *btreeWriter) maxChain() int {
+	n := int(bw.forkBlocks()) * int(bw.bs) / max(bw.nodeSize, 1)
+	return max(n, 1)
 }
 
 // mapCapacityBits returns the total number of node bits the current bitmap

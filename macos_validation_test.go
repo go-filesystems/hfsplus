@@ -516,8 +516,19 @@ func TestDarwinCatalogGrowthFsck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("macOS readdir: %v", err)
 	}
-	if len(ents) != n {
-		t.Fatalf("macOS sees %d entries, want %d", len(ents), n)
+	// Count the files this test made: macOS may add entries of its own to a
+	// volume it mounts read/write (see TestDarwinChurnFsck, #36); this test saw
+	// 5001 once, with the same cause suspected.
+	got := 0
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "f") && strings.HasSuffix(e.Name(), ".txt") {
+			got++
+		} else {
+			t.Logf("entry not made by this test: %q", e.Name())
+		}
+	}
+	if got != n {
+		t.Fatalf("macOS sees %d of the entries, want %d (%d entries in all)", got, n, len(ents))
 	}
 	for _, i := range []int{0, 1, n / 2, n - 2, n - 1} {
 		fp := filepath.Join(mnt, fmt.Sprintf("f%06d.txt", i))
@@ -588,7 +599,20 @@ func TestDarwinChurnFsck(t *testing.T) {
 			want++
 		}
 	}
-	if len(ents) != want {
-		t.Fatalf("macOS sees %d survivors, want %d", len(ents), want)
+	// Count the directories this test made. macOS mounts the volume read/write and
+	// may create its own entries (.fseventsd, .Spotlight-V100, .Trashes) at any
+	// moment after the mount: a count of every entry came out as 601 once, never
+	// reproduced in 25 further runs. The likely cause is one of those, so any
+	// other entry is logged, not counted.
+	got := 0
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "c") && len(e.Name()) == 7 {
+			got++
+		} else {
+			t.Logf("entry not made by this test: %q", e.Name())
+		}
+	}
+	if got != want {
+		t.Fatalf("macOS sees %d survivors, want %d (%d entries in all)", got, want, len(ents))
 	}
 }

@@ -31,6 +31,9 @@ var (
 	_ filesystem.Truncater  = (*Volume)(nil)
 )
 
+// timeNow is the clock stamped on new records; a variable so a test can pin it.
+var timeNow = time.Now
+
 // txn bundles the mutable state a single operation touches.
 type txn struct {
 	v   *Volume
@@ -40,6 +43,22 @@ type txn struct {
 }
 
 func (v *Volume) begin() (*txn, error) {
+	if v.failed != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
+	}
+	// A mutator that failed before commit left its edits in the regions: they
+	// were never written, so drop them and parse the volume as it is on disk.
+	if len(v.regions) > 0 || v.werr != nil {
+		v.discard()
+		v.reconciled = false
+		if err := v.reopen(); err != nil {
+			return nil, err
+		}
+	}
+	if !v.reconciled {
+		v.reconciled = true
+		v.reconcileFreeBlocks()
+	}
 	alc, err := v.newAllocator()
 	if err != nil {
 		return nil, err
@@ -68,19 +87,31 @@ func (t *txn) commit() error {
 	if err := t.v.reopen(); err != nil {
 		return err
 	}
-	return t.v.Sync()
+	if err := t.v.flush(); err != nil {
+		// What reached the disk is unknown beyond "a prefix of the order": forget
+		// the edits and re-read the volume as it is.
+		// and refuse every later mutation: the disk may hold part of this one.
+		if t.v.touched {
+			t.v.failed = err
+			t.v.cleanOnDisk = false
+		}
+		t.v.touched = false
+		t.v.discard()
+		_ = t.v.reopen()
+		return err
+	}
+	return nil
 }
 
 // --- volume header counter helpers ---
 
 func (v *Volume) headerU32(off int) uint32 {
-	return binary.BigEndian.Uint32(v.img[volumeHeaderOffset+off : volumeHeaderOffset+off+4])
+	return binary.BigEndian.Uint32(v.hdr(false)[off : off+4])
 }
 
 func (v *Volume) setHeaderU32(off int, val uint32) {
-	binary.BigEndian.PutUint32(v.img[volumeHeaderOffset+off:volumeHeaderOffset+off+4], val)
-	alt := int64(len(v.img)) - 1024
-	binary.BigEndian.PutUint32(v.img[alt+int64(off):alt+int64(off)+4], val)
+	binary.BigEndian.PutUint32(v.hdr(false)[off:off+4], val)
+	binary.BigEndian.PutUint32(v.hdr(true)[off:off+4], val)
 }
 
 const (
@@ -170,7 +201,14 @@ func (t *txn) adjustParentValence(parent uint32, delta, folderDelta int32) error
 		return fmt.Errorf("%w: no thread for folder CNID %d", ErrCorrupt, parent)
 	}
 	// Locate the folder record (gp, name) directly in its leaf and patch it.
-	return t.cw.patchFolderRecord(gp, name, func(folder []byte) {
+	short := false
+	err = t.cw.patchFolderRecord(gp, name, func(folder []byte) {
+		// A record this short is not a folder record (a hostile thread can point at
+		// any record): patching it would run past its end.
+		if len(folder) < 88 {
+			short = true
+			return
+		}
 		val := binary.BigEndian.Uint32(folder[4:8])
 		binary.BigEndian.PutUint32(folder[4:8], addU32(val, delta))
 		if binary.BigEndian.Uint16(folder[2:4])&kHFSHasFolderCountMask != 0 {
@@ -178,6 +216,10 @@ func (t *txn) adjustParentValence(parent uint32, delta, folderDelta int32) error
 			binary.BigEndian.PutUint32(folder[84:88], addU32(fc, folderDelta))
 		}
 	})
+	if err == nil && short {
+		err = fmt.Errorf("%w: folder record of CNID %d is %d bytes short", ErrCorrupt, parent, 88)
+	}
+	return err
 }
 
 // threadKeyOf returns the (parentCNID, name) recorded in the thread record of
@@ -202,8 +244,8 @@ func (v *Volume) threadKeyOf(cnid uint32) (uint32, string, bool, error) {
 // remaining runs are inserted into the extents-overflow B-tree, so an arbitrarily
 // fragmented file (more than numInlineExtents extents) round-trips correctly.
 func (v *Volume) WriteFile(p string, data []byte, perm os.FileMode) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -275,7 +317,7 @@ func (t *txn) createFile(parent uint32, name string, data []byte, mode uint16) e
 			}
 		}
 	}
-	fileRec := encodeFileRecord(cnid, time.Now(), mode, df)
+	fileRec := encodeFileRecord(cnid, timeNow(), mode, df)
 	key := encodeCatalogKey(parent, name)
 	rec := assembleCatalogRecord(key, fileRec)
 	if err := t.cw.insertRecord(rec); err != nil {
@@ -304,16 +346,25 @@ func (t *txn) writeForkData(runs []extentDescriptor, data []byte) error {
 			n = int(span)
 		}
 		if n > 0 {
-			copy(v.img[off:off+int64(n)], data[pos:pos+n])
+			if err := v.writeData(data[pos:pos+n], off); err != nil {
+				return err
+			}
 			pos += n
 		}
 		// Zero the remainder of this run.
-		for i := off + int64(n); i < off+span; i++ {
-			v.img[i] = 0
+		for z := off + int64(n); z < off+span; {
+			k := min(off+span-z, int64(len(zeroChunk)))
+			if err := v.writeData(zeroChunk[:k], z); err != nil {
+				return err
+			}
+			z += k
 		}
 	}
 	return nil
 }
+
+// zeroChunk is the source of the zero fill past the end of a file's data.
+var zeroChunk [64 << 10]byte
 
 // removeFile frees the file's data-fork blocks (inline + extents-overflow) and
 // removes its catalog + thread records.
@@ -345,8 +396,8 @@ func (t *txn) removeFile(parent uint32, name string, cf *catalogFile) error {
 
 // MkDir creates a directory at path.
 func (v *Volume) MkDir(p string, perm os.FileMode) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -363,7 +414,7 @@ func (v *Volume) MkDir(p string, perm os.FileMode) error {
 	}
 	cnid := v.nextCNID()
 	mode := uint16(sIFDIR) | uint16(perm.Perm())
-	folderRec := encodeFolderRecord(cnid, time.Now(), 0)
+	folderRec := encodeFolderRecord(cnid, timeNow(), 0)
 	binary.BigEndian.PutUint16(folderRec[42:44], mode)
 	if v.CaseSensitive() {
 		setHasFolderCount(folderRec, 0)
@@ -387,8 +438,8 @@ func (v *Volume) MkDir(p string, perm os.FileMode) error {
 
 // DeleteFile removes the regular file (or symlink) at path.
 func (v *Volume) DeleteFile(p string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -417,8 +468,8 @@ func (v *Volume) DeleteFile(p string) error {
 
 // DeleteDir removes the empty directory at path.
 func (v *Volume) DeleteDir(p string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -463,8 +514,8 @@ func (v *Volume) DeleteDir(p string) error {
 // must not already exist. The data fork and CNID are preserved (catalog key
 // change + thread parent/name update).
 func (v *Volume) Rename(oldPath, newPath string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	oparent, oname, err := v.resolveParent(oldPath)
 	if err != nil {
@@ -586,8 +637,8 @@ func (v *Volume) recordBody(parent uint32, name string) ([]byte, bool, error) {
 // Symlink creates a symbolic link at linkPath pointing at target. HFS+ stores
 // the target as the data fork of an S_IFLNK file.
 func (v *Volume) Symlink(target, linkPath string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(linkPath)
 	if err != nil {
@@ -614,8 +665,8 @@ func (v *Volume) Symlink(target, linkPath string) error {
 // reallocates a larger contiguous run (zero-filled); shrinking reallocates a
 // smaller run. Both rewrite the file's single inline extent.
 func (v *Volume) Truncate(p string, newSize int64) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	if newSize < 0 {
 		return fmt.Errorf("%w: negative size", ErrCorrupt)
@@ -706,8 +757,8 @@ func (v *Volume) Label() string {
 // key (parent=1, name=label); SetLabel rewrites that key (and the root thread
 // name) and is reflected by the reader and by macOS.
 func (v *Volume) SetLabel(label string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	label = strings.TrimSpace(label)
 	if label == "" {

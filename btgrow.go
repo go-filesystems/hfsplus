@@ -119,7 +119,7 @@ func (bw *btreeWriter) allocFragments(count uint32) ([]extentDescriptor, error) 
 func (bw *btreeWriter) appendForkExtents(runs []extentDescriptor) error {
 	v := bw.v
 	off := specialBaseOffset + int(bw.forkIdx)*forkDataLen
-	vh := v.img[volumeHeaderOffset : volumeHeaderOffset+512]
+	vh := v.hdr(false)
 	fdBytes := vh[off : off+forkDataLen]
 	fd := parseForkData(fdBytes)
 
@@ -153,8 +153,7 @@ func (bw *btreeWriter) appendForkExtents(runs []extentDescriptor) error {
 	_ = inlineUsed
 	// Write the fork descriptor back into both volume headers.
 	bw.encodeForkDescriptor(fdBytes, fd)
-	altOff := int64(len(v.img)) - 1024
-	altFD := v.img[altOff+int64(off) : altOff+int64(off)+forkDataLen]
+	altFD := v.hdr(true)[off : off+forkDataLen]
 	bw.encodeForkDescriptor(altFD, fd)
 
 	// Spill extents beyond the 8 inline into the extents-overflow tree.
@@ -235,10 +234,21 @@ func (bw *btreeWriter) addMapNode() error {
 	forkNodeCap := uint32(int64(bw.forkBlocks()) * bw.bs / int64(bw.nodeSize))
 	// Find the last node in the header/map chain to link from.
 	last := uint32(0) // header node
-	cur := parseNodeDescriptor(bw.nodeBytes(0)).FLink
-	for cur != 0 {
+	d0, err := bw.descriptorOf(0)
+	if err != nil {
+		return err
+	}
+	cur := d0.FLink
+	for steps := 0; cur != 0; steps++ {
+		if steps >= bw.maxChain() {
+			return fmt.Errorf("%w: map node chain does not end", ErrCorrupt)
+		}
 		last = cur
-		cur = parseNodeDescriptor(bw.nodeBytes(cur)).FLink
+		d, err := bw.descriptorOf(cur)
+		if err != nil {
+			return err
+		}
+		cur = d.FLink
 	}
 	// Pick a free node slot for the new map node: scan the bitmap up to the
 	// fork capacity.
@@ -281,11 +291,17 @@ func (bw *btreeWriter) addMapNode() error {
 	// Link: previous last node -> slot.
 	if last == 0 {
 		hb := bw.nodeBytes(0)
+		if hb == nil {
+			return fmt.Errorf("%w: header node unmapped", ErrCorrupt)
+		}
 		hd := parseNodeDescriptor(hb)
 		hd.FLink = slot
 		writeNodeDescriptor(hb, hd)
 	} else {
 		lb := bw.nodeBytes(last)
+		if lb == nil {
+			return fmt.Errorf("%w: map node %d unmapped", ErrCorrupt, last)
+		}
 		ld := parseNodeDescriptor(lb)
 		ld.FLink = slot
 		writeNodeDescriptor(lb, ld)

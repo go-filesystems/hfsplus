@@ -57,8 +57,8 @@ func encodeHFSDate(field string, t time.Time) (uint32, error) {
 // change, so no node is split or merged and the B-tree stays valid), then the
 // image is committed like every other mutation.
 func (v *Volume) Chtimes(p string, atime, mtime time.Time) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	var a, m, c uint32
 	var err error
