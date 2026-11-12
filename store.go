@@ -283,12 +283,16 @@ func changedRuns(r *region) []writeRun {
 }
 
 // flush writes what the transaction changed, in the order TN1150 relies on: file
-// data (already written by writeData) is made durable first, then the B-tree and
-// bitmap sectors, then the alternate volume header, and the primary header last,
-// each phase followed by an fsync so a crash can only expose a prefix of the
-// sequence. The primary header is the one the OS trusts, so it is the commit
-// point; every earlier phase writes into blocks and nodes the old primary header
-// does not reference. Only changed 512-byte sectors are written: O(change).
+// data (already written by writeData, into blocks nothing references yet) is made
+// durable first, then the B-tree and bitmap sectors, then the alternate volume
+// header and the primary header last. The guarantee is exactly this: three
+// fsyncs separate (data + cleared bit), (B-tree and bitmap sectors) and (both
+// headers), so no later group reaches the disk before an earlier one is durable;
+// inside the last group the alternate is written before the primary but nothing
+// orders them on the disk. The B-tree and bitmap sectors are edited in place, so
+// there is no atomic commit point: a crash after the first of them leaves a
+// volume that may be inconsistent, which is what the cleared unmounted bit
+// declares. Only changed 512-byte sectors are written: O(change).
 //
 // When the volume was cleanly unmounted at open, the primary header is first
 // rewritten with kHFSVolumeUnmountedBit cleared and fsynced, and the final
@@ -345,19 +349,26 @@ func (v *Volume) flush() error {
 			return err
 		}
 		old[vhAttributes+2] &^= kHFSVolumeUnmountedBit >> 8
+		v.touched = true
 		if err := v.putAt(old, pOff); err != nil {
 			return err
 		}
 		v.dataDirty = true // fsync below covers it
 	}
+	v.touched = true // from here on a failure leaves the disk in an unknown state
 	if v.dataDirty {
 		if err := v.fsync(); err != nil {
 			return err
 		}
 	}
 	// The alternate header is only a fallback copy the OS reads when the primary is
-	// unusable, so it is written just before the primary, in the same phase: one
-	// fsync fewer, and a crash that leaves the two apart is one fsck repairs.
+	// unusable, so it is written just before the primary, with no barrier between
+	// them: a crash may leave the two copies apart (either one new), and fsck
+	// repairs that. Everything else is ordered by an fsync: data and the cleared
+	// bit are durable before any B-tree or bitmap sector moves, and those are
+	// durable before either header is rewritten. (A fourth fsync between the
+	// alternate and the primary would order those two as well; it is not taken,
+	// for its latency -- see hfsplus#35.)
 	for _, phase := range [][]writeRun{meta, append(hdrA, hdrP...)} {
 		if len(phase) == 0 {
 			continue
@@ -373,6 +384,7 @@ func (v *Volume) flush() error {
 	}
 	v.regions = nil
 	v.regionBytes = 0
+	v.touched = false
 	v.dataDirty = false
 	v.dropReadCache()
 	return nil

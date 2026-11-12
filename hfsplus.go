@@ -69,9 +69,17 @@ type Volume struct {
 	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
 	// every commit with the unmounted bit cleared, then set again.
 	cleanOnDisk bool
-	cacheOn     bool
-	rcMu        sync.Mutex
-	rcache      map[int64][]byte
+	// failed is the error of the write or fsync that failed; every later mutation
+	// is refused with ErrVolumeFailed (see there).
+	failed error
+	// touched: the flush in progress has begun writing (a failure now leaves the
+	// disk in an unknown state, unlike one before the first write).
+	touched bool
+	// reconciled: freeBlocks has been checked against the bitmap (first write).
+	reconciled bool
+	cacheOn    bool
+	rcMu       sync.Mutex
+	rcache     map[int64][]byte
 }
 
 // writable reports whether the volume was opened for writing.
@@ -236,7 +244,11 @@ func (v *Volume) Sync() error {
 	if !v.wr {
 		return nil
 	}
-	return v.fsync()
+	if err := v.fsync(); err != nil {
+		v.failed = err
+		return err
+	}
+	return nil
 }
 
 // reopen rebuilds the parsed view (volume header + catalog/extents trees) from

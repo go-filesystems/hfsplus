@@ -67,6 +67,13 @@ var (
 	// OpenFileWritable / Format) to mutate it.
 	ErrReadOnly = errors.New("hfsplus: filesystem is read-only")
 
+	// ErrVolumeFailed is returned by every mutating method of a writable volume
+	// after a write or fsync to its backing store failed. What reached the disk is
+	// then unknown (some B-tree sectors written, the headers not), so no further
+	// mutation is attempted -- one would write over a half-written volume and mark
+	// it cleanly unmounted. Close it and open it again; reads still work.
+	ErrVolumeFailed = errors.New("hfsplus: an earlier write failed; reopen the volume")
+
 	// ErrBadHeader is returned when the volume header at offset 1024 lacks a
 	// recognized HFS+ ("H+") or HFSX ("HX") signature.
 	ErrBadHeader = errors.New("hfsplus: no valid volume header")

@@ -40,13 +40,21 @@ type txn struct {
 }
 
 func (v *Volume) begin() (*txn, error) {
+	if v.failed != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
+	}
 	// A mutator that failed before commit left its edits in the regions: they
 	// were never written, so drop them and parse the volume as it is on disk.
 	if len(v.regions) > 0 || v.werr != nil {
 		v.discard()
+		v.reconciled = false
 		if err := v.reopen(); err != nil {
 			return nil, err
 		}
+	}
+	if !v.reconciled {
+		v.reconciled = true
+		v.reconcileFreeBlocks()
 	}
 	alc, err := v.newAllocator()
 	if err != nil {
@@ -79,6 +87,12 @@ func (t *txn) commit() error {
 	if err := t.v.flush(); err != nil {
 		// What reached the disk is unknown beyond "a prefix of the order": forget
 		// the edits and re-read the volume as it is.
+		// and refuse every later mutation: the disk may hold part of this one.
+		if t.v.touched {
+			t.v.failed = err
+			t.v.cleanOnDisk = false
+		}
+		t.v.touched = false
 		t.v.discard()
 		_ = t.v.reopen()
 		return err
@@ -184,7 +198,14 @@ func (t *txn) adjustParentValence(parent uint32, delta, folderDelta int32) error
 		return fmt.Errorf("%w: no thread for folder CNID %d", ErrCorrupt, parent)
 	}
 	// Locate the folder record (gp, name) directly in its leaf and patch it.
-	return t.cw.patchFolderRecord(gp, name, func(folder []byte) {
+	short := false
+	err = t.cw.patchFolderRecord(gp, name, func(folder []byte) {
+		// A record this short is not a folder record (a hostile thread can point at
+		// any record): patching it would run past its end.
+		if len(folder) < 88 {
+			short = true
+			return
+		}
 		val := binary.BigEndian.Uint32(folder[4:8])
 		binary.BigEndian.PutUint32(folder[4:8], addU32(val, delta))
 		if binary.BigEndian.Uint16(folder[2:4])&kHFSHasFolderCountMask != 0 {
@@ -192,6 +213,10 @@ func (t *txn) adjustParentValence(parent uint32, delta, folderDelta int32) error
 			binary.BigEndian.PutUint32(folder[84:88], addU32(fc, folderDelta))
 		}
 	})
+	if err == nil && short {
+		err = fmt.Errorf("%w: folder record of CNID %d is %d bytes short", ErrCorrupt, parent, 88)
+	}
+	return err
 }
 
 // threadKeyOf returns the (parentCNID, name) recorded in the thread record of

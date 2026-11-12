@@ -6,6 +6,7 @@ package hfsplus
 import (
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 )
 
 // alloc.go manages the HFS+ allocation bitmap (the allocation file, TN1150
@@ -61,6 +62,33 @@ func (v *Volume) newAllocator() (*allocator, error) {
 		free:   v.vh.FreeBlocks,
 		curIdx: -1,
 	}, nil
+}
+
+// reconcileFreeBlocks counts the free bits of the bitmap and makes the parsed
+// volume header's freeBlocks agree with it, so the delta bookkeeping of the
+// allocator starts from the truth and the next commit rewrites a wrong count (as
+// the old whole-bitmap flush did on every commit). It reads the bitmap once, in
+// chunks; if the bitmap cannot be read the header's count stands and the
+// allocator reports the problem when it is used.
+func (v *Volume) reconcileFreeBlocks() {
+	a, err := v.newAllocator()
+	if err != nil {
+		return
+	}
+	var free uint32
+	for n := uint32(0); n < a.bits; n += 8 {
+		b, ok := a.byteAt(int64(n / 8))
+		if !ok {
+			return
+		}
+		if rest := a.bits - n; rest < 8 {
+			b |= 0xFF >> rest // bits past the last block do not count
+		}
+		free += uint32(8 - bits.OnesCount8(b))
+	}
+	if a.err == nil {
+		v.vh.FreeBlocks = free
+	}
 }
 
 // chunkAt maps bitmap chunk idx to its absolute image offset and length.

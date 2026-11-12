@@ -151,7 +151,25 @@ func (bw *btreeWriter) forkBlocks() uint32 {
 // hdr returns the live BTHeaderRec bytes (record 0 of the header node).
 func (bw *btreeWriter) hdrRec() []byte {
 	b := bw.nodeBytes(0)
+	if b == nil {
+		// The header node cannot be addressed: hand back scratch space so the
+		// accessors do not index nil, and make the commit refuse.
+		if bw.v.werr == nil {
+			bw.v.werr = fmt.Errorf("%w: btree header node unmapped", ErrCorrupt)
+		}
+		return make([]byte, bw.nodeSize-nodeDescriptorLen)
+	}
 	return b[nodeDescriptorLen:]
+}
+
+// descriptorOf returns the node descriptor of node n, or ErrCorrupt when n
+// cannot be addressed.
+func (bw *btreeWriter) descriptorOf(n uint32) (nodeDescriptor, error) {
+	b := bw.nodeBytes(n)
+	if b == nil {
+		return nodeDescriptor{}, fmt.Errorf("%w: node %d unmapped", ErrCorrupt, n)
+	}
+	return parseNodeDescriptor(b), nil
 }
 
 // The structural setters (rootNode, firstLeaf, lastLeaf) update BOTH the
