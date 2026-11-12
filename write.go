@@ -241,8 +241,8 @@ func (v *Volume) threadKeyOf(cnid uint32) (uint32, string, bool, error) {
 // remaining runs are inserted into the extents-overflow B-tree, so an arbitrarily
 // fragmented file (more than numInlineExtents extents) round-trips correctly.
 func (v *Volume) WriteFile(p string, data []byte, perm os.FileMode) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -393,8 +393,8 @@ func (t *txn) removeFile(parent uint32, name string, cf *catalogFile) error {
 
 // MkDir creates a directory at path.
 func (v *Volume) MkDir(p string, perm os.FileMode) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -435,8 +435,8 @@ func (v *Volume) MkDir(p string, perm os.FileMode) error {
 
 // DeleteFile removes the regular file (or symlink) at path.
 func (v *Volume) DeleteFile(p string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -465,8 +465,8 @@ func (v *Volume) DeleteFile(p string) error {
 
 // DeleteDir removes the empty directory at path.
 func (v *Volume) DeleteDir(p string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(p)
 	if err != nil {
@@ -511,8 +511,8 @@ func (v *Volume) DeleteDir(p string) error {
 // must not already exist. The data fork and CNID are preserved (catalog key
 // change + thread parent/name update).
 func (v *Volume) Rename(oldPath, newPath string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	oparent, oname, err := v.resolveParent(oldPath)
 	if err != nil {
@@ -634,8 +634,8 @@ func (v *Volume) recordBody(parent uint32, name string) ([]byte, bool, error) {
 // Symlink creates a symbolic link at linkPath pointing at target. HFS+ stores
 // the target as the data fork of an S_IFLNK file.
 func (v *Volume) Symlink(target, linkPath string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.resolveParent(linkPath)
 	if err != nil {
@@ -662,8 +662,8 @@ func (v *Volume) Symlink(target, linkPath string) error {
 // reallocates a larger contiguous run (zero-filled); shrinking reallocates a
 // smaller run. Both rewrite the file's single inline extent.
 func (v *Volume) Truncate(p string, newSize int64) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	if newSize < 0 {
 		return fmt.Errorf("%w: negative size", ErrCorrupt)
@@ -754,8 +754,8 @@ func (v *Volume) Label() string {
 // key (parent=1, name=label); SetLabel rewrites that key (and the root thread
 // name) and is reflected by the reader and by macOS.
 func (v *Volume) SetLabel(label string) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	label = strings.TrimSpace(label)
 	if label == "" {

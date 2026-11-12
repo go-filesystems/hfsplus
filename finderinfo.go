@@ -71,8 +71,8 @@ func (v *Volume) FinderInfo(p string) ([finderInfoLen]byte, error) {
 // a B-tree and its writer owns node layout; delete-then-insert with the same
 // key is how SetLabel already does it.
 func (v *Volume) SetFinderInfo(p string, info [finderInfoLen]byte) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	parent, name, err := v.finderInfoKey(p)
 	if err != nil {

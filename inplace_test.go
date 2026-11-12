@@ -27,6 +27,18 @@ type countingWriter struct {
 	writes []writeRec
 	syncs  int
 	failAt int // fail the write with this index (0-based); -1 never
+	// syncFailAt fails the fsync with this index (0-based), once; -1 never.
+	syncFailAt int
+	// events is every write and every successful fsync in order: the log the
+	// crash model replays.
+	events []crashEvent
+}
+
+// crashEvent is one entry of the log: a write (off, data) or an fsync.
+type crashEvent struct {
+	sync bool
+	off  int64
+	data []byte
 }
 
 type writeRec struct {
@@ -42,10 +54,19 @@ func (c *countingWriter) WriteAt(p []byte, off int64) (int, error) {
 		return 0, errInjected
 	}
 	c.writes = append(c.writes, writeRec{off: off, data: bytes.Clone(p)})
+	c.events = append(c.events, crashEvent{off: off, data: bytes.Clone(p)})
 	return c.inner.WriteAt(p, off)
 }
 
-func (c *countingWriter) Sync() error { c.syncs++; return c.syncer.Sync() }
+func (c *countingWriter) Sync() error {
+	if c.syncFailAt >= 0 && c.syncs == c.syncFailAt {
+		c.syncFailAt = -2 // fail once
+		return errInjected
+	}
+	c.syncs++
+	c.events = append(c.events, crashEvent{sync: true})
+	return c.syncer.Sync()
+}
 
 func (c *countingWriter) bytes() int {
 	n := 0
@@ -57,7 +78,7 @@ func (c *countingWriter) bytes() int {
 
 // instrument replaces the volume's writer with a countingWriter.
 func instrument(v *Volume) *countingWriter {
-	c := &countingWriter{inner: v.wa, syncer: v.wa.(interface{ Sync() error }), failAt: -1}
+	c := &countingWriter{inner: v.wa, syncer: v.wa.(interface{ Sync() error }), failAt: -1, syncFailAt: -1}
 	v.wa = c
 	return c
 }

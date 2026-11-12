@@ -60,8 +60,8 @@ func (v *Volume) Chown(p string, uid, gid uint32) error {
 // attributeModDate, all before anything is written if the clock or the record is
 // unusable.
 func (v *Volume) patchBSD(p string, mutate func(data []byte)) error {
-	if !v.writable() {
-		return ErrReadOnly
+	if err := v.mutable(); err != nil {
+		return err
 	}
 	c, err := encodeHFSDate("now", hfsNow())
 	if err != nil {

@@ -85,6 +85,18 @@ type Volume struct {
 // writable reports whether the volume was opened for writing.
 func (v *Volume) writable() bool { return v.wr }
 
+// mutable is the check every mutator starts with: ErrReadOnly for a read-only
+// volume, ErrVolumeFailed once a write to the backing store has failed.
+func (v *Volume) mutable() error {
+	if !v.wr {
+		return ErrReadOnly
+	}
+	if v.failed != nil {
+		return fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
+	}
+	return nil
+}
+
 var _ filesystem.Filesystem = (*Volume)(nil)
 
 // Open parses an HFS+ volume from rs. The caller retains ownership of rs unless
