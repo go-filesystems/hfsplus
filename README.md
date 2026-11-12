@@ -83,6 +83,18 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   the alternate and the primary header are written back to back with no fsync between them, and the
   B-tree sectors are edited in place, so a crash is repaired by `fsck_hfs`, not by the driver (there is
   no journal). Commit latency is tracked in hfsplus#35.
+- **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
+  journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
+  the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
+  `kHFSVolumeJournaledBit` in its first header write (the journal was empty at open and is never
+  written) and the final header restores it. Measured with `fsck_hfs` on crash images of Go-made, Apple
+  HFS+ and Apple Journaled HFS+ volumes (`TestDarwinCrashImagesFsck`): every dirty image makes `-q`
+  exit non-zero, every image still marked clean passes `-fn`. What macOS does with a volume left
+  mid-commit (`TestDarwinMountOfCrashedJournaled`, opt-in): it mounts it read/write as plain
+  "HFS+", not journaled, sets the unmounted bit when it unmounts it, and `fsck_hfs -fn` is clean
+  afterwards; the journal is not re-enabled (the volume stays non-journaled until
+  `diskutil enableJournal`) and nothing is lost. Whether macOS ran a full check at mount was not
+  observed directly. Restoring the bit is safe in every state: the journal is never written.
 - **A failed write** (a `WriteAt` or an fsync error after the first write of a mutation) leaves the disk
   in an unknown state, so the volume is latched: every later mutation returns `ErrVolumeFailed` and
   writes nothing until the volume is closed and opened again; reads still work. A failure before the
