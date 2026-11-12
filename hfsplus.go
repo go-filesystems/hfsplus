@@ -157,6 +157,12 @@ func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The write path bypasses the journal, so a journal holding transactions
+	// would be replayed by macOS over what is written here (go-filesystems/
+	// hfsplus#29 asked about this): refuse it rather than lose writes.
+	if _, err := checkJournal(img, v.vh); err != nil {
+		return nil, err
+	}
 	v.img = img
 	v.wa = wa
 	// Rebind the reader to the in-memory image so the write path sees its own

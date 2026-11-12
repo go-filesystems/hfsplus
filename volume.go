@@ -60,12 +60,15 @@ func parseForkData(b []byte) forkData {
 // volumeHeader is the decoded HFS+ volume header (a subset of the full
 // structure: the fields the reader needs).
 type volumeHeader struct {
-	Signature   uint16
-	Version     uint16
-	Attributes  uint32
-	BlockSize   uint32
-	TotalBlocks uint32
-	FreeBlocks  uint32
+	Signature  uint16
+	Version    uint16
+	Attributes uint32
+	// JournalInfoBlock is the allocation block of the journal info block, set
+	// when kHFSVolumeJournaledBit is (offset 12 of the header).
+	JournalInfoBlock uint32
+	BlockSize        uint32
+	TotalBlocks      uint32
+	FreeBlocks       uint32
 
 	AllocationFile forkData
 	ExtentsFile    forkData
@@ -94,6 +97,7 @@ func readVolumeHeader(rs io.ReaderAt) (*volumeHeader, error) {
 	//   0x28 blockSize, 0x2C totalBlocks, 0x30 freeBlocks
 	//   special files start at 0x70: allocation, extents, catalog,
 	//   attributes, startup — each a 80-byte HFSPlusForkData.
+	vh.JournalInfoBlock = binary.BigEndian.Uint32(buf[12:16])
 	vh.BlockSize = binary.BigEndian.Uint32(buf[0x28:0x2C])
 	vh.TotalBlocks = binary.BigEndian.Uint32(buf[0x2C:0x30])
 	vh.FreeBlocks = binary.BigEndian.Uint32(buf[0x30:0x34])
