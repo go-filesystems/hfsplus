@@ -329,8 +329,23 @@ func (v *Volume) flush() error {
 	if !anyChange && !v.dataDirty {
 		return nil
 	}
-	if v.cleanOnDisk {
-		// The headers are rewritten whole, with the bit set, whatever changed.
+	old := make([]byte, 512)
+	if _, err := v.readUnder(old, pOff); err != nil && err != io.EOF {
+		return err
+	}
+	// A journaled volume is not checked on the strength of the unmounted bit
+	// alone: macOS's quick check (fsck_hfs -q) reports a journaled volume clean
+	// whatever that bit says, trusting the journal to bring it back. This driver
+	// does not journal, so for the span of the commit the volume says it is not
+	// journaled, whether or not it was cleanly unmounted at open (a journaled
+	// volume left dirty with an empty journal is a real state); the final header,
+	// written last, restores the bit. (The journal was empty at open, see
+	// checkJournal, and is never written.)
+	journaled := old[vhAttributes+2]&(kHFSVolumeJournaledBit>>8) != 0
+	if v.cleanOnDisk || journaled {
+		// The headers are rewritten whole, whatever changed: the final ones carry
+		// the unmounted bit (if the volume had it) and the journaled bit (if it had
+		// that), which the bracket write below takes away.
 		for _, h := range []struct {
 			off int64
 			dst *[]writeRun
@@ -339,22 +354,13 @@ func (v *Volume) flush() error {
 			if err != nil {
 				return err
 			}
-			be := b
-			be[vhAttributes+2] |= kHFSVolumeUnmountedBit >> 8
-			*h.dst = []writeRun{{off: h.off, data: be}}
+			if v.cleanOnDisk {
+				b[vhAttributes+2] |= kHFSVolumeUnmountedBit >> 8
+			}
+			*h.dst = []writeRun{{off: h.off, data: b}}
 		}
 		// Make the crash visible before anything the old header references moves.
-		old := make([]byte, 512)
-		if _, err := v.readUnder(old, pOff); err != nil && err != io.EOF {
-			return err
-		}
 		old[vhAttributes+2] &^= kHFSVolumeUnmountedBit >> 8
-		// A journaled volume is not checked on the strength of the unmounted bit
-		// alone: macOS's quick check (fsck_hfs -q) reports a journaled volume clean
-		// whatever that bit says, trusting the journal to bring it back. This driver
-		// does not journal, so for the span of the commit the volume says it is not
-		// journaled; the final header, written last, restores the bit. (The journal
-		// was empty at open, see checkJournal, and is never written.)
 		old[vhAttributes+2] &^= kHFSVolumeJournaledBit >> 8
 		v.touched = true
 		if err := v.putAt(old, pOff); err != nil {

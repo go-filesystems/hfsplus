@@ -56,7 +56,9 @@ func fuzzOps(v *Volume) []bool {
 // in place over a readerWriterAt (the OpenFileWritable path, with its read cache
 // and its regions). A hostile image may make a mutator fail; it must never
 // panic, and the two paths must agree on which calls fail and on the image they
-// leave. (Added after the review of go-filesystems/hfsplus#34 found a panic in
+// leave. The limits of that comparison: both paths share the region and flush
+// code, so a defect in them is invisible to it (the crash and fsck_hfs tests
+// cover that), and memStore's Sync never fails. (Added after the review of go-filesystems/hfsplus#34 found a panic in
 // adjustParentValence on a patched image.)
 func FuzzWritable(f *testing.F) {
 	base := fuzzSeed(f)

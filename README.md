@@ -86,10 +86,12 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
-  `kHFSVolumeJournaledBit` in its first header write (the journal was empty at open and is never
-  written) and the final header restores it. Measured with `fsck_hfs` on crash images of Go-made, Apple
-  HFS+ and Apple Journaled HFS+ volumes (`TestDarwinCrashImagesFsck`): every dirty image makes `-q`
-  exit non-zero, every image still marked clean passes `-fn`. What macOS does with a volume left
+  `kHFSVolumeJournaledBit` in its first header write, whether or not the volume was cleanly unmounted at open
+  (a journaled volume left dirty with an empty journal is a real state; the journal was empty at open
+  and is never written), and the final header restores it. Measured with `fsck_hfs` on crash images of
+  Go-made, Apple HFS+, Apple Journaled HFS+ and Apple Journaled HFS+ left dirty
+  (`TestDarwinCrashImagesFsck`): every dirty image makes `-q` exit non-zero (for the volume dirty at
+  open, every image with the journaled bit cleared mid-commit), every image still marked clean passes `-fn`. What macOS does with a volume left
   mid-commit (`TestDarwinMountOfCrashedJournaled`, opt-in): it mounts it read/write as plain
   "HFS+", not journaled, sets the unmounted bit when it unmounts it, and `fsck_hfs -fn` is clean
   afterwards; the journal is not re-enabled (the volume stays non-journaled until

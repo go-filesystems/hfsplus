@@ -40,10 +40,30 @@ func fsckExit(dev string, args ...string) (int, string) {
 //     for its duration.
 func TestDarwinCrashImagesFsck(t *testing.T) {
 	requireTools(t)
-	kinds := []struct{ name, path string }{
-		{"go-mkfs", sparseImage(t, 8<<20)},
-		{"apple-hfs", appleImage(t, "HFS+", "CRASHPLAIN")},
-		{"apple-jnl", appleImage(t, "Journaled HFS+", "CRASHJNL")},
+	// apple-jnl-dirty is a Journaled HFS+ volume with an empty journal and the
+	// unmounted bit already clear (a macOS crash or an unplugged disk after a
+	// journal checkpoint): fsck_hfs -fn passes, and a commit must still get a
+	// half-written volume checked.
+	dirtyJnl := appleImage(t, "Journaled HFS+", "CRASHDIRTY")
+	{
+		raw, err := os.ReadFile(dirtyJnl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw[volumeHeaderOffset+6] &^= kHFSVolumeUnmountedBit >> 8
+		raw[len(raw)-1024+6] &^= kHFSVolumeUnmountedBit >> 8
+		if err := os.WriteFile(dirtyJnl, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kinds := []struct {
+		name, path  string
+		dirtyAtOpen bool
+	}{
+		{"go-mkfs", sparseImage(t, 8<<20), false},
+		{"apple-hfs", appleImage(t, "HFS+", "CRASHPLAIN"), false},
+		{"apple-jnl", appleImage(t, "Journaled HFS+", "CRASHJNL"), false},
+		{"apple-jnl-dirty", dirtyJnl, true},
 	}
 	dir := t.TempDir()
 	for _, kind := range kinds {
@@ -108,19 +128,40 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 				fn, out := fsckExit(dev, "-fn")
 				detach(dev)
 				name := fmt.Sprintf("%s %s %s", kind.name, op.name, cd.name)
-				if bit {
+				midJournaled := journaled && cd.img[volumeHeaderOffset+6]&(kHFSVolumeJournaledBit>>8) == 0
+				switch {
+				case kind.dirtyAtOpen:
+					// Dirty before and after: only the journaled bit tells a
+					// half-written volume from the original.
+					if midJournaled {
+						dirty++
+						if q == 0 {
+							t.Errorf("%s: the journaled bit is cleared mid-commit but fsck_hfs -q exits 0", name)
+						}
+					} else if q != 0 && !bytes.Equal(cd.img, orig) {
+						t.Logf("%s: fsck_hfs -q exits %d", name, q)
+					}
+				case bit:
 					clean++
 					if !strings.Contains(out, "appears to be OK") {
 						t.Errorf("%s: marked cleanly unmounted but fsck_hfs -fn (exit %d) disagrees:\n%s", name, fn, out)
 					}
-				} else {
+				default:
 					dirty++
 					if q == 0 {
 						t.Errorf("%s: marked dirty (journaled volume: %v) but fsck_hfs -q exits 0, so macOS would not check it at mount", name, journaled)
 					}
 				}
+				if kind.dirtyAtOpen && cd.name == fmt.Sprintf("prefix-%d/%d", len(ev), len(ev)) &&
+					!strings.Contains(out, "appears to be OK") {
+					t.Errorf("%s: the finished commit does not pass fsck_hfs -fn:\n%s", name, out)
+				}
 			}
-			if clean < 2 || dirty < 1 {
+			if kind.dirtyAtOpen {
+				if dirty < 1 {
+					t.Errorf("%s %s: no mid-commit image", kind.name, op.name)
+				}
+			} else if clean < 2 || dirty < 1 {
 				t.Errorf("%s %s: %d clean and %d dirty images", kind.name, op.name, clean, dirty)
 			}
 		}
