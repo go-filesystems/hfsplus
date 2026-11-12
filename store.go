@@ -349,6 +349,13 @@ func (v *Volume) flush() error {
 			return err
 		}
 		old[vhAttributes+2] &^= kHFSVolumeUnmountedBit >> 8
+		// A journaled volume is not checked on the strength of the unmounted bit
+		// alone: macOS's quick check (fsck_hfs -q) reports a journaled volume clean
+		// whatever that bit says, trusting the journal to bring it back. This driver
+		// does not journal, so for the span of the commit the volume says it is not
+		// journaled; the final header, written last, restores the bit. (The journal
+		// was empty at open, see checkJournal, and is never written.)
+		old[vhAttributes+2] &^= kHFSVolumeJournaledBit >> 8
 		v.touched = true
 		if err := v.putAt(old, pOff); err != nil {
 			return err

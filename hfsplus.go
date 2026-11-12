@@ -227,18 +227,36 @@ func OpenFileWritable(path string) (*Volume, error) {
 		f.Close()
 		return nil, fmt.Errorf("hfsplus: stat %s: %w", path, err)
 	}
-	v, err := Open(f, st.Size())
+	v, err := openInPlace(f, st.Size())
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	// The write path bypasses the journal; see OpenWritable.
-	if _, err := checkJournalAt(f, st.Size(), v.vh); err != nil {
-		f.Close()
+	v.wa = &fileWriterAt{f}
+	return v, nil
+}
+
+// readerWriterAt is a store that can be read and written at an offset (an
+// *os.File; the in-memory store of the fuzzer).
+type readerWriterAt interface {
+	io.ReaderAt
+	io.WriterAt
+}
+
+// openInPlace opens the size-byte image held by rw for read/write without
+// copying it: the path of OpenFileWritable, over any readerWriterAt. If rw is an
+// io.Closer, Close releases it.
+func openInPlace(rw readerWriterAt, size int64) (*Volume, error) {
+	v, err := Open(rw, size)
+	if err != nil {
 		return nil, err
 	}
-	v.enableWrites(f, st.Size(), true)
-	v.wa = &fileWriterAt{f}
+	// The write path bypasses the journal; see OpenWritable.
+	if _, err := checkJournalAt(rw, size, v.vh); err != nil {
+		return nil, err
+	}
+	v.enableWrites(rw, size, true)
+	v.wa = rw
 	return v, nil
 }
 
