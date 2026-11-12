@@ -189,9 +189,6 @@ func (f *fork) readGrow() ([]byte, error) {
 // capacity returns the number of bytes the image holds, or -1 when unknown (Open
 // with size <= 0 over a reader).
 func (v *Volume) capacity() int64 {
-	if v.img != nil {
-		return int64(len(v.img))
-	}
 	if v.size > 0 {
 		return v.size
 	}

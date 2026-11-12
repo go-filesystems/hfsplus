@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 )
 
 // The journal, from Apple TN1150 "HFS Plus Volume Format", sections "Journal",
@@ -99,15 +100,24 @@ func journalChecksum(b []byte) uint32 {
 // not journaled, or whose journal is empty, may be written; any other outcome is
 // an error wrapping ErrJournaled. It only reads img.
 func checkJournal(img []byte, vh *volumeHeader) (journalState, error) {
+	return checkJournalAt(bytesReaderAt(img), int64(len(img)), vh)
+}
+
+// checkJournalAt is checkJournal over a reader of size bytes: it reads only the
+// journal info block and the journal header, never the image.
+func checkJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalState, error) {
 	if vh.Attributes&kHFSVolumeJournaledBit == 0 {
 		return journalState{}, nil
 	}
 	st := journalState{journaled: true}
 	jibOff := uint64(vh.JournalInfoBlock) * uint64(vh.BlockSize)
-	if vh.JournalInfoBlock == 0 || jibOff+journalInfoBlockLen > uint64(len(img)) {
+	if vh.JournalInfoBlock == 0 || imgSize < 0 || jibOff+journalInfoBlockLen > uint64(imgSize) {
 		return st, fmt.Errorf("%w: journal info block %d is outside the volume", ErrJournaled, vh.JournalInfoBlock)
 	}
-	jib := img[jibOff : jibOff+journalInfoBlockLen]
+	jib := make([]byte, journalInfoBlockLen)
+	if _, err := r.ReadAt(jib, int64(jibOff)); err != nil {
+		return st, fmt.Errorf("%w: journal info block cannot be read: %v", ErrJournaled, err)
+	}
 	flags := binary.BigEndian.Uint32(jib[0:4])
 	if flags&kJIJournalNeedInitMask != 0 {
 		st.empty = true // TN1150: never initialised, no valid transactions
@@ -117,12 +127,12 @@ func checkJournal(img []byte, vh *volumeHeader) (journalState, error) {
 		return st, fmt.Errorf("%w: journal is not inside the volume (flags %#x)", ErrJournaled, flags)
 	}
 	off, size := binary.BigEndian.Uint64(jib[36:44]), binary.BigEndian.Uint64(jib[44:52])
-	if off > uint64(len(img)) || size > uint64(len(img))-off || size < journalHeaderLen {
+	if off > uint64(imgSize) || size > uint64(imgSize)-off || size < journalHeaderLen {
 		return st, fmt.Errorf("%w: journal at %d, size %d, is outside the volume", ErrJournaled, off, size)
 	}
-	hdr := img[off:]
-	if len(hdr) > maxJournalHeaderBytes {
-		hdr = hdr[:maxJournalHeaderBytes]
+	hdr := make([]byte, min(uint64(imgSize)-off, maxJournalHeaderBytes))
+	if n, err := r.ReadAt(hdr, int64(off)); n < len(hdr) {
+		return st, fmt.Errorf("%w: journal header cannot be read: %v", ErrJournaled, err)
 	}
 	start, end, jsize, _, err := readJournalHeader(hdr)
 	if err != nil {

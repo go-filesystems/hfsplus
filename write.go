@@ -40,6 +40,14 @@ type txn struct {
 }
 
 func (v *Volume) begin() (*txn, error) {
+	// A mutator that failed before commit left its edits in the regions: they
+	// were never written, so drop them and parse the volume as it is on disk.
+	if len(v.regions) > 0 || v.werr != nil {
+		v.discard()
+		if err := v.reopen(); err != nil {
+			return nil, err
+		}
+	}
 	alc, err := v.newAllocator()
 	if err != nil {
 		return nil, err
@@ -68,19 +76,25 @@ func (t *txn) commit() error {
 	if err := t.v.reopen(); err != nil {
 		return err
 	}
-	return t.v.Sync()
+	if err := t.v.flush(); err != nil {
+		// What reached the disk is unknown beyond "a prefix of the order": forget
+		// the edits and re-read the volume as it is.
+		t.v.discard()
+		_ = t.v.reopen()
+		return err
+	}
+	return nil
 }
 
 // --- volume header counter helpers ---
 
 func (v *Volume) headerU32(off int) uint32 {
-	return binary.BigEndian.Uint32(v.img[volumeHeaderOffset+off : volumeHeaderOffset+off+4])
+	return binary.BigEndian.Uint32(v.hdr(false)[off : off+4])
 }
 
 func (v *Volume) setHeaderU32(off int, val uint32) {
-	binary.BigEndian.PutUint32(v.img[volumeHeaderOffset+off:volumeHeaderOffset+off+4], val)
-	alt := int64(len(v.img)) - 1024
-	binary.BigEndian.PutUint32(v.img[alt+int64(off):alt+int64(off)+4], val)
+	binary.BigEndian.PutUint32(v.hdr(false)[off:off+4], val)
+	binary.BigEndian.PutUint32(v.hdr(true)[off:off+4], val)
 }
 
 const (
@@ -304,16 +318,25 @@ func (t *txn) writeForkData(runs []extentDescriptor, data []byte) error {
 			n = int(span)
 		}
 		if n > 0 {
-			copy(v.img[off:off+int64(n)], data[pos:pos+n])
+			if err := v.writeData(data[pos:pos+n], off); err != nil {
+				return err
+			}
 			pos += n
 		}
 		// Zero the remainder of this run.
-		for i := off + int64(n); i < off+span; i++ {
-			v.img[i] = 0
+		for z := off + int64(n); z < off+span; {
+			k := min(off+span-z, int64(len(zeroChunk)))
+			if err := v.writeData(zeroChunk[:k], z); err != nil {
+				return err
+			}
+			z += k
 		}
 	}
 	return nil
 }
+
+// zeroChunk is the source of the zero fill past the end of a file's data.
+var zeroChunk [64 << 10]byte
 
 // removeFile frees the file's data-fork blocks (inline + extents-overflow) and
 // removes its catalog + thread records.

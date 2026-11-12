@@ -119,7 +119,7 @@ func (bw *btreeWriter) allocFragments(count uint32) ([]extentDescriptor, error) 
 func (bw *btreeWriter) appendForkExtents(runs []extentDescriptor) error {
 	v := bw.v
 	off := specialBaseOffset + int(bw.forkIdx)*forkDataLen
-	vh := v.img[volumeHeaderOffset : volumeHeaderOffset+512]
+	vh := v.hdr(false)
 	fdBytes := vh[off : off+forkDataLen]
 	fd := parseForkData(fdBytes)
 
@@ -153,8 +153,7 @@ func (bw *btreeWriter) appendForkExtents(runs []extentDescriptor) error {
 	_ = inlineUsed
 	// Write the fork descriptor back into both volume headers.
 	bw.encodeForkDescriptor(fdBytes, fd)
-	altOff := int64(len(v.img)) - 1024
-	altFD := v.img[altOff+int64(off) : altOff+int64(off)+forkDataLen]
+	altFD := v.hdr(true)[off : off+forkDataLen]
 	bw.encodeForkDescriptor(altFD, fd)
 
 	// Spill extents beyond the 8 inline into the extents-overflow tree.

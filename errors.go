@@ -16,8 +16,8 @@
 // Filesystem contract:
 //
 //   - Open / OpenFile open a volume read-only.
-//   - OpenWritable / OpenFileWritable open it for read/write; the whole image
-//     is held in memory, mutated in place, and flushed by Sync.
+//   - OpenWritable / OpenFileWritable open it for read/write, in place: no
+//     copy of the image is held, and each mutation writes only what it changed.
 //   - Format (and the lower-level Mkfs) lay down a fresh, empty HFS+/HFSX
 //     volume in pure Go — no host tooling — that passes fsck_hfs -n clean and
 //     mounts read/write on macOS.

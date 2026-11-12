@@ -45,6 +45,7 @@ func buildMapWriter(t *testing.T) *btreeWriter {
 	hdr[rec2] = 0x80 // node 0 used
 
 	v := &Volume{img: img, vh: &volumeHeader{BlockSize: uint32(bs)}}
+	v.wr, v.size, v.under, v.rs = true, int64(len(img)), bytesReaderAt(img), overlayReader{v}
 	bw := &btreeWriter{
 		v:        v,
 		nodeSize: ns,

@@ -113,9 +113,10 @@ const (
 	kHFSCatalogFileID = 4
 )
 
-// nodeBytes returns the live image slice for node n, mapping it through the
-// fork's extent list. Returns nil if n is out of range (caller must have grown
-// the fork first).
+// nodeBytes returns the live, editable bytes of node n, mapping it through the
+// fork's extent list: the transaction's private copy of the node (loaded from the
+// image on first use; at commit only its changed sectors are written back).
+// Returns nil if n is out of range (caller must have grown the fork first).
 func (bw *btreeWriter) nodeBytes(n uint32) []byte {
 	logical := int64(n) * int64(bw.nodeSize)
 	var base int64
@@ -123,7 +124,12 @@ func (bw *btreeWriter) nodeBytes(n uint32) []byte {
 		span := int64(e.BlockCount) * bw.bs
 		if logical < base+span {
 			abs := int64(e.StartBlock)*bw.bs + (logical - base)
-			return bw.v.img[abs : abs+int64(bw.nodeSize)]
+			b, err := bw.v.region(abs, bw.nodeSize)
+			if err != nil {
+				bw.v.noteErr(err)
+				return nil
+			}
+			return b
 		}
 		base += span
 	}

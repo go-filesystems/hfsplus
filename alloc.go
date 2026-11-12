@@ -6,55 +6,163 @@ package hfsplus
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/go-volumes/safeio"
 )
 
-// alloc.go manages the HFS+ allocation bitmap (the allocation file). Each bit
-// maps one allocation block: the most-significant bit of byte 0 is block 0.
-// Allocation/free operations edit the bitmap bytes inside the in-memory image
-// and keep the volume header's freeBlocks count in sync. All access goes
-// through allocator, which resolves the allocation file's extents from the
-// volume header.
+// alloc.go manages the HFS+ allocation bitmap (the allocation file, TN1150
+// "Allocation File"). Each bit maps one allocation block: the most-significant
+// bit of byte 0 is block 0. The bitmap is not loaded: it is read in chunks of at
+// most 4 KiB, on demand, and a chunk becomes an editable region of the
+// transaction only when a bit in it changes, so allocating a file writes only the
+// bitmap sectors that hold its blocks. The volume header's freeBlocks is kept in
+// step as bits change. All access goes through allocator, which resolves the
+// allocation file's extents from the volume header.
+
+// allocChunk is the most bitmap bytes read or edited as one unit.
+const allocChunk = 4096
 
 // allocator provides block allocate/free over a writable volume's bitmap.
 type allocator struct {
-	v        *Volume
-	bitmap   []byte // a copy of the allocation file's logical contents
-	bits     uint32 // total allocation blocks
-	forkSpan int64  // byte span of the allocation file on disk (its extents)
+	v     *Volume
+	bits  uint32             // total allocation blocks
+	size  int64              // byte length of the allocation file's logical contents
+	exts  []extentDescriptor // its inline extents
+	bs    int64              // allocation block size
+	chunk int64              // bytes per chunk: min(block size, allocChunk)
+	free  uint32             // free blocks, kept in step with the bitmap
+	err   error              // first read/edit error; allocation fails with it
+
+	cur    []byte // the last chunk read (a scan cache)
+	curIdx int64  // its index, -1 when none
 }
 
-// newAllocator loads the allocation bitmap for the volume into memory.
+// newAllocator prepares the allocation bitmap of the volume for use. It reads
+// nothing; the size and extents it will address are checked against the image
+// first, so no later access is aimed outside it.
 func (v *Volume) newAllocator() (*allocator, error) {
 	fd := v.vh.AllocationFile
 	f := newSpecialFork(v, fd)
-	// Bound the bitmap allocation against the image size (safeio class A): the
-	// bitmap can never exceed the image it describes.
-	if _, err := safeio.MakeBytes(f.size, int64(len(v.img))+int64(v.vh.BlockSize)); err != nil {
-		return nil, fmt.Errorf("hfsplus: allocation bitmap size %d: %w", f.size, err)
+	capacity := v.capacity()
+	if f.size < 0 || f.size > maxForkBytes || f.size > f.extentBytes() || (capacity >= 0 && f.size > capacity) {
+		return nil, fmt.Errorf("%w: allocation bitmap claims %d bytes, its extents cover %d", ErrCorrupt, f.size, f.extentBytes())
 	}
-	raw, err := f.readAll()
+	if capacity >= 0 {
+		if err := f.checkExtentsInside(capacity); err != nil {
+			return nil, fmt.Errorf("hfsplus: allocation bitmap: %w", err)
+		}
+	}
+	bs := int64(v.vh.BlockSize)
+	return &allocator{
+		v:      v,
+		bits:   v.vh.TotalBlocks,
+		size:   f.size,
+		exts:   f.extents,
+		bs:     bs,
+		chunk:  min(bs, allocChunk),
+		free:   v.vh.FreeBlocks,
+		curIdx: -1,
+	}, nil
+}
+
+// chunkAt maps bitmap chunk idx to its absolute image offset and length.
+func (a *allocator) chunkAt(idx int64) (abs int64, n int, ok bool) {
+	logical := idx * a.chunk
+	if logical >= a.size {
+		return 0, 0, false
+	}
+	n = int(min(a.chunk, a.size-logical))
+	var base int64
+	for _, e := range a.exts {
+		span := int64(e.BlockCount) * a.bs
+		if logical < base+span {
+			return int64(e.StartBlock)*a.bs + (logical - base), n, true
+		}
+		base += span
+	}
+	return 0, 0, false
+}
+
+// byteAt returns bitmap byte i, or false if it lies outside the bitmap or cannot
+// be read (then a.err says why, if it was a read error).
+func (a *allocator) byteAt(i int64) (byte, bool) {
+	idx := i / a.chunk
+	if a.curIdx != idx {
+		abs, n, ok := a.chunkAt(idx)
+		if !ok {
+			return 0, false
+		}
+		buf := make([]byte, n)
+		if got, err := a.v.rs.ReadAt(buf, abs); got < n {
+			if a.err == nil {
+				if err == nil {
+					err = fmt.Errorf("short read")
+				}
+				a.err = fmt.Errorf("hfsplus: read allocation bitmap: %w", err)
+			}
+			return 0, false
+		}
+		a.cur, a.curIdx = buf, idx
+	}
+	in := i - idx*a.chunk
+	if in >= int64(len(a.cur)) {
+		return 0, false
+	}
+	return a.cur[in], true
+}
+
+// edit applies f to bitmap byte i inside the transaction's private copy of its
+// chunk.
+func (a *allocator) edit(i int64, f func(b byte) byte) {
+	idx := i / a.chunk
+	abs, n, ok := a.chunkAt(idx)
+	if !ok {
+		return
+	}
+	buf, err := a.v.region(abs, n)
 	if err != nil {
-		return nil, fmt.Errorf("hfsplus: read allocation bitmap: %w", err)
+		if a.err == nil {
+			a.err = fmt.Errorf("hfsplus: allocation bitmap: %w", err)
+		}
+		return
 	}
-	a := &allocator{v: v, bitmap: raw, bits: v.vh.TotalBlocks}
-	return a, nil
+	buf[i-idx*a.chunk] = f(buf[i-idx*a.chunk])
+	// The region is now the freshest copy of the chunk: scan from it.
+	a.cur, a.curIdx = buf, idx
 }
 
 // test reports whether block n is marked used.
 func (a *allocator) test(n uint32) bool {
-	if n/8 >= uint32(len(a.bitmap)) {
-		return true // out of range: treat as used (cannot allocate)
+	b, ok := a.byteAt(int64(n / 8))
+	if !ok {
+		return true // out of range or unreadable: treat as used (cannot allocate)
 	}
-	return a.bitmap[n/8]&(0x80>>(n%8)) != 0
+	return b&(0x80>>(n%8)) != 0
 }
 
-func (a *allocator) set(n uint32) { a.bitmap[n/8] |= 0x80 >> (n % 8) }
-func (a *allocator) clear(n uint32) {
-	if n/8 < uint32(len(a.bitmap)) {
-		a.bitmap[n/8] &^= 0x80 >> (n % 8)
+func (a *allocator) set(n uint32) {
+	if a.test(n) {
+		return
 	}
+	a.edit(int64(n/8), func(b byte) byte { return b | 0x80>>(n%8) })
+	if a.free > 0 {
+		a.free--
+	}
+}
+
+func (a *allocator) clear(n uint32) {
+	if n >= a.bits || !a.test(n) {
+		return
+	}
+	a.edit(int64(n/8), func(b byte) byte { return b &^ (0x80 >> (n % 8)) })
+	a.free++
+}
+
+// skipUsed returns n advanced past the whole used bytes starting at n (n must be
+// a multiple of 8), or n unchanged when the byte at n is not all ones.
+func (a *allocator) skipUsed(n uint32) uint32 {
+	if b, ok := a.byteAt(int64(n / 8)); ok && b == 0xFF {
+		return n + 8
+	}
+	return n
 }
 
 // allocContiguous finds and marks a contiguous run of count free blocks,
@@ -67,6 +175,12 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 	var run uint32
 	var start uint32
 	for n := uint32(0); n < a.bits; n++ {
+		if n%8 == 0 && run == 0 {
+			if m := a.skipUsed(n); m != n {
+				n = m - 1
+				continue
+			}
+		}
 		if a.test(n) {
 			run = 0
 			continue
@@ -79,8 +193,11 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 			for i := start; i < start+count; i++ {
 				a.set(i)
 			}
-			return start, nil
+			return start, a.err
 		}
+	}
+	if a.err != nil {
+		return 0, a.err
 	}
 	return 0, fmt.Errorf("%w: no contiguous run of %d blocks", ErrNoSpace, count)
 }
@@ -95,6 +212,8 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 	}
 	if start, err := a.allocContiguous(count); err == nil {
 		return []extentDescriptor{{StartBlock: start, BlockCount: count}}, nil
+	} else if a.err != nil {
+		return nil, err
 	}
 	// Fall back to multiple fragments: walk free runs, taking each in turn.
 	var runs []extentDescriptor
@@ -112,6 +231,12 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 		}
 	}
 	for n := uint32(0); n < a.bits && remaining > 0; n++ {
+		if n%8 == 0 && runLen == 0 {
+			if m := a.skipUsed(n); m != n {
+				n = m - 1
+				continue
+			}
+		}
 		if a.test(n) {
 			flush()
 			continue
@@ -126,6 +251,9 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 		}
 	}
 	flush()
+	if a.err != nil {
+		return nil, a.err
+	}
 	if remaining > 0 {
 		// Not enough total free space: roll back what we took.
 		for _, r := range runs {
@@ -143,50 +271,21 @@ func (a *allocator) freeRun(start, count uint32) {
 	}
 }
 
-// freeCount returns the number of unused blocks per the in-memory bitmap.
-func (a *allocator) freeCount() uint32 {
-	var free uint32
-	for n := uint32(0); n < a.bits; n++ {
-		if !a.test(n) {
-			free++
-		}
-	}
-	return free
-}
-
-// flush writes the bitmap back into the image (over the allocation file's
-// extents) and updates the volume header's freeBlocks field both in the image
-// and in the in-memory vh.
+// flush records the bitmap's free-block count in the volume header (primary and
+// alternate, in the transaction's copies and in the parsed vh). The bitmap
+// sectors themselves were edited in place as bits changed.
 func (a *allocator) flush() error {
-	fd := a.v.vh.AllocationFile
-	// Write the bitmap bytes across the allocation file's extents.
-	bs := int64(a.v.vh.BlockSize)
-	var written int
-	for _, e := range fd.Extents {
-		if e.BlockCount == 0 {
-			break
-		}
-		dst := int64(e.StartBlock) * bs
-		n := int(int64(e.BlockCount) * bs)
-		if written+n > len(a.bitmap) {
-			n = len(a.bitmap) - written
-		}
-		copy(a.v.img[dst:dst+int64(n)], a.bitmap[written:written+n])
-		written += n
-		if written >= len(a.bitmap) {
-			break
-		}
+	if a.err != nil {
+		return a.err
 	}
-	free := a.freeCount()
-	a.v.vh.FreeBlocks = free
-	a.v.setHeaderFreeBlocks(free)
+	a.v.vh.FreeBlocks = a.free
+	a.v.setHeaderFreeBlocks(a.free)
 	return nil
 }
 
 // setHeaderFreeBlocks patches freeBlocks at offset 0x30 in both the primary and
-// alternate volume headers in the image.
+// alternate volume headers.
 func (v *Volume) setHeaderFreeBlocks(free uint32) {
-	binary.BigEndian.PutUint32(v.img[volumeHeaderOffset+0x30:volumeHeaderOffset+0x34], free)
-	alt := int64(len(v.img)) - 1024
-	binary.BigEndian.PutUint32(v.img[alt+0x30:alt+0x34], free)
+	binary.BigEndian.PutUint32(v.hdr(false)[0x30:0x34], free)
+	binary.BigEndian.PutUint32(v.hdr(true)[0x30:0x34], free)
 }
