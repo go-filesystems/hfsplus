@@ -78,8 +78,17 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   fsync; then the alternate header and, last, the primary header (bit set again), fsync. A crash anywhere
   in between leaves the bit clear, so the next mount runs `fsck_hfs` instead of trusting a half-written
   volume (go-filesystems/hfsplus#32, finding 6). A volume that was already not cleanly unmounted when
-  opened is left that way. The cost is three fsyncs per mutation; a crash between the B-tree writes is
-  repaired by fsck, not by the driver (there is no journal).
+  opened is left that way. The cost is three fsyncs per mutation. The guarantee is exactly that the
+  fsyncs separate the three groups (data and the cleared bit; B-tree and bitmap sectors; both headers);
+  the alternate and the primary header are written back to back with no fsync between them, and the
+  B-tree sectors are edited in place, so a crash is repaired by `fsck_hfs`, not by the driver (there is
+  no journal). Commit latency is tracked in hfsplus#35.
+- **A failed write** (a `WriteAt` or an fsync error after the first write of a mutation) leaves the disk
+  in an unknown state, so the volume is latched: every later mutation returns `ErrVolumeFailed` and
+  writes nothing until the volume is closed and opened again; reads still work. A failure before the
+  first write (while writing the file's data) latches nothing.
+- **`freeBlocks`** is counted from the bitmap at the first write of a volume (one pass over the bitmap,
+  in chunks), then kept in step bit by bit, so a wrong count in the header is put right.
 - **Allocation** scans the bitmap from block 0 for a free run, so a very full large volume reads more
   bitmap per write (reads only; the bytes written stay O(change)).
 

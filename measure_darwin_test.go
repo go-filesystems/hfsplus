@@ -85,6 +85,6 @@ func TestDarwinWriteLatencyVsMacOS(t *testing.T) {
 		return s[len(s)/2]
 	}
 	t.Logf("create+1 byte+fsync: macOS driver %v, this driver %v (median of %d interleaved rounds)", med(macWrite), med(ourWrite), rounds)
-	t.Logf("Chtimes (NOT comparable: the macOS one is not fsynced, ours does 3 fsyncs): macOS driver %v, this driver %v",med(macTimes), med(ourTimes))
+	t.Logf("Chtimes (NOT comparable: the macOS one is not fsynced, ours does 3 fsyncs): macOS driver %v, this driver %v", med(macTimes), med(ourTimes))
 	t.Logf("bytes written by this driver per round: WriteFile %d, Chtimes %d (%d WriteAt calls in all)", ourBytesWrite/rounds, ourBytesTimes/rounds, len(c.writes))
 }
