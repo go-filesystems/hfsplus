@@ -227,30 +227,54 @@ func OpenFileWritable(path string) (*Volume, error) {
 		f.Close()
 		return nil, fmt.Errorf("hfsplus: stat %s: %w", path, err)
 	}
-	v, err := openInPlace(f, st.Size())
+	v, err := OpenWritableAt(f, st.Size())
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	v.wa = &fileWriterAt{f}
+	// The volume opened the file itself, so Close releases it.
+	v.closer = f
 	return v, nil
 }
 
-// readerWriterAt is a store that can be read and written at an offset (an
-// *os.File; the in-memory store of the fuzzer).
-type readerWriterAt interface {
+// ReadWriteSyncerAt is the store OpenWritableAt reads and writes in place: an
+// *os.File satisfies it, and so does a block device or any other random-access
+// store. Sync is part of it because the order in which a commit reaches the
+// medium (data, then B-tree and bitmap sectors, then the headers) is only a
+// guarantee if each stage is made durable before the next begins.
+type ReadWriteSyncerAt interface {
 	io.ReaderAt
 	io.WriterAt
+	Sync() error
 }
 
-// openInPlace opens the size-byte image held by rw for read/write without
-// copying it: the path of OpenFileWritable, over any readerWriterAt. If rw is an
-// io.Closer, Close releases it.
-func openInPlace(rw readerWriterAt, size int64) (*Volume, error) {
+// OpenWritableAt opens the size-byte HFS+ image held by rw for read/write, in
+// place, exactly as OpenFileWritable does: no copy of the image is made, a
+// journaled volume whose journal is not empty is refused with ErrJournaled, and
+// every mutation reads what it needs from rw and writes back only what it
+// changed (see store.go).
+//
+// It exists so a caller that already holds the image open -- an *os.File it
+// opened itself, with the checks it needs (an os.Root, O_NOFOLLOW, a descriptor
+// passed in) -- is not made to reopen it by name, which another process can
+// swap in between.
+//
+// Ownership: rw belongs to the caller. Volume.Close does NOT close it, even if
+// it implements io.Closer; the caller closes it, after the last use of the
+// Volume and not before (the Volume reads and writes through it until then).
+// size is the number of bytes of the image (the volume's alternate header is
+// 1024 bytes before its end), usually the file's size; it must be positive. Use
+// only one writable Volume at a time over a store: two would each keep their own
+// view of it.
+func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
+	if rw == nil || size <= 0 {
+		return nil, fmt.Errorf("hfsplus: OpenWritableAt: need a store and a positive size (got %d)", size)
+	}
 	v, err := Open(rw, size)
 	if err != nil {
 		return nil, err
 	}
+	v.closer = nil // Open took rw's Close for its own; it is the caller's
 	// The write path bypasses the journal; see OpenWritable.
 	if _, err := checkJournalAt(rw, size, v.vh); err != nil {
 		return nil, err
@@ -291,12 +315,6 @@ func (v *Volume) reopen() error {
 	v.vh = vh
 	return v.openTrees()
 }
-
-// fileWriterAt adapts an *os.File to io.WriterAt with a Sync method.
-type fileWriterAt struct{ f *os.File }
-
-func (w *fileWriterAt) WriteAt(p []byte, off int64) (int, error) { return w.f.WriteAt(p, off) }
-func (w *fileWriterAt) Sync() error                              { return w.f.Sync() }
 
 // bytesReaderAt is a minimal io.ReaderAt over a byte slice (avoids importing
 // bytes for a one-method shim and lets the writable volume re-bind to a live
