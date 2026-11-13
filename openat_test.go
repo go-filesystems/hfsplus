@@ -160,3 +160,162 @@ func TestOpenWritableAtBadArguments(t *testing.T) {
 		}
 	}
 }
+
+// sizedImage returns the path of a 8 MiB sparse volume followed by extra trailing
+// bytes (0xEE), and the volume's length.
+func sizedImage(t *testing.T, extra int) (path string, volLen int64) {
+	t.Helper()
+	p := sparseImage(t, 8<<20)
+	if extra > 0 {
+		f, err := os.OpenFile(p, os.O_RDWR|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(bytes.Repeat([]byte{0xEE}, extra)); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	return p, 8 << 20
+}
+
+// openAt opens path through OpenWritableAt with the given size.
+func openAt(t *testing.T, path string, size int64) (*Volume, *os.File, error) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	v, err := OpenWritableAt(f, size)
+	return v, f, err
+}
+
+// TestWritableOpenSizeMustFitTheVolume: the alternate header sits 1024 bytes before
+// the end of the VOLUME (TN1150), not of the size the caller names or of the file.
+// A size smaller than the volume is refused with nothing written; a size larger
+// than the file, or a file with trailing bytes, writes the alternate header at the
+// volume's end and touches nothing after it.
+func TestWritableOpenSizeMustFitTheVolume(t *testing.T) {
+	// Too small, through OpenWritableAt: refused, file unchanged.
+	p, vol := sizedImage(t, 0)
+	orig, _ := os.ReadFile(p)
+	for _, size := range []int64{vol - 1, vol - 4096, 7 << 20, 1 << 20, 2048} {
+		if _, _, err := openAt(t, p, size); !errors.Is(err, ErrVolumeSize) {
+			t.Errorf("size %d: err = %v, want ErrVolumeSize", size, err)
+		}
+	}
+	// Too small, through OpenFileWritable: a truncated file.
+	if err := os.Truncate(p, vol-4096); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenFileWritable(p); !errors.Is(err, ErrVolumeSize) {
+		t.Errorf("a truncated file: err = %v, want ErrVolumeSize", err)
+	}
+	if err := os.WriteFile(p, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No volume header where the alternate must be.
+	z := bytes.Clone(orig)
+	clear(z[vol-1024 : vol-1024+512])
+	zp := filepath.Join(t.TempDir(), "noalt.img")
+	if err := os.WriteFile(zp, z, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openAt(t, zp, vol); !errors.Is(err, ErrVolumeSize) {
+		t.Errorf("no alternate header: err = %v, want ErrVolumeSize", err)
+	}
+	if _, err := OpenFileWritable(zp); !errors.Is(err, ErrVolumeSize) {
+		t.Errorf("no alternate header (file): err = %v, want ErrVolumeSize", err)
+	}
+	if after, _ := os.ReadFile(zp); !bytes.Equal(after, z) {
+		t.Error("a refused open changed the image")
+	}
+
+	// Larger size than the file, and trailing bytes, through both entry points.
+	const extra = 4096
+	for _, tc := range []struct {
+		name string
+		open func(path string) (*Volume, error)
+	}{
+		{"OpenFileWritable", OpenFileWritable},
+		{"OpenWritableAt, size = file", func(path string) (*Volume, error) {
+			st, _ := os.Stat(path)
+			v, _, err := openAt(t, path, st.Size())
+			return v, err
+		}},
+		{"OpenWritableAt, size beyond the file", func(path string) (*Volume, error) {
+			v, _, err := openAt(t, path, vol+(1<<20))
+			return v, err
+		}},
+	} {
+		tp, _ := sizedImage(t, extra)
+		before, _ := os.ReadFile(tp)
+		v, err := tc.open(tp)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if err := v.MkDir("/t", 0o755); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		v.Close()
+		after, _ := os.ReadFile(tp)
+		if len(after) != len(before) {
+			t.Errorf("%s: the file grew from %d to %d bytes", tc.name, len(before), len(after))
+		}
+		if !bytes.Equal(after[vol:], before[vol:]) {
+			t.Errorf("%s: bytes after the volume were written", tc.name)
+		}
+		alt, pri := after[vol-1024:vol-512], after[volumeHeaderOffset:volumeHeaderOffset+512]
+		if !bytes.Equal(alt, pri) {
+			t.Errorf("%s: the alternate header at the volume's end is not the primary's copy", tc.name)
+		}
+		r, err := OpenFile(tp)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if _, err := r.Stat("/t"); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+		r.Close()
+	}
+}
+
+// TestClosedVolumeRefusesMutations: after Close a writable volume returns
+// ErrClosed and keeps no cache or edit state.
+func TestClosedVolumeRefusesMutations(t *testing.T) {
+	p, _ := sizedImage(t, 0)
+	for name, open := range map[string]func() (*Volume, error){
+		"OpenFileWritable": func() (*Volume, error) { return OpenFileWritable(p) },
+		"OpenWritableAt": func() (*Volume, error) {
+			v, _, err := openAt(t, p, 8<<20)
+			return v, err
+		},
+	} {
+		v, err := open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := v.MkDir("/k"+name[len(name)-2:], 0o755); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(p)
+		v.Close()
+		for _, err := range []error{
+			v.MkDir("/z", 0o755),
+			v.WriteFile("/z", []byte("x"), 0o644),
+			v.DeleteDir("/k" + name[len(name)-2:]),
+			v.Chtimes("/k"+name[len(name)-2:], time.Now(), time.Now()),
+		} {
+			if !errors.Is(err, ErrClosed) {
+				t.Errorf("%s: a mutation after Close returned %v, want ErrClosed", name, err)
+			}
+		}
+		if v.regions != nil || v.rcache != nil {
+			t.Errorf("%s: Close keeps its cache or regions", name)
+		}
+		if after, _ := os.ReadFile(p); !bytes.Equal(after, before) {
+			t.Errorf("%s: a mutation after Close changed the image", name)
+		}
+	}
+}

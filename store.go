@@ -192,7 +192,7 @@ func (v *Volume) noteErr(err error) {
 func (v *Volume) hdr(alt bool) []byte {
 	off := int64(volumeHeaderOffset)
 	if alt {
-		off = v.size - 1024
+		off = v.altOff
 	}
 	b, err := v.region(off, 512)
 	if err != nil {
@@ -304,7 +304,7 @@ func (v *Volume) flush() error {
 	}
 	var meta []writeRun
 	var hdrP, hdrA []writeRun
-	pOff, aOff := int64(volumeHeaderOffset), v.size-1024
+	pOff, aOff := int64(volumeHeaderOffset), v.altOff
 	anyChange := false
 	offs := make([]int64, 0, len(v.regions))
 	for off := range v.regions {

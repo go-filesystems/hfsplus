@@ -4,11 +4,12 @@
 package hfsplus
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
-
 	"sync"
 
 	filesystem "github.com/go-filesystems/interface"
@@ -72,6 +73,10 @@ type Volume struct {
 	// failed is the error of the write or fsync that failed; every later mutation
 	// is refused with ErrVolumeFailed (see there).
 	failed error
+	// closed: Close was called; mutations return ErrClosed.
+	closed bool
+	// altOff is the offset of the alternate volume header (see enableWrites).
+	altOff int64
 	// touched: the flush in progress has begun writing (a failure now leaves the
 	// disk in an unknown state, unlike one before the first write).
 	touched bool
@@ -90,6 +95,9 @@ func (v *Volume) writable() bool { return v.wr }
 func (v *Volume) mutable() error {
 	if !v.wr {
 		return ErrReadOnly
+	}
+	if v.closed {
+		return ErrClosed
 	}
 	if v.failed != nil {
 		return fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
@@ -195,14 +203,42 @@ func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
 	if _, err := checkJournal(img, v.vh); err != nil {
 		return nil, err
 	}
-	v.enableWrites(bytesReaderAt(img), int64(len(img)), false)
+	if err := v.enableWrites(bytesReaderAt(img), int64(len(img)), false); err != nil {
+		return nil, err
+	}
 	v.img = img
 	v.wa = wa
 	return v, nil
 }
 
+// ErrVolumeSize is returned by the writable opens when the size given for the
+// image does not fit the volume it holds: smaller than the volume says it is, or
+// with no volume header where the alternate header must be. Nothing is written
+// in that case; a write at the wrong place would land inside the volume.
+var ErrVolumeSize = errors.New("hfsplus: image size does not match the volume")
+
 // enableWrites turns a freshly opened volume into a writable one over under.
-func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) {
+//
+// Apple TN1150, "Volume Header": the alternate volume header is "stored starting
+// 1024 bytes before the end of the volume", and the volume is totalBlocks
+// allocation blocks of blockSize bytes. So the alternate header is at
+// totalBlocks*blockSize - 1024, wherever the file ends: bytes after the volume
+// (a file longer than the volume) are not part of it. The image must be at least
+// that long, and the signature of a volume header must sit at that offset, or
+// the writes of a commit would land in the wrong place. (A volume wrapped in an
+// HFS wrapper, where the embedded volume's end is not the file's, is not
+// supported: its signature at offset 1024 is the wrapper's, and Open refuses it.)
+func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) error {
+	volEnd := int64(v.vh.TotalBlocks) * int64(v.vh.BlockSize)
+	alt := volEnd - 1024
+	if size < volEnd || alt < volumeHeaderOffset+512 {
+		return fmt.Errorf("%w: %d bytes given, the volume is %d blocks of %d bytes", ErrVolumeSize, size, v.vh.TotalBlocks, v.vh.BlockSize)
+	}
+	var sig [2]byte
+	if _, err := under.ReadAt(sig[:], alt); err != nil || binary.BigEndian.Uint16(sig[:]) != v.vh.Signature {
+		return fmt.Errorf("%w: no volume header at the alternate location %d", ErrVolumeSize, alt)
+	}
+	v.altOff = alt
 	v.wr = true
 	v.under = under
 	v.size = size
@@ -212,6 +248,7 @@ func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) {
 		v.cacheOn = true
 		v.rcache = make(map[int64][]byte)
 	}
+	return nil
 }
 
 // OpenFileWritable opens the image at path for read/write, in place: the image
@@ -279,7 +316,9 @@ func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
 	if _, err := checkJournalAt(rw, size, v.vh); err != nil {
 		return nil, err
 	}
-	v.enableWrites(rw, size, true)
+	if err := v.enableWrites(rw, size, true); err != nil {
+		return nil, err
+	}
 	v.wa = rw
 	return v, nil
 }
@@ -341,7 +380,19 @@ func (v *Volume) CaseSensitive() bool {
 }
 
 // Close releases the backing handle if Volume opened one.
+//
+// After Close a writable volume refuses every mutation with ErrClosed, and its
+// cache and edit state are dropped. A store given to OpenWritableAt is not
+// closed (it is the caller's).
 func (v *Volume) Close() error {
+	if v.wr {
+		v.closed = true
+		v.discard()
+		v.rcMu.Lock()
+		v.rcache = nil
+		v.rcMu.Unlock()
+		v.cacheOn = false
+	}
 	if v.closer != nil {
 		return v.closer.Close()
 	}
