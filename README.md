@@ -165,6 +165,7 @@ memory). The returned `*Volume` implements
 | `OpenFile(path string) (*Volume, error)` | Open an image file read-only |
 | `OpenWritable(img []byte, wa io.WriterAt) (*Volume, error)` | Open an in-memory image read/write |
 | `OpenFileWritable(path string) (*Volume, error)` | Open an image file read/write in place (no copy of the image; each mutation writes and fsyncs what it changed) |
+| `OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error)` | The same in-place open over a store the caller already holds (an `*os.File` opened with its own checks, an `os.Root`, a descriptor passed in), so the image is not reopened by name. `rw` stays the caller's: `Close` does not close it. Same `ErrJournaled` check. `size` must be at least `totalBlocks x blockSize` and a volume header must sit at the alternate location, 1024 bytes before the end of the *volume* (TN1150, "Volume Header"), else `ErrVolumeSize` and nothing is written; a file longer than the volume is written up to the volume's end only. After `Close`, mutators return `ErrClosed`. HFS-wrapped volumes are not supported |
 | `Mkfs(size int64, cfg FormatConfig) ([]byte, error)` | Build a fresh empty HFS+/HFSX image in pure Go |
 | `Format(path string, size int64, cfg FormatConfig) (filesystem.Filesystem, error)` | Pure-Go format + open read/write |
 | `FormatAppleDmg(path, size, cfg)` | Optional darwin-only `hdiutil` alternative |

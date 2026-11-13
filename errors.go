@@ -67,6 +67,10 @@ var (
 	// OpenFileWritable / Format) to mutate it.
 	ErrReadOnly = errors.New("hfsplus: filesystem is read-only")
 
+	// ErrClosed is returned by every mutating method of a writable volume after
+	// Close.
+	ErrClosed = errors.New("hfsplus: volume is closed")
+
 	// ErrVolumeFailed is returned by every mutating method of a writable volume
 	// after a write or fsync to its backing store failed. What reached the disk is
 	// then unknown (some B-tree sectors written, the headers not), so no further

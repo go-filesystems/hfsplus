@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// memStore is a readerWriterAt over a byte slice with an fsync that does nothing:
+// memStore is a ReadWriteSyncerAt over a byte slice with an fsync that does nothing:
 // it drives the file-backed path (read cache, regions, flush order) with no file.
 type memStore struct{ buf []byte }
 
@@ -53,7 +53,7 @@ func fuzzOps(v *Volume) []bool {
 
 // FuzzWritable splices fuzzer bytes into a valid image, opens it writable and
 // drives the mutators over it, twice: over the in-memory image (OpenWritable) and
-// in place over a readerWriterAt (the OpenFileWritable path, with its read cache
+// in place over a ReadWriteSyncerAt (OpenWritableAt, the OpenFileWritable path, with its read cache
 // and its regions). A hostile image may make a mutator fail; it must never
 // panic, and the two paths must agree on which calls fail and on the image they
 // leave. The limits of that comparison: both paths share the region and flush
@@ -78,7 +78,7 @@ func FuzzWritable(f *testing.F) {
 		inMem := append([]byte(nil), img...)
 		v, err := OpenWritable(inMem, nil)
 		st := &memStore{buf: append([]byte(nil), img...)}
-		w, err2 := openInPlace(st, int64(len(img)))
+		w, err2 := OpenWritableAt(st, int64(len(img)))
 		if (err == nil) != (err2 == nil) {
 			t.Fatalf("OpenWritable err=%v, in-place open err=%v", err, err2)
 		}
