@@ -105,6 +105,40 @@ func TestDurabilityCrashModel(t *testing.T) {
 					t.Errorf("%s: %d crash points marked clean, %d marked dirty", model, clean, dirty)
 				}
 			}
+			// Nothing orders the writes between two fsyncs on the disk: for each such
+			// group, the durable prefix plus any ONE write of it, and plus all but
+			// one, must be dirty or consistent.
+			reordered := 0
+			for s := 0; s <= len(events); {
+				e := s
+				for e < len(events) && !events[e].sync {
+					e++
+				}
+				for i := s; i < e; i++ {
+					for _, only := range []bool{true, false} {
+						img := image(s)
+						for j := s; j < e; j++ {
+							if (j == i) == only {
+								copy(img[events[j].off:], events[j].data)
+							}
+						}
+						if err := os.WriteFile(crash, img, 0o644); err != nil {
+							t.Fatal(err)
+						}
+						reordered++
+						if attrsOf(t, crash)&kHFSVolumeUnmountedBit == 0 {
+							continue
+						}
+						if msg := base.check(crash); msg != "" {
+							t.Errorf("group [%d,%d), write %d (only=%v): marked cleanly unmounted but %s", s, e, i, only, msg)
+						}
+					}
+				}
+				s = e + 1
+			}
+			if reordered == 0 {
+				t.Error("no reordered image")
+			}
 			if op.dur == DurabilityLazy {
 				return
 			}
