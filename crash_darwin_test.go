@@ -78,7 +78,7 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, op := range crashOps {
+		for _, op := range crashOpsPerDurability() {
 			work := filepath.Join(dir, kind.name+"-"+op.name+".img")
 			if err := os.WriteFile(work, orig, 0o644); err != nil {
 				t.Fatal(err)
@@ -86,6 +86,9 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 			v, err := OpenFileWritable(work)
 			if err != nil {
 				t.Fatalf("%s: %v", kind.name, err)
+			}
+			if err := v.SetDurability(op.dur); err != nil {
+				t.Fatal(err)
 			}
 			c := instrument(v)
 			if err := op.run(v); err != nil {
@@ -170,10 +173,13 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 						dirty++
 					}
 				case kind.dirtyAtOpen:
-					// Dirty before and after: the original and the finished
-					// commit are the images outside the commit.
-					if q != 0 && !bytes.Equal(cd.img, orig) {
-						t.Logf("%s: fsck_hfs -q exits %d", name, q)
+					// Dirty before and after: -q reports it dirty whatever happens,
+					// but every image outside the commit (the data-only prefixes,
+					// primary-without-alt, the finished commit) must still pass -fn
+					// (hfsplus#39).
+					clean++
+					if !strings.Contains(out, "appears to be OK") {
+						t.Errorf("%s: outside the commit but fsck_hfs -fn (exit %d) disagrees:\n%s", name, fn, out)
 					}
 				case bit:
 					clean++
@@ -183,15 +189,11 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 				default:
 					t.Errorf("%s: outside the commit but not marked cleanly unmounted", name)
 				}
-				if kind.dirtyAtOpen && cd.name == fmt.Sprintf("prefix-%d/%d", len(ev), len(ev)) &&
-					!strings.Contains(out, "appears to be OK") {
-					t.Errorf("%s: the finished commit does not pass fsck_hfs -fn:\n%s", name, out)
-				}
 			}
 			if dirty != mids {
 				t.Errorf("%s %s: %d of %d mid-commit images make fsck_hfs -q exit non-zero", kind.name, op.name, dirty, mids)
 			}
-			if !kind.dirtyAtOpen && clean < 2 {
+			if clean < 2 {
 				t.Errorf("%s %s: %d clean images", kind.name, op.name, clean)
 			}
 		}

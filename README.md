@@ -82,7 +82,40 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   fsyncs separate the three groups (data and the cleared bit; B-tree and bitmap sectors; both headers);
   the alternate and the primary header are written back to back with no fsync between them, and the
   B-tree sectors are edited in place, so a crash is repaired by `fsck_hfs`, not by the driver (there is
-  no journal). Commit latency is tracked in hfsplus#35.
+  no journal).
+- **Durability levels** (`SetDurability`, `Batch`; hfsplus#35). Barriers are `File.Sync`, which on darwin
+  is `fcntl(F_FULLFSYNC)` (Go's `internal/poll/fd_fsync_darwin.go`, `Fsync`, line 22); `man 2 fsync` says
+  plain fsync(2) leaves the drive free to reorder, `man 2 fcntl` says F_FULLFSYNC "acts as a barrier",
+  so the ordering above is only a guarantee over F_FULLFSYNC and no weaker primitive is offered.
+  Fsyncs for a first mutation on a volume clean at open, a second without file data, a third with file
+  data, then `Sync` (counted by `TestDurabilityBarriers`):
+
+  | Level | first | next (no data) | with data | `Sync` | Durable when the mutator returns | Volume between mutations |
+  |---|---|---|---|---|---|---|
+  | `DurabilityStrict` (default) | 3 | 3 | 3 | 1 | yes | marked clean |
+  | `DurabilityMounted` | 2 | 1 | 2 | 1 | yes | marked dirty until `Sync`/`Close` |
+  | `DurabilityLazy` | 1 | 0 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
+
+  `Mounted` is data-ordered (like ext4 `data=ordered`): a commit that wrote file data puts a barrier
+  between the data and the metadata that points at it, so no crash image shows a file holding bytes it
+  was never written with (`TestDurabilityNoStaleData`, red without that barrier). `Lazy` is
+  data-writeback, by design: after a crash a file may contain stale bytes of a previously deleted file
+  (a disclosure), so do not use `Lazy` or `Batch` where different users share a volume. Under `Mounted`
+  and `Lazy` the journaled bit stays cleared for the whole held span, not one commit: after a crash in
+  it the volume stays non-journaled until `diskutil enableJournal`. `SetDurability` and `Batch` must not
+  run concurrently with mutators.
+
+  Three barriers is the minimum for a commit that leaves the volume clean: the dirty mark must be durable
+  before a sector moves, and those sectors before the clean mark. `Mounted` is TN1150's own protocol
+  ("An implementation must clear this bit on the media when it mounts a volume for writing ... set this
+  bit ... as the last step of unmounting"): the mark is cleared once, sectors are written in place and made
+  durable with one barrier, and `Sync`/`Close` restores the clean marks. Nothing inside a commit is ordered,
+  the dirty mark is what protects it: a crash between `Sync`s leaves a volume that `fsck_hfs` checks at
+  mount, never one that claims to be clean and is not. `Batch(fn)` runs `fn` lazily then `Sync`s: a group
+  of mutations (an SMB write plus its times) pays one set of barriers, not a transaction (a crash loses
+  the group in whole or in part, with the volume marked dirty). `Close` settles. A failed volume is left
+  dirty. Checked by `TestDurabilityCrashModel` (both crash models plus every write of every fsync group
+  landing alone or missing alone) and `TestDarwinCrashImagesFsck` at every level.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
@@ -171,7 +204,9 @@ memory). The returned `*Volume` implements
 | `FormatAppleDmg(path, size, cfg)` | Optional darwin-only `hdiutil` alternative |
 | `(*Volume) WriteFile / MkDir / DeleteFile / DeleteDir / Rename` | Mutate the volume |
 | `(*Volume) SetLabel / Symlink / Truncate` | Optional `Labeller` / `Symlinker` / `Truncater` capabilities |
-| `(*Volume) Sync() error` | Final fsync (every mutator has already written and fsynced its changes) |
+| `(*Volume) Sync() error` | Final fsync; at `DurabilityMounted`/`DurabilityLazy` also makes everything durable and restores the clean marks |
+| `(*Volume) SetDurability(Durability) error` / `Durability()` | Choose `DurabilityStrict` (default), `DurabilityMounted` or `DurabilityLazy`; see "Durability levels" |
+| `(*Volume) Batch(fn func() error) error` | Run `fn` lazily, then one `Sync` |
 | `(*Volume) ListDir / ReadFile / Stat / ReadLink` | Read paths |
 | `(*Volume) Chtimes` | `Chtimes(path, atime, mtime)`: contentModDate and accessDate as whole GMT seconds since 1904 (rounded down), attributeModDate (ctime) set to the clock, createDate untouched; a zero time leaves its field unchanged; a time outside 1904-01-01 00:00:01 .. 2040-02-06 06:28:15 GMT (the date 0 reads as "not recorded") is a `*TimeRangeError` (`errors.Is(err, ErrTimeOutOfRange)`), nothing written; the catalog record is patched in place, so the B-tree is unchanged in shape. Checked with `fsck_hfs` and a macOS mount |
 | `(*Volume) Chmod`, `Chown` | with `Chtimes`, the whole `filesystem.MetadataSetter` (what SMB/NFS/SFTP servers probe for). `Chmod` replaces the 12 permission bits (setuid/setgid/sticky included) of `HFSPlusBSDInfo.fileMode`, keeping the type bits; `Chown` sets ownerID/groupID; both patch the catalog record in place (file or folder), set attributeModDate to the clock, refuse the root folder, and `Stat` now reports a folder's recorded mode. Checked with a macOS mount (`stat -f %Lp`) |

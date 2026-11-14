@@ -70,6 +70,12 @@ type Volume struct {
 	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
 	// every commit with the unmounted bit cleared, then set again.
 	cleanOnDisk bool
+	// durability, held, restore*, unsynced: see durability.go. held: the dirty
+	// mark is on the medium and the clean marks (restore*) are due at settle;
+	// unsynced: sectors were written since the last fsync.
+	durability                         Durability
+	held, unsynced                     bool
+	restoreUnmounted, restoreJournaled bool
 	// failed is the error of the write or fsync that failed; every later mutation
 	// is refused with ErrVolumeFailed (see there).
 	failed error
@@ -337,7 +343,7 @@ func (v *Volume) Sync() error {
 	if !v.wr {
 		return nil
 	}
-	if err := v.fsync(); err != nil {
+	if err := v.settle(); err != nil {
 		v.failed = err
 		return err
 	}
@@ -385,6 +391,12 @@ func (v *Volume) CaseSensitive() bool {
 // cache and edit state are dropped. A store given to OpenWritableAt is not
 // closed (it is the caller's).
 func (v *Volume) Close() error {
+	var serr error
+	if v.wr && !v.closed && (v.held || v.unsynced) {
+		// DurabilityMounted / DurabilityLazy: make the writes durable and put the
+		// clean marks back.
+		serr = v.Sync()
+	}
 	if v.wr {
 		v.closed = true
 		v.discard()
@@ -394,9 +406,9 @@ func (v *Volume) Close() error {
 		v.cacheOn = false
 	}
 	if v.closer != nil {
-		return v.closer.Close()
+		return errors.Join(serr, v.closer.Close())
 	}
-	return nil
+	return serr
 }
 
 // resolved is the outcome of a path lookup: the matching catalog record plus
