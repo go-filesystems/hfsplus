@@ -31,14 +31,22 @@ const (
 	// Close or SetDurability(DurabilityStrict). Each commit is durable when its
 	// mutator returns, but a crash between Syncs leaves the volume marked dirty
 	// (the next mount runs fsck_hfs, which finds nothing to repair unless a commit
-	// was torn). Nothing inside a commit is ordered: the dirty mark is what
-	// protects it.
+	// was torn). Nothing inside the metadata of a commit is ordered: the dirty
+	// mark is what protects it. Data is ordered (like ext4 data=ordered): a
+	// commit that wrote file data takes a barrier between the data and the
+	// metadata that points at it, so a crash never shows a file holding bytes it
+	// was not written with; a commit without data takes one barrier. The
+	// journaled bit stays cleared for the whole held span, so after a crash in it
+	// the journal stays off until diskutil enableJournal.
 	DurabilityMounted
 	// DurabilityLazy is DurabilityMounted without the per-commit barrier: a
 	// mutation is durable only after Sync, Close or SetDurability(DurabilityStrict)
 	// (Batch does this for a group of mutations). A crash before that loses the
 	// mutations made since the last Sync, in whole or in part, and leaves the
-	// volume marked dirty.
+	// volume marked dirty. It is data-writeback: nothing orders file data before
+	// the metadata that references it, so after a crash a file may contain stale
+	// bytes of a previously deleted file. Do not use it where different users
+	// share a volume.
 	DurabilityLazy
 )
 
@@ -58,7 +66,8 @@ func (d Durability) String() string {
 // SetDurability selects the level for the following mutations. Leaving a level
 // that holds the volume dirty first settles it: everything written is made durable
 // and, for DurabilityStrict, the clean mark is restored. It returns the error of
-// that settling, and the level is unchanged when it fails.
+// that settling, and the level is unchanged when it fails. Like every mutator,
+// it must not run concurrently with another mutator, Sync, Batch or Close.
 func (v *Volume) SetDurability(d Durability) error {
 	if d < DurabilityStrict || d > DurabilityLazy {
 		return fmt.Errorf("hfsplus: unknown durability %d", int(d))
@@ -86,7 +95,8 @@ func (v *Volume) Durability() Durability { return v.durability }
 // barriers instead of one per mutation (an SMB request that writes and sets times,
 // say). It is not a transaction: if fn fails or the machine dies, the mutations
 // made so far stay (or are partly lost) and the volume is left marked dirty; fn's
-// error is returned in preference to Sync's.
+// error is returned in preference to Sync's. Like SetDurability, it must not run
+// concurrently with mutators; it has DurabilityLazy's data-writeback exposure.
 func (v *Volume) Batch(fn func() error) error {
 	prev := v.durability
 	if err := v.SetDurability(DurabilityLazy); err != nil {
@@ -121,8 +131,18 @@ func (v *Volume) flushHeld(meta, hdrP, hdrA []writeRun, old []byte, journaled bo
 			return err
 		}
 		v.held = true
+		v.dataDirty = false // that fsync made the data durable too
 	}
 	v.touched = true
+	// Data-ordered (like ext4 data=ordered): file data is durable before the
+	// metadata that points at it, or a crash can show a new file holding the bytes
+	// of a deleted one. A commit without data pays no extra barrier. Lazy skips it
+	// by design (data-writeback).
+	if v.dataDirty && v.durability == DurabilityMounted {
+		if err := v.fsync(); err != nil {
+			return err
+		}
+	}
 	for _, h := range []struct {
 		off int64
 		dst *[]writeRun

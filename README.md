@@ -87,14 +87,23 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   is `fcntl(F_FULLFSYNC)` (Go's `internal/poll/fd_fsync_darwin.go`, `Fsync`, line 22); `man 2 fsync` says
   plain fsync(2) leaves the drive free to reorder, `man 2 fcntl` says F_FULLFSYNC "acts as a barrier",
   so the ordering above is only a guarantee over F_FULLFSYNC and no weaker primitive is offered.
-  Fsyncs for a first and a second mutation on a volume clean at open, then `Sync` (counted by
-  `TestDurabilityBarriers`):
+  Fsyncs for a first mutation on a volume clean at open, a second without file data, a third with file
+  data, then `Sync` (counted by `TestDurabilityBarriers`):
 
-  | Level | first | next | `Sync` | Durable when the mutator returns | Volume between mutations |
-  |---|---|---|---|---|---|
-  | `DurabilityStrict` (default) | 3 | 3 | 1 | yes | marked clean |
-  | `DurabilityMounted` | 2 | 1 | 1 | yes | marked dirty until `Sync`/`Close` |
-  | `DurabilityLazy` | 1 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
+  | Level | first | next (no data) | with data | `Sync` | Durable when the mutator returns | Volume between mutations |
+  |---|---|---|---|---|---|---|
+  | `DurabilityStrict` (default) | 3 | 3 | 3 | 1 | yes | marked clean |
+  | `DurabilityMounted` | 2 | 1 | 2 | 1 | yes | marked dirty until `Sync`/`Close` |
+  | `DurabilityLazy` | 1 | 0 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
+
+  `Mounted` is data-ordered (like ext4 `data=ordered`): a commit that wrote file data puts a barrier
+  between the data and the metadata that points at it, so no crash image shows a file holding bytes it
+  was never written with (`TestDurabilityNoStaleData`, red without that barrier). `Lazy` is
+  data-writeback, by design: after a crash a file may contain stale bytes of a previously deleted file
+  (a disclosure), so do not use `Lazy` or `Batch` where different users share a volume. Under `Mounted`
+  and `Lazy` the journaled bit stays cleared for the whole held span, not one commit: after a crash in
+  it the volume stays non-journaled until `diskutil enableJournal`. `SetDurability` and `Batch` must not
+  run concurrently with mutators.
 
   Three barriers is the minimum for a commit that leaves the volume clean: the dirty mark must be durable
   before a sector moves, and those sectors before the clean mark. `Mounted` is TN1150's own protocol

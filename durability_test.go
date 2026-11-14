@@ -164,12 +164,13 @@ func TestDurabilityBarriers(t *testing.T) {
 	for _, tc := range []struct {
 		d     Durability
 		first int // fsyncs of the first mutation
-		next  int // of the second
+		next  int // of the second (no file data)
+		data  int // of a third that writes file data
 		sync  int // of the Sync that follows
 	}{
-		{DurabilityStrict, 3, 3, 1},
-		{DurabilityMounted, 2, 1, 1},
-		{DurabilityLazy, 1, 0, 2},
+		{DurabilityStrict, 3, 3, 3, 1},
+		{DurabilityMounted, 2, 1, 2, 1},
+		{DurabilityLazy, 1, 0, 0, 2},
 	} {
 		t.Run(tc.d.String(), func(t *testing.T) {
 			p := sparseImage(t, 8<<20)
@@ -194,6 +195,14 @@ func TestDurabilityBarriers(t *testing.T) {
 			}
 			if got := c.syncs - at; got != tc.next {
 				t.Errorf("second mutation: %d fsyncs, want %d", got, tc.next)
+			}
+			at = c.syncs
+			// A mutation that writes file data: Mounted orders it before the metadata.
+			if err := v.WriteFile("/c.txt", []byte{'z'}, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := c.syncs - at; got != tc.data {
+				t.Errorf("third mutation (with data): %d fsyncs, want %d", got, tc.data)
 			}
 			at = c.syncs
 			if err := v.Sync(); err != nil {
@@ -329,5 +338,111 @@ func TestDurabilityFailureStaysDirty(t *testing.T) {
 				t.Errorf("%v failAt %d: Close marked a failed volume cleanly unmounted", d, failAt)
 			}
 		}
+	}
+}
+
+// TestDurabilityNoStaleData: a later commit writes a file into the blocks a
+// deleted file held. Under Strict and Mounted no crash image (fsynced-only,
+// in-order, and every write of every fsync group landing alone or missing alone)
+// may show /b with a byte it was never written with. Lazy is data-writeback: the
+// stale bytes are allowed, and must be observed (the test is not vacuous).
+func TestDurabilityNoStaleData(t *testing.T) {
+	for _, d := range allDurabilities {
+		t.Run(d.String(), func(t *testing.T) {
+			p := sparseImage(t, 8<<20)
+			v, err := OpenFileWritable(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := v.SetDurability(d); err != nil {
+				t.Fatal(err)
+			}
+			if err := v.WriteFile("/a", bytes.Repeat([]byte{0xAA}, 9000), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := v.DeleteFile("/a"); err != nil {
+				t.Fatal(err)
+			}
+			orig, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := instrument(v)
+			if err := v.WriteFile("/b", bytes.Repeat([]byte{0xBB}, 9000), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			v.Close()
+			events := c.events
+			crash := filepath.Join(t.TempDir(), "crash.img")
+			stale, images := 0, 0
+			look := func(img []byte, what string) {
+				images++
+				if err := os.WriteFile(crash, img, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				r, err := OpenFile(crash)
+				if err != nil {
+					return
+				}
+				defer r.Close()
+				b, err := r.ReadFile("/b")
+				if err != nil {
+					return
+				}
+				if bytes.Contains(b, []byte{0xAA}) {
+					stale++
+					if d != DurabilityLazy {
+						t.Errorf("%s: /b holds bytes of the deleted file", what)
+					}
+				}
+			}
+			apply := func(upto int, skip, only int) []byte {
+				img := bytes.Clone(orig)
+				for j, e := range events[:upto] {
+					if e.sync || (skip >= 0 && j == skip) || (only >= 0 && j != only) {
+						continue
+					}
+					copy(img[e.off:], e.data)
+				}
+				return img
+			}
+			for k := 0; k <= len(events); k++ {
+				look(apply(k, -1, -1), "in-order")
+				dur := 0
+				for i := 0; i < k; i++ {
+					if events[i].sync {
+						dur = i + 1
+					}
+				}
+				look(apply(dur, -1, -1), "fsynced-only")
+			}
+			for s := 0; s <= len(events); {
+				e := s
+				for e < len(events) && !events[e].sync {
+					e++
+				}
+				base := apply(s, -1, -1)
+				for i := s; i < e; i++ {
+					only := bytes.Clone(base)
+					copy(only[events[i].off:], events[i].data)
+					look(only, "group write alone")
+					rest := bytes.Clone(base)
+					for j := s; j < e; j++ {
+						if j != i {
+							copy(rest[events[j].off:], events[j].data)
+						}
+					}
+					look(rest, "group write missing")
+				}
+				s = e + 1
+			}
+			if images == 0 {
+				t.Fatal("no image examined")
+			}
+			if d == DurabilityLazy && stale == 0 {
+				t.Error("lazy: the documented stale-data exposure was never observed, so the test proves nothing")
+			}
+			t.Logf("%v: %d images, %d with stale bytes", d, images, stale)
+		})
 	}
 }
