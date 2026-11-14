@@ -78,7 +78,7 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, op := range crashOps {
+		for _, op := range crashOpsPerDurability() {
 			work := filepath.Join(dir, kind.name+"-"+op.name+".img")
 			if err := os.WriteFile(work, orig, 0o644); err != nil {
 				t.Fatal(err)
@@ -86,6 +86,9 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 			v, err := OpenFileWritable(work)
 			if err != nil {
 				t.Fatalf("%s: %v", kind.name, err)
+			}
+			if err := v.SetDurability(op.dur); err != nil {
+				t.Fatal(err)
 			}
 			c := instrument(v)
 			if err := op.run(v); err != nil {

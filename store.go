@@ -342,6 +342,9 @@ func (v *Volume) flush() error {
 	// written last, restores the bit. (The journal was empty at open, see
 	// checkJournal, and is never written.)
 	journaled := old[vhAttributes+2]&(kHFSVolumeJournaledBit>>8) != 0
+	if v.durability != DurabilityStrict {
+		return v.flushHeld(meta, hdrP, hdrA, old, journaled)
+	}
 	if v.cleanOnDisk || journaled {
 		// The headers are rewritten whole, whatever changed: the final ones carry
 		// the unmounted bit (if the volume had it) and the journaled bit (if it had
@@ -395,10 +398,15 @@ func (v *Volume) flush() error {
 			return err
 		}
 	}
+	v.commitDone()
+	return nil
+}
+
+// commitDone drops the transaction's edit state after a commit reached the store.
+func (v *Volume) commitDone() {
 	v.regions = nil
 	v.regionBytes = 0
 	v.touched = false
 	v.dataDirty = false
 	v.dropReadCache()
-	return nil
 }
