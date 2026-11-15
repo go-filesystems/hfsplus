@@ -399,9 +399,11 @@ func (v *Volume) CaseSensitive() bool {
 // closed (it is the caller's).
 func (v *Volume) Close() error {
 	var serr error
-	if v.wr && !v.closed && (v.held || v.unsynced) {
+	if v.wr && !v.closed && (v.held || v.unsynced || v.failed != nil) {
 		// DurabilityMounted / DurabilityLazy: make the writes durable and put the
-		// clean marks back.
+		// clean marks back. A failed volume, at any level (a strict commit that
+		// failed mid-write holds nothing, but is not consistent), gets Sync's
+		// latched ErrVolumeFailed.
 		serr = v.Sync()
 	}
 	if v.wr {
