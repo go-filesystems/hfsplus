@@ -343,6 +343,13 @@ func (v *Volume) Sync() error {
 	if !v.wr {
 		return nil
 	}
+	if v.failed != nil {
+		// A write or fsync failed earlier. A retried fsync may succeed (the
+		// kernel reports an error once, then forgets it: fsyncgate) without the
+		// data that failed being on the medium, so answering nil would tell a
+		// caller its data is durable. The failure stays latched until reopen.
+		return fmt.Errorf("%w: %v", ErrVolumeFailed, v.failed)
+	}
 	if err := v.settle(); err != nil {
 		v.failed = err
 		return err
