@@ -56,7 +56,7 @@ correctness test.
 
 **Out of scope** (as with the `btrfs`/`xfs` siblings — these are deliberate non-goals, not partial implementations):
 
-- **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted). A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were. One whose journal holds transactions, or whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused. To make such a volume writable, mount and unmount it on macOS first so its journal is replayed.
+- **Journaling** — the HFS+ journal is not written/replayed (volumes are authored cleanly-unmounted). A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were (since v0.12.3 the first commit that changes anything stamps `lastMountedVersion` = `GoHF` into both volume headers, journaled or not; not `HFSJ`, the driver does not maintain the journal). One whose journal holds transactions, or whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch, or since v0.12.3 the Apple `journal_open` range checks: `jhdr_size` 0, journal size outside [256 KiB, 1 GiB], start/end 0, beyond the journal size or 1 GiB, or not a multiple of 512; three older checks stay stricter than Apple's and can refuse a journal macOS opens: the magic, where we accept only `JNLx` and Apple also accepts `JHDR`; the endian field; and the journal size recorded in the journal header against the Journal Info Block's, hfsplus#48) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused. To make such a volume writable, mount and unmount it on macOS first so its journal is replayed.
 - **Do not write an image that is mounted.** macOS keeps its own view of a mounted volume (cached nodes, bitmap and headers) and the two clobber each other (see `detach` in `macos_validation_test.go`).
 - **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not handled (compression is detected and rejected rather than returning wrong bytes).
 
@@ -116,6 +116,12 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   the group in whole or in part, with the volume marked dirty). `Close` settles. A failed volume is left
   dirty. Checked by `TestDurabilityCrashModel` (both crash models plus every write of every fsync group
   landing alone or missing alone) and `TestDarwinCrashImagesFsck` at every level.
+
+  Measured against macOS's own HFS+ driver (v0.12.2, 2026-11-16, 1-min load 4.19 to 4.75, 30 interleaved
+  rounds, opt-in `measure_darwin_test.go` with `HFSPLUS_MEASURE=1`), create + 1 byte + fsync: macOS
+  5.13 ms; `Strict` 12.66 ms (2.47x); `Mounted` 8.20 ms (1.60x); `Lazy` 0.095 ms (not durable until
+  `Sync`). The same 6 barriers over plain fsync(2) cost 0.29 ms, so the gap is the `F_FULLFSYNC` count.
+  Closing it is hfsplus#45 (journal writes); the design is `docs/design/journal-write.md`.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
@@ -213,7 +219,7 @@ memory). The returned `*Volume` implements
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
-| `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending, or unreadable / off-volume / other-device / bad checksum); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written |
+| `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending, or unreadable / off-volume / other-device / bad checksum / a header field outside Apple's `journal_open` ranges since v0.12.3; three older checks stay stricter than Apple's, see hfsplus#48); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written |
 
 ## Validation
 
