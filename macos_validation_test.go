@@ -345,6 +345,17 @@ func TestDarwinWriteIntoJournaledImage(t *testing.T) {
 		t.Error("the write changed the journal info block or the journal header")
 	}
 
+	// The Go write leaves a volume fsck_hfs accepts (read-only attach, as in the
+	// other tests).
+	// fsck_hfs skips a journaled volume without -f ("Volume is journaled. No
+	// checking performed"), so it is forced here.
+	fdev := attachRaw(t, img, true)
+	if out, _ := exec.Command("fsck_hfs", "-fn", fdev).CombinedOutput(); !strings.Contains(string(out), "appears to be OK") {
+		detach(fdev)
+		t.Fatalf("fsck_hfs -fn not clean after the Go write:\n%s", out)
+	}
+	detach(fdev)
+
 	dev, mnt = mountRaw(t, img)
 	defer detach(dev)
 	time.Sleep(300 * time.Millisecond)

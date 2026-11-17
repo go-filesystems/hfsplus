@@ -84,12 +84,23 @@ func TestJournalHeaderByteOrders(t *testing.T) {
 			t.Errorf("len %d: err = %v, want ErrJournaled", len(h), err)
 		}
 	}
-	// jhdr_size larger than what was given, and smaller than the header.
-	for _, js := range []uint32{0, 43, 8192} {
-		h := buildJournalHeader(binary.BigEndian, 0, 0, 4096, false)
+	// jhdr_size zero (Apple, hfs_journal.c:1961) or smaller than the struct read.
+	for _, js := range []uint32{0, 43} {
+		h := buildJournalHeader(binary.BigEndian, 512, 512, 4096, false)
 		binary.BigEndian.PutUint32(h[40:], js)
+		resignJournalHeader(h)
 		if _, _, _, _, err := readJournalHeader(h); !errors.Is(err, ErrJournaled) {
 			t.Errorf("jhdr_size %d: err = %v", js, err)
+		}
+	}
+	// Apple refuses only zero, so any other size at least the struct is decoded
+	// (a power-of-two sector-size rule would have refused 100, 513 and 768).
+	for _, js := range []uint32{44, 100, 513, 768, 8192} {
+		h := buildJournalHeader(binary.BigEndian, 512, 512, 4096, false)
+		binary.BigEndian.PutUint32(h[40:], js)
+		resignJournalHeader(h)
+		if _, _, _, jh, err := readJournalHeader(h); err != nil || jh != js {
+			t.Errorf("jhdr_size %d: %d, %v", js, jh, err)
 		}
 	}
 }
@@ -125,7 +136,34 @@ func journaledImage(t testing.TB, flags uint32, jh []byte, size uint64) (img []b
 	be.PutUint64(jib[36:], uint64(jBlock)*uint64(vh.BlockSize))
 	be.PutUint64(jib[44:], size)
 	copy(img[uint64(jBlock)*uint64(vh.BlockSize):], jh)
+	// The bitmap owns both: mark the JIB block and the journal's 128 blocks
+	// allocated (and take them off freeBlocks, as macOS does), so a larger write
+	// cannot allocate over them.
+	bmOff := uint64(vh.AllocationFile.Extents[0].StartBlock) * uint64(vh.BlockSize)
+	used := uint32(0)
+	for _, r := range [][2]uint32{{jibBlock, 1}, {jBlock, 128}} {
+		for b := r[0]; b < r[0]+r[1]; b++ {
+			if img[bmOff+uint64(b/8)]&(0x80>>(b%8)) != 0 {
+				t.Fatalf("block %d is already allocated", b)
+			}
+			img[bmOff+uint64(b/8)] |= 0x80 >> (b % 8)
+			used++
+		}
+	}
+	be.PutUint32(h[0x30:], vh.FreeBlocks-used)
 	return img, jibBlock, jBlock
+}
+
+// withJhdrSize returns a copy of header h with jhdr_size js, re-signed.
+func withJhdrSize(h []byte, js uint32) []byte {
+	h = bytes.Clone(h)
+	bo := binary.ByteOrder(binary.LittleEndian)
+	if binary.BigEndian.Uint32(h[0:4]) == journalHeaderMagic {
+		bo = binary.BigEndian
+	}
+	bo.PutUint32(h[40:], js)
+	resignJournalHeader(h)
+	return h
 }
 
 func TestCheckJournal(t *testing.T) {
@@ -151,6 +189,24 @@ func TestCheckJournal(t *testing.T) {
 		{"size mismatch", kJIJournalInFSMask, empty, size + 4096, nil, "differs"},
 		{"size too small", kJIJournalInFSMask, empty, 8, nil, "outside the volume"},
 		{"size past the volume", kJIJournalInFSMask, empty, 1 << 40, nil, "outside the volume"},
+		// What Apple's journal_open refuses (hfs_journal.c:2019-2033 start/end <= 0
+		// or above size; :2046, :2053 not a multiple of 512).
+		{"start == end == 0", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0, 0, size, false), size, nil, "outside"},
+		{"start == end == 256", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 256, 256, size, false), size, nil, "512-aligned"},
+		{"start zero, end set", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0, 0x4400, size, false), size, nil, "outside"},
+		{"start == end past size", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, size+512, size+512, size, false), size, nil, "outside"},
+		{"start == end unaligned", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x4401, 0x4401, size, false), size, nil, "512-aligned"},
+		{"end past size", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x4400, size+512, size, false), size, nil, "outside"},
+		{"start == end == size", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, size, size, size, false), size, nil, ""},
+		// Accepted by Apple's journal_open, so accepted here: jhdr_size is refused
+		// only when zero (hfs_journal.c:1961), start/end may lie below jhdr_size
+		// (:2019-2033 only bound them by 0 and size). A power-of-two or
+		// [jhdr_size, size] rule would have refused all three.
+		{"jhdr_size 768 (not a sector size)", kJIJournalInFSMask, withJhdrSize(empty, 768), size, nil, ""},
+		{"jhdr_size 4096, start == end == 512", kJIJournalInFSMask, withJhdrSize(buildJournalHeader(binary.LittleEndian, 512, 512, size, false), 4096), size, nil, ""},
+		{"jhdr_size zero", kJIJournalInFSMask, withJhdrSize(empty, 0), size, nil, "header size 0"},
+		{"jhdr_size beyond the journal", kJIJournalInFSMask, withJhdrSize(empty, size+512), size, nil, "exceeds the journal size"},
+		{"journal below 256 KiB", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 512, 512, 0x20000, false), 0x20000, nil, "outside [256 KiB"},
 		{"info block zero", kJIJournalInFSMask, empty, size, func(img []byte, _ uint32) {
 			binary.BigEndian.PutUint32(img[volumeHeaderOffset+12:], 0)
 		}, "outside the volume"},
@@ -226,9 +282,40 @@ func TestWriteIntoEmptyJournal(t *testing.T) {
 	if !bytes.Equal(out[uint64(jBlock)*4096:][:512], empty) {
 		t.Error("journal header changed")
 	}
+	// The first write signed both headers (TN1150: lastMountedVersion).
+	for name, off := range map[string]int{"primary": volumeHeaderOffset, "alternate": len(out) - 1024} {
+		if got := string(out[off+8 : off+12]); got != lastMountedVersion {
+			t.Errorf("%s header lastMountedVersion = %q, want %q", name, got, lastMountedVersion)
+		}
+	}
 	// Reopened for writing it is still accepted: the journal is still empty.
 	if _, err := OpenWritable(out, nil); err != nil {
 		t.Errorf("reopen after write: %v", err)
+	}
+}
+
+// The fixture marks the info block and the journal allocated, so a write that
+// needs most of the free space cannot land on them.
+func TestLargeWriteSparesJournal(t *testing.T) {
+	empty := buildJournalHeader(binary.LittleEndian, 0x4400, 0x4400, 0x80000, false)
+	img, jibBlock, jBlock := journaledImage(t, kJIJournalInFSMask, empty, 0x80000)
+	want := bytes.Clone(img[uint64(jBlock)*4096:][:128*4096])
+	jibWant := bytes.Clone(img[uint64(jibBlock)*4096:][:4096])
+	v, err := OpenWritable(img, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	free := int(v.VolumeHeader().FreeBlocks)
+	data := bytes.Repeat([]byte{0xA5}, (free-16)*4096)
+	if err := v.WriteFile("/big", data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := v.Bytes()
+	if !bytes.Equal(out[uint64(jBlock)*4096:][:128*4096], want) || !bytes.Equal(out[uint64(jibBlock)*4096:][:4096], jibWant) {
+		t.Error("a large write overwrote the journal or its info block")
+	}
+	if got, err := v.ReadFile("/big"); err != nil || !bytes.Equal(got, data) {
+		t.Errorf("ReadFile: %v", err)
 	}
 }
 
@@ -287,11 +374,27 @@ func FuzzJournalHeader(f *testing.F) {
 			}
 			return
 		}
-		if jh < journalHeaderLen || jh > maxJournalHeaderBytes {
+		if jh < journalHeaderLen {
 			t.Fatalf("accepted jhdr_size %d", jh)
 		}
 		_, _, _ = start, end, size
 	})
+}
+
+// resignJournalHeader recomputes the checksum of the journal header at h, in the
+// byte order its magic names (and leaves a header with no valid magic alone).
+func resignJournalHeader(h []byte) {
+	var bo binary.ByteOrder
+	switch {
+	case binary.BigEndian.Uint32(h[0:4]) == journalHeaderMagic:
+		bo = binary.BigEndian
+	case binary.LittleEndian.Uint32(h[0:4]) == journalHeaderMagic:
+		bo = binary.LittleEndian
+	default:
+		return
+	}
+	bo.PutUint32(h[36:40], 0)
+	bo.PutUint32(h[36:40], journalChecksum(h[:journalHeaderLen]))
 }
 
 // FuzzCheckJournal splices fuzzer-chosen bytes into the journal info block and
@@ -316,6 +419,11 @@ func FuzzCheckJournal(f *testing.F) {
 			at = jibOff
 		}
 		copy(img[at+off:], patch)
+		if !inJIB {
+			// Sign what was patched, so the checksum does not turn every input
+			// away before the fields behind it are looked at.
+			resignJournalHeader(img[jOff : jOff+512])
+		}
 		vh, err := readVolumeHeader(bytesReaderAt(img))
 		if err != nil {
 			return
@@ -326,6 +434,30 @@ func FuzzCheckJournal(f *testing.F) {
 		}
 		if err == nil && !st.empty {
 			t.Fatal("accepted a journal that is not empty")
+		}
+		if err != nil || !st.journaled {
+			return
+		}
+		// Accepted: decode the header independently of the code under test and
+		// hold it to what Apple's journal_open and TN1150 require of an empty
+		// journal (a never-initialised one carries no header to read).
+		be := binary.BigEndian
+		jib := img[int64(vh.JournalInfoBlock)*4096:]
+		if be.Uint32(jib[0:4])&kJIJournalNeedInitMask != 0 {
+			return
+		}
+		joff, size := be.Uint64(jib[36:44]), be.Uint64(jib[44:52])
+		h := img[joff:]
+		var bo binary.ByteOrder = binary.LittleEndian
+		if be.Uint32(h[0:4]) == journalHeaderMagic {
+			bo = be
+		}
+		start, end, jsize, jhdr := bo.Uint64(h[8:16]), bo.Uint64(h[16:24]), bo.Uint64(h[24:32]), uint64(bo.Uint32(h[40:44]))
+		if start != end {
+			t.Fatalf("accepted start %d != end %d", start, end)
+		}
+		if jsize != size || jsize < 256*1024 || jsize > 1<<30 || jhdr < journalHeaderLen || jhdr > jsize || start == 0 || start > jsize || start%512 != 0 {
+			t.Fatalf("accepted out-of-range header: start %d end %d size %d (info block %d) jhdr_size %d", start, end, jsize, size, jhdr)
 		}
 	})
 }

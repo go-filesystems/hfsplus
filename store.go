@@ -329,6 +329,9 @@ func (v *Volume) flush() error {
 	if !anyChange && !v.dataDirty {
 		return nil
 	}
+	if err := v.stampLastMountedVersion(&hdrP, &hdrA); err != nil {
+		return err
+	}
 	old := make([]byte, 512)
 	if _, err := v.readUnder(old, pOff); err != nil && err != io.EOF {
 		return err
@@ -399,6 +402,40 @@ func (v *Volume) flush() error {
 		}
 	}
 	v.commitDone()
+	return nil
+}
+
+// lastMountedVersion is the signature this driver writes at offset 8 of both
+// volume headers (TN1150, Volume Header, lastMountedVersion: "Any code which
+// modifies the on disk structures must also set this field to a unique value
+// which identifies that code. Third-party implementations of HFS Plus should
+// place a registered creator code in this field"). It is deliberately none of
+// Apple's values: 'HFSJ' says the writer maintains the journal (this driver does
+// not; TN1150, Journal: a journal must not be replayed when the field is not the
+// signature of an implementation that maintains it), '10.0' and '8.10' would
+// claim to be Mac OS.
+const lastMountedVersion = "GoHF"
+
+const vhLastMountedVersion = 8
+
+// stampLastMountedVersion sets lastMountedVersion in the primary and alternate
+// header of the transaction being committed, and refreshes their changed runs.
+// A volume already carrying the signature is not touched.
+func (v *Volume) stampLastMountedVersion(hdrP, hdrA *[]writeRun) error {
+	for _, h := range []struct {
+		off int64
+		dst *[]writeRun
+	}{{volumeHeaderOffset, hdrP}, {v.altOff, hdrA}} {
+		b, err := v.region(h.off, 512)
+		if err != nil {
+			return err
+		}
+		if string(b[vhLastMountedVersion:vhLastMountedVersion+4]) == lastMountedVersion {
+			continue
+		}
+		copy(b[vhLastMountedVersion:], lastMountedVersion)
+		*h.dst = changedRuns(v.regions[h.off])
+	}
 	return nil
 }
 

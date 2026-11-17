@@ -35,8 +35,9 @@ const (
 	// journalHeaderLen is the bytes of journal_header the checks read (through
 	// jhdr_size); the on-disk header fills one sector.
 	journalHeaderLen = 44
-	// maxJournalHeaderBytes bounds jhdr_size, one sector (TN1150: "2048 on many
-	// types of optical media"); a larger one is not a journal header.
+	// maxJournalHeaderBytes is how much of the journal is read to decode the
+	// header (one sector; TN1150: "2048 on many types of optical media"). It does
+	// not bound jhdr_size: the decoder reads only the first journalHeaderLen bytes.
 	maxJournalHeaderBytes = 4096
 )
 
@@ -71,7 +72,12 @@ func readJournalHeader(h []byte) (start, end, size uint64, jhdrSize uint32, err 
 		return 0, 0, 0, 0, fmt.Errorf("%w: journal header magic is not valid", ErrJournaled)
 	}
 	jhdrSize = bo.Uint32(h[40:44])
-	if jhdrSize < journalHeaderLen || jhdrSize > maxJournalHeaderBytes {
+	// Apple's journal_open refuses only a zero jhdr_size (core/hfs_journal.c:1961,
+	// hfs-715.100.10), so no sector-size rule is applied here. A jhdr_size below
+	// the 44-byte struct this reader decodes is refused for that reason alone (it
+	// cannot be a header we can read); the upper bound (jhdr_size <= size) is
+	// checked in checkJournalAt, where the size is known.
+	if jhdrSize < journalHeaderLen {
 		return 0, 0, 0, 0, fmt.Errorf("%w: journal header size %d", ErrJournaled, jhdrSize)
 	}
 	// TN1150: zero the checksum field, then checksum the header. The header it
@@ -134,12 +140,32 @@ func checkJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalStat
 	if n, err := r.ReadAt(hdr, int64(off)); n < len(hdr) {
 		return st, fmt.Errorf("%w: journal header cannot be read: %v", ErrJournaled, err)
 	}
-	start, end, jsize, _, err := readJournalHeader(hdr)
+	start, end, jsize, jhdrSize, err := readJournalHeader(hdr)
 	if err != nil {
 		return st, err
 	}
 	if jsize != size {
 		return st, fmt.Errorf("%w: journal header size %d differs from the journal info block's %d", ErrJournaled, jsize, size)
+	}
+	// Exactly what Apple's journal_open refuses (core/hfs_journal.c, tag
+	// hfs-715.100.10), no more: size below 256 KiB or above 1 GiB (:2035); start
+	// (:2019-2021) or end (:2027-2029) <= 0, above size, or above 1 GiB; start
+	// (:2046) or end (:2053) not a multiple of 512. A journal macOS opens is not
+	// refused here. The one addition is jhdr_size > size, which our reader needs
+	// so the header cannot claim to be larger than its journal.
+	if jsize < 256*1024 || jsize > 1<<30 {
+		return st, fmt.Errorf("%w: journal size %d is outside [256 KiB, 1 GiB]", ErrJournaled, jsize)
+	}
+	if uint64(jhdrSize) > jsize {
+		return st, fmt.Errorf("%w: journal header size %d exceeds the journal size %d", ErrJournaled, jhdrSize, jsize)
+	}
+	for _, f := range []struct {
+		name string
+		v    uint64
+	}{{"start", start}, {"end", end}} {
+		if f.v == 0 || f.v > jsize || f.v > 1<<30 || f.v%512 != 0 {
+			return st, fmt.Errorf("%w: journal header %s %d is outside (0, %d] or not 512-aligned", ErrJournaled, f.name, f.v, jsize)
+		}
 	}
 	if start != end {
 		return st, fmt.Errorf("%w: transactions pending (start %d, end %d)", ErrJournaled, start, end)
