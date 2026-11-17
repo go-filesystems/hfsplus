@@ -116,6 +116,12 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   the group in whole or in part, with the volume marked dirty). `Close` settles. A failed volume is left
   dirty. Checked by `TestDurabilityCrashModel` (both crash models plus every write of every fsync group
   landing alone or missing alone) and `TestDarwinCrashImagesFsck` at every level.
+
+  Measured against macOS's own HFS+ driver (v0.12.2, 2026-11-16, 1-min load 4.2-4.75, 30 interleaved
+  rounds, opt-in `measure_darwin_test.go` with `HFSPLUS_MEASURE=1`), create + 1 byte + fsync: macOS
+  5.13 ms; `Strict` 12.66 ms (2.47x); `Mounted` 8.20 ms (1.60x); `Lazy` 0.095 ms (not durable until
+  `Sync`). The same 6 barriers over plain fsync(2) cost 0.29 ms, so the gap is the `F_FULLFSYNC` count.
+  Closing it is hfsplus#45 (journal writes); the design is `docs/design/journal-write.md`.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
