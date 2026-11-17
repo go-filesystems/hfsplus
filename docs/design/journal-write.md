@@ -40,6 +40,8 @@ checked in a source is marked **UNVERIFIED**.
     - `buffer_flushed_callback` (597-769)
     - `get_io_info` (1617-1640)
     - `journal_open` (1876-2140)
+    - `size_up_tbuffer` (1557-1614)
+    - `update_fs_block` (818-880)
   - `core/hfs_vfsutils.c`:
     - `hfs_flush` (3483-3546)
     - the mount-time dirty mark (706-710)
@@ -49,6 +51,8 @@ checked in a source is marked **UNVERIFIED**.
     - early journal init, gated on `lastMountedVersion == 'HFSJ'` (1575-1610)
     - `hfs_flushvolumeheader` journaling both headers and writing `'HFSJ'`
       (3678-3731, 3931-3958)
+    - `HFS_REPLAY_JOURNAL` sysctl and `hfs_journal_replay` (3061-3077,
+      4492-4511)
   - `core/hfs_format.h:59-61` (`kHFSPlusMountVersion`, `kHFSJMountVersion`,
     `kFSKMountVersion`);
   - `core/hfs_vnops.c` (`hfs_fsync` full-sync path, 3227-3242);
@@ -57,7 +61,8 @@ checked in a source is marked **UNVERIFIED**.
   - `lib_fsck_hfs`:
     - `fsck_journal.c` (fsck's own replay, 180-338, 466-643)
     - `fsck_journal.h:52-59`
-    - `dfalib/SVerify1.c:98-166` (`CheckIfJournaled`)
+    - `dfalib/SVerify1.c:98-166` (`CheckIfJournaled`) and `:4514-4545`
+      (`journal_replay`, delegated to the kernel)
     - `dfalib/SControl.c:599-680` (quick check, journal replay into fsck's
       cache)
     - `check.c:258-270`
@@ -125,9 +130,14 @@ but the header that names it may not be. macOS relies on the replay reading
 their checksum is valid and their sequence number is the previous one or the
 previous one + 1 (1211-1300, `check_past_jnl_end`). This only works if the
 durable header has `start != end`, because `replay_journal` returns at once on
-an empty journal (1184-1186). macOS keeps the journal non-empty while mounted:
-`start` advances lazily, only when space is needed (`check_free_space`,
-2433-2500), and at `journal_close` (2317-2320).
+an empty journal (1184-1186). macOS advances `start` lazily, only when space is
+needed (`check_free_space`, 2433-2500) and at `journal_close` (2317-2320), so
+the journal is usually non-empty while mounted. It is not always non-empty,
+though: when no older transaction is pending, `check_free_space` sets
+`start = active_start` (2493), and that can equal `end`. In that corner, a
+transaction past `end` whose header write did not land before a crash is not
+replayed. Our design does not inherit this, because invariant C (section 5)
+keeps the durable header non-empty from the first commit on.
 
 **The header must never be durable before the transaction it names.** Suppose
 the header covers a block list whose checksum is bad. If that block list is not
@@ -185,8 +195,48 @@ its `endian` field states; the driver keeps the existing order.
   macOS writes them (2552). The blocks follow in `binfo` order.
 - The block list header checksum covers its first 32 bytes, computed with the
   field zeroed: the 16-byte header plus `binfo[0]` (`BLHDR_CHECKSUM_SIZE`, 130
-  and 4142-4143; TN1150 *Block List Header*). `binfo[1..]` are not covered;
-  the per-block checksums protect them.
+  and 4142-4143; TN1150 *Block List Header*). `binfo[1..]` are **not**
+  covered.
+
+**The block list header is one sector.** Because `binfo[1..]` are not covered
+by the checksum, a block list header spanning several sectors can be torn in a
+way that still verifies. Take a header written past `end` where sector 0 lands
+but sectors 1.. still hold the block list a previous lap wrote at the same
+offset. The checksum passes, and the stale entries come with their own stale
+checksums. If the stale data is also still at the same offsets, those
+checksums pass too, and replay writes stale blocks.
+
+The guard:
+
+- In `H_1`, the first header of a session, written while the journal is empty,
+  we set `blhdr_size = jhdr_size`. Every block list header is then one sector,
+  and it lands whole or not at all under the same one-sector assumption as the
+  journal header (section 5).
+- Changing `blhdr_size` while the journal is empty is safe: nothing is live
+  that was written with the old size, and replay reads the size from the
+  header (1215).
+- macOS itself chooses `blhdr_size = phys_blksz` when its transaction buffer
+  is small (1608-1609), and it recomputes the value at its own next open
+  (1607-1613).
+- fsck reads the block list header as one `jhdr_size` block
+  (fsck_journal.c:176-182) and finds the data at `blhdr_size`
+  (fsck_journal.c:274).
+- **UNVERIFIED:** that both replayers accept a journal we re-sized this way.
+  The oracle asserts it.
+
+The cost of the guard is capacity. A block list holds 30 entries with
+`jhdr_size = 512` (`512/16 - 1 - 1`) and 254 with 4096. Each entry is one
+contiguous run, of any length that is a multiple of `jhdr_size`, so adjacent
+changed sectors of one region merge into one entry. Widening a run to the
+whole region (a B-tree node, a bitmap block) is allowed when that keeps the
+count under the cap. A commit that still needs more entries takes the bypass
+path (section 7).
+
+The fallback, if the oracle refuses a re-sized journal, is to keep the volume's
+`blhdr_size` and cap `num_blocks` so that every used entry lies in sector 0. It
+gives the same 30 or 254 entries. The guard also removes a cost: with a
+macOS-sized `blhdr_size` of up to 96 KiB (section 4, "Sizes"), every commit
+would write a 96 KiB block list header.
 
 **One block list per transaction.** The format allows chained block lists
 (TN1150; 2855-2911), but we do not write them. If the second of two chained
@@ -194,11 +244,12 @@ lists past `end` is torn, replay stops there and applies the first one alone,
 which tears the transaction (1244-1253). A transaction that does not fit one
 block list or the journal takes the bypass path (section 7).
 
-- A block list holds up to `max_blocks` blocks, typically 255 with
-  `blhdr_size = 4096`.
-- `size_up_tbuffer` (1607-1612) gives 4096 for the default 128 KiB
-  transaction buffer.
-- The actual `blhdr_size` is read from the header, never assumed.
+- **Sizes.** A volume arrives with whatever `blhdr_size` macOS last chose.
+  `size_up_tbuffer` sets it to `tbuffer_size / jhdr_size * 16` (1607). The
+  transaction buffer is 128 KiB only below 256 MB of RAM. Above that it is
+  RAM / 256 MB × 128 KiB (1563-1576), capped at `size/2` and 3 MiB (1599-1605).
+  So a macOS-written `blhdr_size` can reach 96 KiB. We read it from the header
+  and never assume it, and we replace it at session start (above).
 
 **Blocks.** Blocks are `jhdr_size`-aligned runs. Each changed run of a region
 is widened to `jhdr_size` boundaries, and the widened bytes are read through
@@ -208,8 +259,8 @@ The two volume headers are journaled like any other block, as macOS does
 
 **Wraparound.** The journal buffer is `[jhdr_size, size)`. A write that
 reaches `size` continues at `jhdr_size`, and a block list header or a block may
-be split there (TN1150 *Journal*; `do_journal_io` 341-347 and 423-431; replay
-412-414, 1403-1405, 1443-1446).
+be split there (TN1150 *Journal*; `do_journal_io` 341-347 and 423-431; replay 1403-1405 and
+1443-1446).
 
 **The journal is never perfectly full** (TN1150 *Journal*).
 
@@ -221,15 +272,63 @@ be split there (TN1150 *Journal*; `do_journal_io` 341-347 and 423-431; replay
 
 **Sequence numbers.**
 
-- The first transaction of a session gets the header's `sequence_num` + 1,
-  and each later transaction gets the previous one + 1.
-- A sequence number is never 0.
-- The header's `sequence_num` is the newest transaction it covers (4289,
-  `saved_sequence_num`).
+The header's `sequence_num` is not a safe base. After a kernel replay, the
+header is rewritten with the sequence number it already had
+(`write_journal_header(jnl, 1, jnl->jhdr->sequence_num)`, 1510). The
+transactions replayed from past `end` carried higher numbers, and
+`journal_open` restarts numbering from that header value (2109). Replay past
+`end` accepts a sequence number equal to the previous one, as well as one
+greater (1268-1271; fsck the same, fsck_journal.c:590-593).
+
+So "header + 1" can reproduce a number an earlier session used. Here is how
+that goes wrong. Our first transaction `T_1` gets `s + 1` and is written at
+`end`. If `T_1` is large enough to wrap up to an older transaction that also
+carried `s + 1`, the replayer reads past `T_1` and accepts the stale
+transaction as its successor.
+
+Rule: the first transaction of a session gets
+`header.sequence_num + size/jhdr_size + 1`. This is what macOS does when it
+rewrites a journal after a block-size change (2097-2099, without the random
+term, which we do not need). Each later transaction gets the previous number
+plus one. A transaction that would get 0 gets 1 instead.
+
+Why this is enough:
+
+- Every block list occupies at least one `jhdr_size` sector, so the journal
+  holds at most `size/jhdr_size` block lists at any time.
+- The only numbers the header can lag behind are those of block lists
+  physically present in the journal: the ones replayed from past `end`, and
+  torn ones that replay rejected. There are at most `size/jhdr_size` of them,
+  numbered consecutively from `header.sequence_num + 1`.
+- So the first number of the new session is greater than every number still
+  in the journal.
+- Replay accepts a successor only if its number equals the previous one or
+  the previous one + 1. Every number of the new session is at least the
+  first, so no stale block list can follow a new one.
+- The header's `sequence_num`, written in `H_k`, is `seq(T_{k-1})`, the newest
+  transaction it covers (as at 4289). The empty header written at Close
+  carries `seq(T_c)`, as `journal_close` writes `jnl->sequence_num` (2320).
+
+The numbers are 32 bits, and each session spends at least `size/jhdr_size` of
+them. 1270-1271 compare with plain equality, so the argument should survive a
+wrap, with 0 skipped. **UNVERIFIED:** the kernel's behavior across a 32-bit
+wrap was not exercised.
+
+**Replayer (PR 1) transaction boundaries.** A transaction starts at a block
+list with `BLHDR_FIRST_HEADER` set (1330-1331, 2557), as the kernel does. It
+does not end when `binfo[0].next == 0`, as TN1150 *Replaying the Journal*
+says, because the kernel stores the sequence number in that word (4140), so
+it is never 0 on a current journal.
 
 **Journal validity at open.** These checks come on top of today's:
 
 - `256 KiB ≤ size ≤ 1 GiB` and `size % jhdr_size == 0` (1905-1922);
+- `size ≥ jhdr_size × (jhdr_size / 16)` (1910-1916): 16 KiB at 512, 1 MiB on a
+  4Kn device;
+- the volume is not embedded in an HFS wrapper. `bnum` counts device sectors
+  (`update_fs_block` reads `fs_block` on `fsdev`, 826), and for an embedded
+  volume that would add the wrapper's offset. The writable opens already
+  refuse wrapped volumes (`enableWrites`, hfsplus.go:232-236);
 - `blhdr_size` is a positive multiple of `jhdr_size`;
 - `jhdr_size` equals the sector size the driver writes in (512 or 4096).
 
@@ -328,15 +427,46 @@ way macOS reaches the transaction its last `F_FULLFSYNC` wrote. `H_k` advances
 `start` past `T_{k-2}`. Its in-place writes went out after barrier k-2 and were
 made durable by barrier k-1, so invariant B holds.
 
+**Invariant D: `T_k` must not overwrite `T_{k-2}`.** `H_k` and `T_k` are in the
+same group, so while group k is in flight the durable header may still be
+`H_{k-1} = [T_{k-2}]`. Replay then starts at `start(T_{k-2})`. If `T_k`
+wrapped over `T_{k-2}`'s block list, replay would either:
+
+- fail at the first block list (1259-1262), so the mount writes `'FSK!'`; or
+- restart with `end = start` (1434-1435) and replay nothing, leaving
+  `T_{k-1}`'s torn in-place writes unrepaired.
+
+The live region of the journal during commit k is therefore `T_{k-2}`,
+`T_{k-1}` and `T_k`. Free space for `T_k` is measured from `start(T_{k-2})`,
+not from `start(T_{k-1})`.
+
 ### Crash argument against today's strict guarantee
 
 Today's guarantee: every commit is durable when its mutator returns. A crash
 anywhere leaves either a consistent volume marked clean, or a volume marked
 dirty that fsck repairs.
 
-The new guarantee is stronger. After macOS replays, the volume holds exactly
-the commits that returned, possibly plus the one in flight, whole. Nothing
-needs repair.
+The new guarantee is stronger. After the kernel replays, the volume holds
+exactly the commits that returned, possibly plus the one in flight, whole.
+Nothing needs repair. Two replay paths reach the device, and both are the
+kernel's:
+
+- **The mount.** Early journal init calls `journal_open` → `replay_journal`
+  (hfs_vfsops.c:1590).
+- **A writable `fsck_hfs`** (not `-n`, not `-q`). It calls
+  `journal_replay(block_device)` (check.c:258-270). That is a
+  `sysctl(HFS_REPLAY_JOURNAL)` on its write descriptor (SVerify1.c:4514-4538),
+  which the kernel serves with `hfs_mountfs(..., journal_replay_only = 1)`
+  (hfs_vfsops.c:3061-3077, 4492-4505), so the per-block checksums apply.
+
+fsck's own replay (fsck_journal.c), which skips per-block checksums, writes
+only into fsck's cache. It runs only when fsck cannot write
+(`canWrite == 0 || writeRef == -1`, SControl.c:652-655). So it can make
+`fsck_hfs -n` report damage the kernel would never produce (below), but it
+never writes a torn `T_k` to the device. The review that prompted this
+paragraph read check.c:258-270 as fsck writing its own replay. SVerify1.c:4536
+shows the replay is delegated to the kernel. The oracle checks the writable
+path anyway (section 9).
 
 | Crash point | Durable on the medium | What macOS replays | Result |
 |---|---|---|---|
@@ -380,8 +510,9 @@ With one barrier, a crash in group k can still replay `T_k` (whole, past
 guarantee.
 
 **Small data is journaled.** A commit's new data blocks, up to a bound, go into
-`T_k` as ordinary blocks. The proposed bound is the smaller of 1 MiB and a
-quarter of the journal. They are written in place after the barrier, like
+`T_k` as ordinary blocks. The proposed bound is the smaller of 1 MiB and
+`(size - jhdr_size) / 8`. That keeps three consecutive transactions under the
+journal-full threshold of section 7. They are written in place after the barrier, like
 metadata. The data is then atomic with its metadata, for 1 barrier. The 1-byte
 benchmark falls under this rule.
 
@@ -389,12 +520,24 @@ benchmark falls under this rule.
 then the commit above: 2 barriers, as `Mounted` pays today. The extra 2 ms is
 noise next to the I/O of a large write.
 
-**Revoke rule.** A block journaled by a transaction still in the replay window
-(`T_{k-1}`, `T_k`) must not be overwritten in place by unjournaled data.
-Otherwise replay would put the old journaled contents over it; this is the
-classic revoke problem. The rule: a newly allocated data block that is in the
-window's journaled set is journaled too. The window holds at most two
-transactions, so the set is small. macOS's `journal_kill_block` covers only
+**Revoke rule.** A block journaled by a transaction that replay can still
+reach must not be overwritten in place by unjournaled data. Otherwise replay
+would put the old journaled contents over it; this is the classic revoke
+problem.
+
+The replay window is **three** transactions, `T_{k-2}`, `T_{k-1}` and `T_k`.
+While group k (or the data group before it, on the large-data path) is in
+flight, the durable header may still be `H_{k-1} = [T_{k-2}]`, and replay
+starts there (section 5, invariant D).
+
+Example: a block is journaled in `T_{k-2}`, freed in `T_{k-1}`, then reused as
+large unjournaled data in commit k. A crash before barrier k replays
+`T_{k-2}`'s old bytes over it.
+
+The rule: a newly allocated data block that is in the journaled set of
+`T_{k-2}`, `T_{k-1}` or `T_k` is journaled too. If that would exceed the
+small-data bound, the allocation skips the block instead. The set covers three
+transactions of at most 30-254 entries each, so it stays small. macOS's `journal_kill_block` covers only
 the open transaction (2981). How macOS handles this across transactions is
 **UNVERIFIED**.
 
@@ -405,18 +548,37 @@ and made durable by barrier k+1. Reads in between see them, because `putAt`
 drops the read cache, as today.
 
 **`start` advance.** Every commit's header advances `start` past `T_{k-2}`
-(section 5), at no extra barrier. The live journal is at most `T_{k-1}`, `T_k`
-and the free gap. A commit needs `size(T_k) <` the free space after the
-advance.
+(section 5), at no extra barrier.
 
-**Journal full.** When `T_k` does not fit next to `T_{k-1}`:
+**Free-space rule (invariant D).** During commit k the live journal is
+`T_{k-2}`, `T_{k-1}` and `T_k`. `T_k` fits only if
+`size(T_{k-2}) + size(T_{k-1}) + size(T_k) < size - jhdr_size`, which leaves
+the one free sector TN1150 requires.
+
+**Journal full.** When `T_k` does not fit:
 
 1. A barrier makes `T_{k-1}`'s in-place writes durable.
 2. Write `H = [end(T_{k-1}), end(T_{k-1}))`, an empty journal, then a barrier.
 3. Run the first-commit sequence for `T_k` (2 barriers).
 
-That is 4 barriers. It is rare: the journal is at least 256 KiB (2035), and a
-small commit is a few KiB.
+That is 4 barriers.
+
+**How often.** Wrapping around the circular buffer costs nothing; only the
+three-transaction fit does. With one-sector block list headers (section 4), a
+small commit is about 6-8 KiB (block list header, a catalog node or two, a
+bitmap sector, two volume headers, journaled data). Three of them fit any
+journal macOS accepts (≥ 256 KiB, 2035). Journal-full therefore needs three
+consecutive transactions averaging more than a third of the journal. The
+small-data bound in section 6 is set to keep a run of small writes under
+that, so a steady stream of small writes never takes this path.
+**UNVERIFIED:** "rare" for mixed workloads. The churn test counts the
+journal-full commits.
+
+**Effect of invariant D on the barrier plan.** Counting from `start(T_{k-2})`
+instead of `start(T_{k-1})` adds no barrier to a commit that fits. It only
+lowers the transaction size at which journal-full triggers, from about half
+the journal to about a third. The steady state is still 1 barrier, and the
+estimate in section 10 does not move.
 
 **Bypass.** The bypass applies when `T_k` cannot be one block list, cannot fit
 an empty journal, or the journal failed the checks of section 4.
@@ -425,8 +587,13 @@ an empty journal, or the journal failed the checks of section 4.
 2. Write `lastMountedVersion = 'GoHF'`.
 3. Run today's strict path: clear the bits, 3 barriers, restore them.
 
-The 1314-image review covered that strict path, so it is correct by
-construction. The next commit is a first commit again.
+The 1314-image review covered today's strict path. **UNVERIFIED:** that it
+stays correct when it is entered right after a journal is emptied, and when it
+writes `'GoHF'`. The review never ran that sequence, so the oracle adds it.
+The next commit after a bypass is a first commit again.
+
+The bypass is also taken when a commit needs more block list entries than one
+sector holds (section 4).
 
 **Sync.** In journal mode every commit is already durable. Sync issues one
 barrier if in-place writes are pending (cheap insurance, not needed for
@@ -438,7 +605,8 @@ correctness), and nothing otherwise.
 2. Barrier.
 3. Write `T_c` in place.
 4. Barrier.
-5. Write an empty `H`.
+5. Write an empty `H`, with `start = end = end(T_c)` and
+   `sequence_num = seq(T_c)`, as `journal_close` does (2317-2320).
 6. Barrier.
 
 That is 3 barriers, once. The volume is left as macOS leaves it: an empty
@@ -469,7 +637,7 @@ is atomic.
 
 **Batch** then becomes a real transaction when its mutations fit one block
 list: all or nothing after a crash. Today Batch is documented as "not a
-transaction" (durability.go:104-108). Until the Lazy PR lands:
+transaction" (durability.go:96). Until the Lazy PR lands:
 
 - Batch keeps today's behavior;
 - the journal is emptied before switching to a held level (`SetDurability`
@@ -487,8 +655,23 @@ log, `attachRaw`, `fsckExit` in crash_darwin_test.go).
 **Inputs.**
 
 - Image kinds: `apple-jnl` and `apple-jnl-dirty`.
-- A multi-commit sequence, k = 1 to 4, so the first commit, the steady
-  state, the wrap and journal-full are all crossed.
+- A multi-commit sequence, k = 1 to 4: the first commit and the steady state.
+- **A wraparound sequence.** Enough commits to wrap the journal at least
+  twice, on the smallest journal macOS accepts. The crash points sit where:
+  - `T_k` straddles the end of the buffer;
+  - `T_k` lands right behind `T_{k-2}` (invariant D at its limit);
+  - `T_k` overwrites a previous lap's block list at the same offset, with
+    that stale list's sectors and data still in place (section 4, the
+    one-sector guard).
+
+  It also includes a session that starts on a journal a kernel replay left
+  with a lagging `sequence_num` (section 4). The base images are made by
+  macOS.
+- **Journal full and bypass.** A transaction too large for the free space
+  (journal full), and one with too many entries (bypass), each followed by
+  ordinary commits.
+- **Revoke.** A block journaled in `T_{k-2}`, freed, and reused as large data
+  in commit k.
 
 **Crash images:**
 
@@ -509,7 +692,11 @@ log, `attachRaw`, `fsckExit` in crash_darwin_test.go).
    bytes.
 4. **No `'FSK!'`.** Read `lastMountedVersion` after detach: it must say
    `'HFSJ'`. `'FSK!'` would mean the mount judged our journal bad.
-5. **Secondary check.** Run `fsck_hfs -fn` on the raw image before mounting.
+5. **Writable fsck path.** On a second copy of the crash image, run a
+   writable `fsck_hfs -fy` on the raw device. That replays through
+   `sysctl(HFS_REPLAY_JOURNAL)` (section 5). Then run `fsck_hfs -fn` and the
+   durability walk of step 3. The result must equal step 1's.
+6. **Secondary check.** Run `fsck_hfs -fn` on the raw image before mounting.
    Its result is recorded but not asserted for torn-block images, because of
    the divergence noted in section 5.
 
@@ -556,6 +743,10 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
   - Which case holds is the UNVERIFIED point of section 3.
 - The first commit of a session costs 2 barriers, so the benchmark reports its
   first round separately.
+- The review fixes (invariant D, the three-transaction revoke window,
+  one-sector block list headers, the sequence bump) add no barrier to a
+  commit that fits. The one-sector header shrinks each commit's journal write
+  from up to 96 KiB to a few KiB. The estimate is unchanged.
 - Count macOS's own `DKIOCSYNCHRONIZE` calls per fsync on the image
   (dtrace/`fs_usage`) to settle the UNVERIFIED point of section 3.
 
@@ -574,13 +765,22 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
      does not.
    - The kernel drops the previous transaction when a covered block list
      header is bad (1413-1439). Our ordering never produces that state.
-   - A stale block list from an earlier lap, carrying sequence number + 1,
-     would be replayed. That cannot happen while our sequence numbers continue
-     the header's.
+   - A stale block list from an earlier lap, carrying the same sequence
+     number or that number + 1, would be replayed. The session-start bump of
+     `size/jhdr_size` (section 4) rules this out.
+   - A multi-sector block list header torn over a previous lap's list could
+     pass with stale entries. One-sector block list headers (section 4) rule
+     this out, under the one-sector-atomicity assumption, which is
+     UNVERIFIED.
 3. **Slower than mounted.**
    - Small data is written twice (journal + in place), and large data pays 2
      barriers.
-   - Journal-full (4 barriers) and bypass (3 + 2) are slower than mounted's 1-2.
+   - Journal-full (4 barriers) and bypass (3 + 2) are slower than mounted's
+     1-2. Invariant D makes journal-full start at about a third of the
+     journal per transaction instead of a half.
+   - Bypass also catches commits with more than 30 entries at
+     `jhdr_size = 512`, for example a large rename touching many B-tree
+     nodes.
    - Close costs 3.
    - With a small journal (256 KiB) and a write-heavy batch, journal-full
      could dominate. Measure this with the churn test, and size the small-data
@@ -597,7 +797,8 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
 
 1. **Read side: replayer and format.**
    - Decode the journal header (all fields), the block list headers and the
-     blocks.
+     blocks. Transaction boundaries follow `BLHDR_FIRST_HEADER`, not TN1150's
+     `binfo[0].next` rule (section 4).
    - Replay into an overlay.
    - Add a fuzz target and corpus, and the fixture macOS wrote.
    - `Open` gains an option to replay a non-empty journal in memory,
