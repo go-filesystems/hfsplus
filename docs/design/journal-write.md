@@ -309,6 +309,29 @@ Why this is enough:
   transaction it covers (as at 4289). The empty header written at Close
   carries `seq(T_c)`, as `journal_close` writes `jnl->sequence_num` (2320).
 
+**Exception: a session whose `H_1` never landed.** The proof above misses one
+case. Suppose a session crashes in group 1 or 2, before `H_1` is durable. It
+leaves its `T_1`, numbered `header + N + 1`, at `end`, behind the unchanged
+empty header. The next session computes the same number and writes its own
+`T_1` at the same offset, because `end` did not move.
+
+We keep the arithmetic bump and accept this case, rather than scanning the
+ring, because the case is harmless:
+
+- While the durable header is empty, nothing is replayed. The kernel returns
+  at once (1184-1186), and fsck replays only a non-empty journal
+  (SControl.c:661).
+- The new `T_1`'s block list header is one sector (above), so it replaces the
+  old one at that offset in a single write.
+- The old `T_1` cannot be written past without `H_1` landing, so it is the
+  only leftover. When the new `H_1` lands, it covers the new `T_1`, and replay
+  reads past `end(T_1)` into what is left of the old `T_1`'s blocks. Those
+  bytes are block contents, not a block list header, so the read-past-end
+  stops there.
+
+The last point holds only while those blocks are not crafted to look like a
+block list header (section 11, risk 5).
+
 The numbers are 32 bits, and each session spends at least `size/jhdr_size` of
 them. 1270-1271 compare with plain equality, so the argument should survive a
 wrap, with 0 skipped. **UNVERIFIED:** the kernel's behavior across a 32-bit
@@ -558,8 +581,12 @@ the one free sector TN1150 requires.
 **Journal full.** When `T_k` does not fit:
 
 1. A barrier makes `T_{k-1}`'s in-place writes durable.
-2. Write `H = [end(T_{k-1}), end(T_{k-1}))`, an empty journal, then a barrier.
-3. Run the first-commit sequence for `T_k` (2 barriers).
+2. Write `H = [end(T_{k-1}), end(T_{k-1}))`, an empty journal, with
+   `sequence_num = seq(T_{k-1})`, then a barrier.
+3. Run the first-commit sequence for `T_k` (2 barriers). It continues the
+   numbering with `seq(T_k) = seq(T_{k-1}) + 1`, not with a session-start
+   bump: every number still in the ring is at most `seq(T_{k-1})`, so the
+   argument of section 4 holds without one.
 
 That is 4 barriers.
 
@@ -583,7 +610,9 @@ estimate in section 10 does not move.
 **Bypass.** The bypass applies when `T_k` cannot be one block list, cannot fit
 an empty journal, or the journal failed the checks of section 4.
 
-1. Empty the journal, as in journal-full steps 1-2.
+1. Empty the journal, as in journal-full steps 1-2. The empty `H` carries
+   `sequence_num = seq(T_{k-1})`, the newest journal transaction. The next
+   journaled commit after the bypass continues from that number + 1.
 2. Write `lastMountedVersion = 'GoHF'`.
 3. Run today's strict path: clear the bits, 3 barriers, restore them.
 
@@ -789,7 +818,20 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
    transaction, or macOS resets the journal (hfs_vfsutils.c:2886-2895), and it
    must switch from #32's `'GoHF'` in the same PR that starts writing the
    journal (section 5).
-5. **`jhdr_size` ≠ 512 (4Kn).** Blocks widen to 4 KiB, and write amplification
+5. **User bytes in the journal (security).** Small-data journaling (section 6)
+   puts file contents a user controls into the journal ring. Replay reads past
+   `end` into stale bytes, possibly a previous lap's journaled data. A crafted
+   sector there could pass as a block list header: a valid 32-byte checksum,
+   a guessable sequence number (`last` or `last + 1`), entries pointing
+   anywhere on the volume, and data matching its own checksums. After a crash,
+   replay would write those sectors. macOS does not journal file data, so it
+   has no such exposure.
+
+   This must be designed out before PR 4. Candidates: journal only data
+   blocks that cannot hold a plausible block list header (reject a block
+   whose first 32 bytes verify as one), or keep file data out of the journal
+   and pay the large-data path's 2 barriers. Open, not accepted.
+6. **`jhdr_size` ≠ 512 (4Kn).** Blocks widen to 4 KiB, and write amplification
    grows. The tests need a 4Kn image; whether `hdiutil` supports one is
    **UNVERIFIED**.
 
