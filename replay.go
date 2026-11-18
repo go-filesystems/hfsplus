@@ -63,6 +63,10 @@ func replayErrorf(format string, a ...any) error {
 type replayOverlay struct {
 	unit  uint64
 	units map[uint64][]byte // unit index (volume offset / unit) -> its bytes
+	// end is where the replay stopped: the kernel's jhdr->start == jhdr->end after
+	// replay_journal (hfs_journal.c:1453-1456), the offset the journal header is
+	// rewritten with when the replay is written back (replay_write.go).
+	end uint64
 }
 
 func (o *replayOverlay) add(fsOff uint64, data []byte) {
@@ -190,6 +194,7 @@ func replayJournal(r io.ReaderAt, base uint64, h journalHeader, volSize uint64) 
 	}
 	ov := &replayOverlay{unit: jh, units: map[uint64][]byte{}}
 	if p.start == p.end { // :1184-1186
+		ov.end = p.start
 		return ov, nil
 	}
 	p.origStart = p.start
@@ -206,6 +211,7 @@ func replayJournal(r io.ReaderAt, base uint64, h journalHeader, volSize uint64) 
 		for _, e := range entries {
 			ov.add(e.fsOff, e.data)
 		}
+		ov.end = p.start // == p.end, :1453-1456
 		return ov, nil
 	}
 }
