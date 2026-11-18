@@ -232,14 +232,21 @@ func OpenFile(path string, opts ...OpenOption) (*Volume, error) {
 // volume edits img in place; callers can retrieve the mutated bytes with
 // Bytes() or, if wa is non-nil, flush them with Sync. Pass wa = nil for a
 // purely in-memory writable volume.
+//
+// A journaled volume whose journal holds transactions and whose lastMountedVersion
+// is 'HFSJ' is replayed first (replay_write.go): the blocks, a barrier, the empty
+// journal header, a barrier. If wa is non-nil the replay is written to it too.
 func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
+	if err := replayPending(&journalMemStore{img: img, wa: wa}, int64(len(img))); err != nil {
+		return nil, err
+	}
 	v, err := Open(bytesReaderAt(img), int64(len(img)))
 	if err != nil {
 		return nil, err
 	}
 	// The write path bypasses the journal, so a journal holding transactions
 	// would be replayed by macOS over what is written here (go-filesystems/
-	// hfsplus#29 asked about this): refuse it rather than lose writes.
+	// hfsplus#29 asked about this): replayPending emptied it, or refused.
 	if _, err := checkJournal(img, v.vh); err != nil {
 		return nil, err
 	}
@@ -269,16 +276,11 @@ var ErrVolumeSize = errors.New("hfsplus: image size does not match the volume")
 // HFS wrapper, where the embedded volume's end is not the file's, is not
 // supported: its signature at offset 1024 is the wrapper's, and Open refuses it.)
 func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) error {
-	volEnd := int64(v.vh.TotalBlocks) * int64(v.vh.BlockSize)
-	alt := volEnd - 1024
-	if size < volEnd || alt < volumeHeaderOffset+512 {
-		return fmt.Errorf("%w: %d bytes given, the volume is %d blocks of %d bytes", ErrVolumeSize, size, v.vh.TotalBlocks, v.vh.BlockSize)
+	volEnd, err := checkWritableExtent(under, size, v.vh)
+	if err != nil {
+		return err
 	}
-	var sig [2]byte
-	if _, err := under.ReadAt(sig[:], alt); err != nil || binary.BigEndian.Uint16(sig[:]) != v.vh.Signature {
-		return fmt.Errorf("%w: no volume header at the alternate location %d", ErrVolumeSize, alt)
-	}
-	v.altOff = alt
+	v.altOff = volEnd - 1024
 	v.wr = true
 	v.under = under
 	v.size = size
@@ -289,6 +291,21 @@ func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) error {
 		v.rcache = make(map[int64][]byte)
 	}
 	return nil
+}
+
+// checkWritableExtent is the size and alternate-header check of enableWrites,
+// returning the volume's end (totalBlocks * blockSize).
+func checkWritableExtent(under io.ReaderAt, size int64, vh *volumeHeader) (volEnd int64, err error) {
+	volEnd = int64(vh.TotalBlocks) * int64(vh.BlockSize)
+	alt := volEnd - 1024
+	if size < volEnd || alt < volumeHeaderOffset+512 {
+		return 0, fmt.Errorf("%w: %d bytes given, the volume is %d blocks of %d bytes", ErrVolumeSize, size, vh.TotalBlocks, vh.BlockSize)
+	}
+	var sig [2]byte
+	if _, err := under.ReadAt(sig[:], alt); err != nil || binary.BigEndian.Uint16(sig[:]) != vh.Signature {
+		return 0, fmt.Errorf("%w: no volume header at the alternate location %d", ErrVolumeSize, alt)
+	}
+	return volEnd, nil
 }
 
 // OpenFileWritable opens the image at path for read/write, in place: the image
@@ -327,8 +344,9 @@ type ReadWriteSyncerAt interface {
 
 // OpenWritableAt opens the size-byte HFS+ image held by rw for read/write, in
 // place, exactly as OpenFileWritable does: no copy of the image is made, a
-// journaled volume whose journal is not empty is refused with ErrJournaled, and
-// every mutation reads what it needs from rw and writes back only what it
+// journaled volume whose journal holds transactions is replayed first if its
+// lastMountedVersion is 'HFSJ' (replay_write.go) and refused with ErrJournaled if
+// it is not, and every mutation reads what it needs from rw and writes back only what it
 // changed (see store.go).
 //
 // It exists so a caller that already holds the image open -- an *os.File it
@@ -346,6 +364,9 @@ type ReadWriteSyncerAt interface {
 func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
 	if rw == nil || size <= 0 {
 		return nil, fmt.Errorf("hfsplus: OpenWritableAt: need a store and a positive size (got %d)", size)
+	}
+	if err := replayPending(rw, size); err != nil {
+		return nil, err
 	}
 	v, err := Open(rw, size)
 	if err != nil {

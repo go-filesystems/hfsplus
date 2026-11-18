@@ -443,9 +443,10 @@ func TestOpenWithJournalReplay(t *testing.T) {
 	if !bytes.Equal(img, before) {
 		t.Error("Open with replay modified the image")
 	}
-	// The write path is unchanged: still refused.
-	if _, err := OpenWritable(img, nil); !errors.Is(err, ErrJournaled) {
-		t.Errorf("OpenWritable: %v, want ErrJournaled", err)
+	// checkJournal, the check the plain write path made, still refuses (PR 2 of #45
+	// replays before it; see replay_write_test.go).
+	if _, err := checkJournal(img, plain.vh); !errors.Is(err, ErrJournaled) {
+		t.Errorf("checkJournal: %v, want ErrJournaled", err)
 	}
 	// Size unknown: replay cannot bound its reads.
 	if _, err := Open(bytesReaderAt(img), -1, WithJournalReplay()); !errors.Is(err, ErrJournaled) {

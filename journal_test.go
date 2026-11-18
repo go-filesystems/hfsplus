@@ -180,8 +180,11 @@ func TestCheckJournal(t *testing.T) {
 		{"empty little-endian", kJIJournalInFSMask, empty, size, nil, ""},
 		{"empty big-endian", kJIJournalInFSMask, buildJournalHeader(binary.BigEndian, 512, 512, size, false), size, nil, ""},
 		{"never initialised", kJIJournalInFSMask | kJIJournalNeedInitMask, make([]byte, 512), size, nil, ""},
-		{"transactions pending", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x4400, 0x6000, size, false), size, nil, "transactions pending"},
-		{"wrapped transactions", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x6000, 0x4400, size, false), size, nil, "transactions pending"},
+		{"transactions pending", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x4400, 0x6000, size, false), size, nil, "cannot be replayed"},
+		// The volumes of these two carry 'HFSJ' and a journal of zeros, so since PR 2 of
+		// #45 the replayer is what refuses them (checkJournal itself still says
+		// "transactions pending"; see replay_write_test.go).
+		{"wrapped transactions", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x6000, 0x4400, size, false), size, nil, "cannot be replayed"},
 		{"bad checksum", kJIJournalInFSMask, buildJournalHeader(binary.LittleEndian, 0x4400, 0x4400, size, true), size, nil, "checksum"},
 		{"no magic", kJIJournalInFSMask, make([]byte, 512), size, nil, "magic"},
 		{"other device", kJIJournalOnOtherDeviceMask, empty, size, nil, "not inside the volume"},
