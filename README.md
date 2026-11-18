@@ -196,12 +196,26 @@ memory). The returned `*Volume` implements
 `github.com/go-filesystems/interface.Filesystem` plus the optional
 `Labeller` / `Symlinker` / `Truncater` capabilities.
 
+## Reading a journaled volume whose journal holds transactions
+
+`Open(rs, size, hfsplus.WithJournalReplay())` (and `OpenFile(path, hfsplus.WithJournalReplay())`)
+serves such a volume as macOS would see it after replaying the journal: the journaled blocks are
+replayed in memory, over the image, and read from there. The image is not written and the volume
+stays read-only; the size must be known (not -1). It is a port of Apple's `replay_journal`
+(`hfs-715.100.10`, `core/hfs_journal.c`), so a transaction is read past the header's `end` while
+sequence numbers continue, a torn block or block list drops its transaction, and wraparound is
+handled. Every size taken from the journal is bounded (the overlay never exceeds the journal's size,
+256 MiB at most); a journal it refuses fails `Open` with `ErrJournalReplay` (which wraps
+`ErrJournaled`). `OpenWritable` and its variants still refuse such a volume with `ErrJournaled`.
+Without the option, `Open` reads the blocks as they are on the medium, without the transactions.
+Design: `docs/design/journal-write.md`, section 4; hfsplus#45.
+
 ## API
 
 | Function / method | Purpose |
 |---|---|
-| `Open(rs io.ReaderAt, size int64) (*Volume, error)` | Parse an HFS+/HFSX volume read-only from a `ReaderAt` |
-| `OpenFile(path string) (*Volume, error)` | Open an image file read-only |
+| `Open(rs io.ReaderAt, size int64, opts ...OpenOption) (*Volume, error)` | Parse an HFS+/HFSX volume read-only from a `ReaderAt`; `WithJournalReplay()` replays a non-empty journal in memory (see above) |
+| `OpenFile(path string, opts ...OpenOption) (*Volume, error)` | Open an image file read-only |
 | `OpenWritable(img []byte, wa io.WriterAt) (*Volume, error)` | Open an in-memory image read/write |
 | `OpenFileWritable(path string) (*Volume, error)` | Open an image file read/write in place (no copy of the image; each mutation writes and fsyncs what it changed) |
 | `OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error)` | The same in-place open over a store the caller already holds (an `*os.File` opened with its own checks, an `os.Root`, a descriptor passed in), so the image is not reopened by name. `rw` stays the caller's: `Close` does not close it. Same `ErrJournaled` check. `size` must be at least `totalBlocks x blockSize` and a volume header must sit at the alternate location, 1024 bytes before the end of the *volume* (TN1150, "Volume Header"), else `ErrVolumeSize` and nothing is written; a file longer than the volume is written up to the volume's end only. After `Close`, mutators return `ErrClosed`. HFS-wrapped volumes are not supported |
@@ -219,6 +233,7 @@ memory). The returned `*Volume` implements
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
+| `ErrJournalReplay` | `Open(..., WithJournalReplay())` on a journal the replayer cannot replay (the kernel would abandon it, or a size in it is outside the bounds); wraps `ErrJournaled` |
 | `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending, or unreadable / off-volume / other-device / bad checksum / a header field outside Apple's `journal_open` ranges since v0.12.3; three older checks stay stricter than Apple's, see hfsplus#48); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written |
 
 ## Validation

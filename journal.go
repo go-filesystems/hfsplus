@@ -18,7 +18,8 @@ import (
 // nothing to replay, so it cannot overwrite what was written. A volume whose
 // journal holds transactions is not: replay would copy the journalled blocks
 // over the driver's. OpenWritable therefore refuses such a volume with
-// ErrJournaled; Open (read-only) is unaffected.
+// ErrJournaled; Open (read-only) is unaffected, and Open with WithJournalReplay
+// serves the volume as macOS would see it after replaying the journal (replay.go).
 
 const (
 	kHFSVolumeJournaledBit = 1 << 13 // volume header attributes, bit 13

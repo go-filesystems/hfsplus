@@ -5,6 +5,7 @@ package hfsplus
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -511,10 +512,54 @@ func TestBombReplay(t *testing.T) {
 	}
 }
 
+// macNonEmptyJournal is the journal (header sector and buffer, 512 KiB) of a
+// Journaled HFS+ image on Darwin 27.2 (arm64), caught with 128 KiB of
+// transactions in it (start 0x4400, end 0x24600) by TestDarwinReplayMatchesKernel
+// while macOS was creating files. It is stored gzipped; the volume it belongs to
+// is not kept, so the test checks that it decodes and replays, not what it writes.
+func macNonEmptyJournal(t testing.TB) ([]byte, journalHeader) {
+	t.Helper()
+	f, err := os.Open(filepath.Join("testdata", "macos-nonempty-journal.bin.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := decodeJournalHeader(j[:512])
+	if err != nil {
+		t.Fatalf("macOS-written journal header rejected: %v", err)
+	}
+	return j, h
+}
+
+func TestReplayMacOSWrittenJournal(t *testing.T) {
+	j, h := macNonEmptyJournal(t)
+	if h.start != 0x4400 || h.end != 0x24600 || h.size != uint64(len(j)) || h.jhdrSize != 512 || h.blhdrSize != 0x2000 {
+		t.Fatalf("fixture header: start %#x end %#x size %#x jhdr %d blhdr %#x", h.start, h.end, h.size, h.jhdrSize, h.blhdrSize)
+	}
+	ov, err := replayJournal(bytesReaderAt(j), 0, h, 16<<20) // the image was 16 MiB
+	if err != nil {
+		t.Fatalf("a journal macOS wrote was refused: %v", err)
+	}
+	if len(ov.units) == 0 || ov.bytes() > h.size {
+		t.Errorf("overlay holds %d bytes of a %d-byte journal", ov.bytes(), h.size)
+	}
+	t.Logf("macOS-written journal: %d units (%d KiB) replayed", len(ov.units), ov.bytes()>>10)
+}
+
 func FuzzJournalReplay(f *testing.F) {
 	for _, s := range replaySeeds() {
 		f.Add(s.data, s.start, s.end, s.blhdr, s.sel, s.big)
 	}
+	j, h := macNonEmptyJournal(f)
+	f.Add(j, h.start, h.end, h.blhdrSize, uint8(0), false)
 	f.Fuzz(func(t *testing.T, data []byte, start, end uint64, blhdr uint32, sel uint8, big bool) {
 		jh := uint32(512) << (sel % 3)
 		size := uint64(len(data)) / uint64(jh) * uint64(jh)
