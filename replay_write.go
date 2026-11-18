@@ -40,8 +40,12 @@ import (
 // A crash at any point leaves either the volume as it was, with the journal still
 // non-empty (replay is idempotent: it writes the same blocks again), or the
 // replayed volume with an empty journal. Never an empty header over blocks that
-// were not written. A replay error leaves the volume untouched (nothing is
-// written before the replay has succeeded and its end is checked).
+// were not written. A replay that cannot be done (ErrJournalReplay) writes nothing:
+// nothing is written before the replay has succeeded and its end is checked. A
+// WriteAt or Sync error part-way is crash-safe, not "writes nothing": the journal
+// stays non-empty and the next open replays to the same result. The open's own
+// checks after the replay (checkJournal in hfsplus.go) can still refuse a volume
+// the replay rewrote.
 //
 // Only a volume whose lastMountedVersion is 'HFSJ' is replayed. TN1150,
 // "Journal": "If the lastMountedVersion field of the volume header does not match
@@ -56,7 +60,7 @@ import (
 // last mounted the volume is by definition not one we can vouch for), and macOS
 // itself does it only to avoid replaying over a third party's changes, a risk
 // that does not arise when we do not replay. Mount and unmount the volume on
-// macOS to have it reset, or open it read-only.
+// macOS to have it reset.
 
 const vhLastMountedVersionOff = volumeHeaderOffset + vhLastMountedVersion
 
@@ -89,6 +93,16 @@ func (m *journalMemStore) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
+// canBarrier: a purely in-memory volume (wa == nil) is its own store and ordered;
+// a mirror must be able to Sync.
+func (m *journalMemStore) canBarrier() bool {
+	if m.wa == nil {
+		return true
+	}
+	_, ok := m.wa.(interface{ Sync() error })
+	return ok
+}
+
 func (m *journalMemStore) Sync() error {
 	if s, ok := m.wa.(interface{ Sync() error }); ok {
 		return s.Sync()
@@ -114,9 +128,13 @@ func replayPending(st replayStore, size int64) error {
 		return nil
 	}
 	// The same size and alternate-header checks the open makes, before anything is
-	// written: a replay into a volume the open then refuses would have written.
-	volEnd, err := checkWritableExtent(st, size, vh)
-	if err != nil {
+	// written: a replay into a volume the open then refuses would have written. They
+	// use the volume header as it is now; the replayed blocks are bounded by the
+	// image below, not by this header's totalBlocks*blockSize, because an
+	// interrupted hfs_extendfs journals the new alternate header past the old end
+	// (hfs_resize.c:372, :798; hfs_vfsops.c:3897, :3938) and the kernel and the read
+	// path (replay.go) bound a block by the device or image, not by the old header.
+	if _, err := checkWritableExtent(st, size, vh); err != nil {
 		return err
 	}
 	var lmv [4]byte
@@ -126,9 +144,19 @@ func replayPending(st replayStore, size int64) error {
 	if string(lmv[:]) != "HFSJ" {
 		return fmt.Errorf("%w: transactions pending (start %d, end %d) and lastMountedVersion is %q, not 'HFSJ': "+
 			"macOS discards such a journal at mount (hfs_vfsutils.c:2886-2895) and TN1150 says it must not be replayed; "+
-			"mount and unmount the volume on macOS first, or open it read-only", ErrJournaled, loc.hdr.start, loc.hdr.end, lmv[:])
+			"mount and unmount the volume on macOS first (read-only Open without WithJournalReplay shows the blocks in place; "+
+			"WithJournalReplay shows the journal's view, which macOS would discard)", ErrJournaled, loc.hdr.start, loc.hdr.end, lmv[:])
 	}
-	ov, err := replayJournal(st, loc.off, loc.hdr, uint64(volEnd))
+	// The two barriers are what keeps an emptied header from sitting over blocks that
+	// never landed. A writer given to OpenWritable that cannot Sync gives none, so
+	// the journal is not replayed through it. (The write path itself tolerates such a
+	// writer, but a torn commit there is declared by the cleared unmounted bit; an
+	// emptied journal over missing blocks is declared by nothing.)
+	if b, ok := st.(interface{ canBarrier() bool }); ok && !b.canBarrier() {
+		return fmt.Errorf("%w: transactions pending and the writer cannot Sync, so the replay could not be ordered "+
+			"(blocks durable before the journal header is emptied)", ErrJournaled)
+	}
+	ov, err := replayJournal(st, loc.off, loc.hdr, uint64(size))
 	if err != nil {
 		return err
 	}
