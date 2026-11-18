@@ -59,8 +59,29 @@ type journalState struct {
 // field tells). It returns the start, end, size and jhdr_size fields after
 // verifying magic, endian and checksum.
 func readJournalHeader(h []byte) (start, end, size uint64, jhdrSize uint32, err error) {
+	jh, err := decodeJournalHeader(h)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return jh.start, jh.end, jh.size, jh.jhdrSize, nil
+}
+
+// journalHeader is every field of journal_header (hfs_journal.h:111-124),
+// decoded in the byte order the header states.
+type journalHeader struct {
+	bo          binary.ByteOrder
+	start, end  uint64
+	size        uint64
+	blhdrSize   uint32
+	jhdrSize    uint32
+	sequenceNum uint32 // 0 when h held fewer than 48 bytes
+}
+
+// decodeJournalHeader is readJournalHeader with all the fields: magic, endian,
+// start, end, size, blhdr_size, checksum, jhdr_size and sequence_num.
+func decodeJournalHeader(h []byte) (journalHeader, error) {
 	if len(h) < journalHeaderLen {
-		return 0, 0, 0, 0, fmt.Errorf("%w: journal header is truncated", ErrJournaled)
+		return journalHeader{}, fmt.Errorf("%w: journal header is truncated", ErrJournaled)
 	}
 	var bo binary.ByteOrder
 	switch {
@@ -69,16 +90,16 @@ func readJournalHeader(h []byte) (start, end, size uint64, jhdrSize uint32, err 
 	case binary.LittleEndian.Uint32(h[0:4]) == journalHeaderMagic && binary.LittleEndian.Uint32(h[4:8]) == journalEndianMagic:
 		bo = binary.LittleEndian
 	default:
-		return 0, 0, 0, 0, fmt.Errorf("%w: journal header magic is not valid", ErrJournaled)
+		return journalHeader{}, fmt.Errorf("%w: journal header magic is not valid", ErrJournaled)
 	}
-	jhdrSize = bo.Uint32(h[40:44])
+	jhdrSize := bo.Uint32(h[40:44])
 	// Apple's journal_open refuses only a zero jhdr_size (core/hfs_journal.c:1961,
 	// hfs-715.100.10), so no sector-size rule is applied here. A jhdr_size below
 	// the 44-byte struct this reader decodes is refused for that reason alone (it
 	// cannot be a header we can read); the upper bound (jhdr_size <= size) is
 	// checked in checkJournalAt, where the size is known.
 	if jhdrSize < journalHeaderLen {
-		return 0, 0, 0, 0, fmt.Errorf("%w: journal header size %d", ErrJournaled, jhdrSize)
+		return journalHeader{}, fmt.Errorf("%w: journal header size %d", ErrJournaled, jhdrSize)
 	}
 	// TN1150: zero the checksum field, then checksum the header. The header it
 	// means is the journal_header struct (44 bytes, through jhdr_size), not the
@@ -88,9 +109,16 @@ func readJournalHeader(h []byte) (start, end, size uint64, jhdrSize uint32, err 
 	copy(buf[:], h)
 	copy(buf[36:40], []byte{0, 0, 0, 0})
 	if got, want := journalChecksum(buf[:]), bo.Uint32(h[36:40]); got != want {
-		return 0, 0, 0, 0, fmt.Errorf("%w: journal header checksum %#x, want %#x", ErrJournaled, want, got)
+		return journalHeader{}, fmt.Errorf("%w: journal header checksum %#x, want %#x", ErrJournaled, want, got)
 	}
-	return bo.Uint64(h[8:16]), bo.Uint64(h[16:24]), bo.Uint64(h[24:32]), jhdrSize, nil
+	jh := journalHeader{
+		bo: bo, start: bo.Uint64(h[8:16]), end: bo.Uint64(h[16:24]), size: bo.Uint64(h[24:32]),
+		blhdrSize: bo.Uint32(h[32:36]), jhdrSize: jhdrSize,
+	}
+	if len(h) >= journalHeaderLen+4 {
+		jh.sequenceNum = bo.Uint32(h[44:48])
+	}
+	return jh, nil
 }
 
 // journalChecksum is TN1150's calc_checksum.
@@ -112,6 +140,30 @@ func checkJournal(img []byte, vh *volumeHeader) (journalState, error) {
 // checkJournalAt is checkJournal over a reader of size bytes: it reads only the
 // journal info block and the journal header, never the image.
 func checkJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalState, error) {
+	return inspectJournalAt(r, imgSize, vh, nil)
+}
+
+// journalLoc is where a journal lies and what its header says; loadJournalAt
+// fills it in when the journal has transactions (start != end).
+type journalLoc struct {
+	off uint64
+	hdr journalHeader
+}
+
+// loadJournalAt runs every check of checkJournalAt except the last one (it does
+// not refuse start != end): it returns st.empty == false, a nil error and the
+// journal's location for a journal that holds transactions, which is what the
+// replayer reads. checkJournalAt turns that case into ErrJournaled.
+func loadJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalState, journalLoc, error) {
+	var loc journalLoc
+	st, err := inspectJournalAt(r, imgSize, vh, &loc)
+	return st, loc, err
+}
+
+// inspectJournalAt is the body of both: it stores the location in loc once the
+// header is decoded and the bounds hold, and refuses start != end only when
+// loc is nil.
+func inspectJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader, loc *journalLoc) (journalState, error) {
 	if vh.Attributes&kHFSVolumeJournaledBit == 0 {
 		return journalState{}, nil
 	}
@@ -140,10 +192,11 @@ func checkJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalStat
 	if n, err := r.ReadAt(hdr, int64(off)); n < len(hdr) {
 		return st, fmt.Errorf("%w: journal header cannot be read: %v", ErrJournaled, err)
 	}
-	start, end, jsize, jhdrSize, err := readJournalHeader(hdr)
+	jh, err := decodeJournalHeader(hdr)
 	if err != nil {
 		return st, err
 	}
+	start, end, jsize, jhdrSize := jh.start, jh.end, jh.size, jh.jhdrSize
 	if jsize != size {
 		return st, fmt.Errorf("%w: journal header size %d differs from the journal info block's %d", ErrJournaled, jsize, size)
 	}
@@ -165,6 +218,12 @@ func checkJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader) (journalStat
 	}{{"start", start}, {"end", end}} {
 		if f.v == 0 || f.v > jsize || f.v > 1<<30 || f.v%512 != 0 {
 			return st, fmt.Errorf("%w: journal header %s %d is outside (0, %d] or not 512-aligned", ErrJournaled, f.name, f.v, jsize)
+		}
+	}
+	if loc != nil {
+		*loc = journalLoc{off: off, hdr: jh}
+		if start != end {
+			return st, nil // transactions pending: the caller replays them
 		}
 	}
 	if start != end {
