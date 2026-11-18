@@ -49,6 +49,12 @@ const (
 // in it is outside the bounds the replayer accepts. It wraps ErrJournaled.
 var ErrJournalReplay = fmt.Errorf("%w: journal cannot be replayed", ErrJournaled)
 
+// ErrReplayBudget is returned when the blocks a journal would replay exceed this
+// driver's own resource bound, min(journal size, 256 MiB). The kernel has no such
+// bound (it streams blocks to the device); it protects the memory of a process
+// that replays an untrusted journal into an overlay. It wraps ErrJournalReplay.
+var ErrReplayBudget = fmt.Errorf("%w: replayed blocks exceed the replay memory budget", ErrJournalReplay)
+
 func replayErrorf(format string, a ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrJournalReplay}, a...)...)
 }
@@ -118,12 +124,13 @@ const (
 
 // replayer is the state of replay_journal (its locals, hfs_journal.c:1164-1174).
 type replayer struct {
-	r       io.ReaderAt
-	base    uint64 // offset of the journal in the image
-	h       journalHeader
-	volSize uint64
-	ring    uint64 // bytes of the circular buffer [jhdr_size, size)
-	budget  uint64 // most bytes of block data one replay may hold
+	checkBlocks bool // check_block_checksums, sticky (:1323-1325)
+	r           io.ReaderAt
+	base        uint64 // offset of the journal in the image
+	h           journalHeader
+	volSize     uint64
+	ring        uint64 // bytes of the circular buffer [jhdr_size, size)
+	budget      uint64 // most bytes of block data one replay may hold
 
 	start, end uint64 // jhdr->start and jhdr->end, which replay_journal rewrites
 	origStart  uint64
@@ -154,8 +161,12 @@ func replayJournal(r io.ReaderAt, base uint64, h journalHeader, volSize uint64) 
 	if jh < minJhdrSize || jh > maxJhdrSize || h.size%jh != 0 || h.size < 2*jh {
 		return nil, replayErrorf("jhdr_size %d, size %d", h.jhdrSize, h.size)
 	}
-	// hfs_journal.c:1905-1922: size is a multiple of jhdr_size and at least
-	// jhdr_size * (jhdr_size / 16).
+	// journal_open (hfs_journal.c:1910-1922) requires size >= phys_blksz *
+	// (phys_blksz / sizeof(block_info)) and size % phys_blksz == 0, where
+	// phys_blksz is the DEVICE's sector size (:1900). The replayer does not know
+	// the device, so it uses jhdr_size as phys_blksz (design section 4: they are
+	// equal on a journal macOS wrote, and do_journal_io addresses the journal in
+	// jhdr_size units, :386). A stand-in, not the kernel's test.
 	if h.size < jh*(jh/16) {
 		return nil, replayErrorf("size %d below jhdr_size*(jhdr_size/16)", h.size)
 	}
@@ -303,8 +314,18 @@ func (p *replayer) attempt() ([]replayEntry, attemptResult, error) {
 
 		// :1302-1308, plus the bounds this reader needs: the entries lie inside
 		// blhdr_size, and bytes_used covers the header and stays inside the buffer.
-		if maxBlocks == 0 || maxBlocks > size/jh || numBlocks == 0 || numBlocks > maxBlocks ||
-			numBlocks > bl/16-1 || bytesUsed < int64(bl) || uint64(bytesUsed) > p.ring {
+		if maxBlocks == 0 || maxBlocks > size/jh || numBlocks == 0 || numBlocks > maxBlocks {
+			return bad()
+		}
+		// Ours, not the kernel's: the entries must lie inside the list header we
+		// read, and bytes_used must cover it and fit the buffer (the kernel adds
+		// bytes_used to start unchecked, :1442). Past end the list is not part of
+		// the journal, so, like a torn list there (:1245-1254), it just ends the read.
+		if numBlocks > bl/16-1 || bytesUsed < int64(bl) || uint64(bytesUsed) > p.ring {
+			if p.uncharted {
+				stopPast()
+				continue
+			}
 			return bad()
 		}
 		if consumed+uint64(bytesUsed) > p.ring { // the pass would lap the buffer
@@ -323,7 +344,13 @@ func (p *replayer) attempt() ([]replayEntry, attemptResult, error) {
 		if flags&blhdrFirstHeader != 0 { // :1330-1332
 			p.txnStart = blOff
 		}
-		check := flags&blhdrCheckChecksums != 0
+		// :1323-1325: once any list sets BLHDR_CHECK_CHECKSUMS the kernel checks the
+		// blocks of every later list too (check_block_checksums is never cleared,
+		// not even at restart_replay).
+		if flags&blhdrCheckChecksums != 0 {
+			p.checkBlocks = true
+		}
+		check := p.checkBlocks
 		for i := uint64(1); i < numBlocks; i++ { // :1337-1406
 			e := hb[16+16*i:]
 			bnum := int64(bo.Uint64(e[0:8]))
@@ -342,7 +369,8 @@ func (p *replayer) attempt() ([]replayEntry, attemptResult, error) {
 					return nil, attemptAbort, replayErrorf("block %d (%d bytes) outside the volume", bnum, bsize)
 				}
 				if pendingBytes+bsize > p.budget {
-					return nil, attemptAbort, replayErrorf("replayed blocks exceed %d bytes", p.budget)
+					// Our own bound, not the kernel's (see ErrReplayBudget).
+					return nil, attemptAbort, fmt.Errorf("%w (%d bytes)", ErrReplayBudget, p.budget)
 				}
 				boff := off
 				data, ok := p.read(&boff, bsize) // :1362-1367

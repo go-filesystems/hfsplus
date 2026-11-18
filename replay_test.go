@@ -6,15 +6,19 @@ package hfsplus
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
+	"slices"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -470,11 +474,50 @@ func TestOpenFileWithJournalReplay(t *testing.T) {
 	}
 }
 
-// A journal that claims a gigabyte block in a small image is refused, and
-// refused cheaply: under a 64 MiB memory limit (GOMEMLIMIT) it allocates a few
-// KiB, not what the list claims.
+// TestBombReplay re-executes TestBombReplayChild in a child process under
+// GOMEMLIMIT=64MiB and (where the OS enforces it, Linux) an address-space limit
+// of the child's size at start plus 256 MiB, and asserts the child passed rather
+// than skipped. A replayer that believed a 1 GiB block would die there.
 func TestBombReplay(t *testing.T) {
-	defer debug.SetMemoryLimit(debug.SetMemoryLimit(64 << 20))
+	if os.Getenv("HFSPLUS_BOMB_CHILD") == "1" {
+		t.Skip("running as the child")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestBombReplayChild$", "-test.v", "-test.count=1")
+	cmd.Env = append(os.Environ(), "GOMEMLIMIT=64MiB", "HFSPLUS_BOMB_CHILD=1", "HFSPLUS_BOMB_AS_SLACK=268435456")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child failed: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("--- PASS: TestBombReplayChild")) {
+		t.Fatalf("child did not run the bomb test:\n%s", out)
+	}
+	t.Logf("child: %s", firstLinesContaining(out, "address-space"))
+}
+
+func firstLinesContaining(out []byte, sub string) string {
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.Contains(l, sub) {
+			return strings.TrimSpace(l)
+		}
+	}
+	return "(no such line)"
+}
+
+// A journal that claims a gigabyte block in a small image is refused, and
+// refused cheaply: it allocates a few KiB, not what the list claims.
+func TestBombReplayChild(t *testing.T) {
+	if os.Getenv("HFSPLUS_BOMB_CHILD") != "1" {
+		t.Skip("runs only as the child of TestBombReplay")
+	}
+	if os.Getenv("GOMEMLIMIT") != "64MiB" {
+		t.Fatalf("GOMEMLIMIT = %q, want 64MiB", os.Getenv("GOMEMLIMIT"))
+	}
+	slack, _ := strconv.ParseUint(os.Getenv("HFSPLUS_BOMB_AS_SLACK"), 10, 64)
+	t.Logf("address-space limit: %s", limitAddressSpace(t, slack))
 	b := newJB(0x80000, 512, 0x2000)
 	end := b.txn(512, 1, first, blk{10, fill(512, 1)})
 	// Entry 1 claims 1 GiB.
@@ -512,14 +555,16 @@ func TestBombReplay(t *testing.T) {
 	}
 }
 
-// macNonEmptyJournal is the journal (header sector and buffer, 512 KiB) of a
-// Journaled HFS+ image on Darwin 27.2 (arm64), caught with 128 KiB of
-// transactions in it (start 0x4400, end 0x24600) by TestDarwinReplayMatchesKernel
-// while macOS was creating files. It is stored gzipped; the volume it belongs to
-// is not kept, so the test checks that it decodes and replays, not what it writes.
-func macNonEmptyJournal(t testing.TB) ([]byte, journalHeader) {
+// macNonEmptyFixture is a 16 MiB Journaled HFS+ image from Darwin 27.2 (arm64),
+// caught by TestDarwinReplayMatchesKernel while macOS was creating files, with
+// transactions in its journal (start != end) and a catalog that does NOT yet show
+// the files those transactions create. It is stored gzipped, with the listing
+// macOS itself showed after replaying it (macos-nonempty-journal.golden: "name
+// size sha256" per file). It returns the image, the journal bytes (header sector
+// and buffer) and the decoded header.
+func macNonEmptyFixture(t testing.TB) (img, journal []byte, h journalHeader) {
 	t.Helper()
-	f, err := os.Open(filepath.Join("testdata", "macos-nonempty-journal.bin.gz"))
+	f, err := os.Open(filepath.Join("testdata", "macos-nonempty-journal.img.gz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,49 +573,120 @@ func macNonEmptyJournal(t testing.TB) ([]byte, journalHeader) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j, err := io.ReadAll(zr)
+	if img, err = io.ReadAll(zr); err != nil {
+		t.Fatal(err)
+	}
+	vh, err := readVolumeHeader(bytesReaderAt(img))
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := decodeJournalHeader(j[:512])
-	if err != nil {
-		t.Fatalf("macOS-written journal header rejected: %v", err)
+	st, loc, err := loadJournalAt(bytesReaderAt(img), int64(len(img)), vh)
+	if err != nil || st.empty {
+		t.Fatalf("fixture journal: empty=%v, %v", st.empty, err)
 	}
-	return j, h
+	return img, img[loc.off : loc.off+loc.hdr.size], loc.hdr
 }
 
+// fileDigests lists the regular files whose names start with "f" in the root of v
+// as "name size sha256" lines, sorted.
+func fileDigests(t testing.TB, v *Volume) []string {
+	t.Helper()
+	ents, err := v.ListDir("/")
+	if err != nil {
+		t.Fatalf("ListDir: %v", err)
+	}
+	var out []string
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), "f") {
+			continue
+		}
+		b, err := v.ReadFile("/" + e.Name())
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", e.Name(), err)
+		}
+		out = append(out, fmt.Sprintf("%s %d %x", e.Name(), len(b), sha256.Sum256(b)))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// The fixture shows what the replay is for: read as it lies on the medium, the
+// volume lacks the files macOS had created; replayed, it shows exactly the files
+// (names, sizes and bytes) that macOS's own replay showed.
 func TestReplayMacOSWrittenJournal(t *testing.T) {
-	j, h := macNonEmptyJournal(t)
+	img, j, h := macNonEmptyFixture(t)
 	if h.start != 0x4400 || h.end != 0x24600 || h.size != uint64(len(j)) || h.jhdrSize != 512 || h.blhdrSize != 0x2000 {
 		t.Fatalf("fixture header: start %#x end %#x size %#x jhdr %d blhdr %#x", h.start, h.end, h.size, h.jhdrSize, h.blhdrSize)
 	}
-	ov, err := replayJournal(bytesReaderAt(j), 0, h, 16<<20) // the image was 16 MiB
+	golden, err := os.ReadFile(filepath.Join("testdata", "macos-nonempty-journal.golden"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Split(strings.TrimSpace(string(golden)), "\n")
+	if len(want) < 10 {
+		t.Fatalf("golden listing has %d files", len(want))
+	}
+	plain, err := Open(bytesReaderAt(img), int64(len(img)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fileDigests(t, plain); slices.Equal(got, want) {
+		t.Fatal("the fixture shows every file without replay: it proves nothing")
+	} else if len(got) >= len(want) {
+		t.Errorf("without replay %d files, with macOS's replay %d", len(got), len(want))
+	}
+	v, err := Open(bytesReaderAt(img), int64(len(img)), WithJournalReplay())
 	if err != nil {
 		t.Fatalf("a journal macOS wrote was refused: %v", err)
 	}
-	if len(ov.units) == 0 || ov.bytes() > h.size {
-		t.Errorf("overlay holds %d bytes of a %d-byte journal", ov.bytes(), h.size)
+	if got := fileDigests(t, v); !slices.Equal(got, want) {
+		t.Errorf("replayed volume shows %d files, macOS showed %d; first difference: %s", len(got), len(want), firstDiff(got, want))
 	}
-	t.Logf("macOS-written journal: %d units (%d KiB) replayed", len(ov.units), ov.bytes()>>10)
+}
+
+func firstDiff(a, b []string) string {
+	for i := 0; i < max(len(a), len(b)); i++ {
+		var x, y string
+		if i < len(a) {
+			x = a[i]
+		}
+		if i < len(b) {
+			y = b[i]
+		}
+		if x != y {
+			return fmt.Sprintf("#%d replay %q, macOS %q", i, x, y)
+		}
+	}
+	return "none"
 }
 
 func FuzzJournalReplay(f *testing.F) {
 	for _, s := range replaySeeds() {
-		f.Add(s.data, s.start, s.end, s.blhdr, s.sel, s.big)
+		f.Add(s.data, s.start, s.end, s.blhdr, s.sel, s.big, uint8(0))
+		f.Add(s.data, s.start, s.end, s.blhdr, s.sel, s.big, uint8(7))
 	}
-	j, h := macNonEmptyJournal(f)
-	f.Add(j, h.start, h.end, h.blhdrSize, uint8(0), false)
-	f.Fuzz(func(t *testing.T, data []byte, start, end uint64, blhdr uint32, sel uint8, big bool) {
+	_, j, h := macNonEmptyFixture(f)
+	f.Add(j, h.start, h.end, h.blhdrSize, uint8(0), false, uint8(0))
+	// fix: bit 0 re-signs every block list header, bit 1 every block checksum, bit 2
+	// snaps start and end to aligned offsets inside the buffer, after the mutation,
+	// so the fuzzer gets past the checksums to the checks behind them (see
+	// replay_fuzz_test.go). Without it a mutation died at the first list checksum.
+	f.Fuzz(func(t *testing.T, data []byte, start, end uint64, blhdr uint32, sel uint8, big bool, fix uint8) {
 		jh := uint32(512) << (sel % 3)
 		size := uint64(len(data)) / uint64(jh) * uint64(jh)
 		if size < 2*uint64(jh) {
 			return
 		}
+		data = bytes.Clone(data[:size])
 		var bo binary.ByteOrder = binary.LittleEndian
 		if big {
 			bo = binary.BigEndian
 		}
+		if fix&4 != 0 {
+			start, end = snapOffset(start, size, uint64(jh)), snapOffset(end, size, uint64(jh))
+		}
 		h := journalHeader{bo: bo, start: start, end: end, size: size, blhdrSize: blhdr, jhdrSize: jh}
+		resignLists(data, h, fix)
 		vol := size * uint64(1+sel/3%4)
 		ov, err := replayJournal(bytesReaderAt(data[:size]), 0, h, vol)
 		if err != nil {
@@ -663,7 +779,7 @@ func TestWriteReplayCorpus(t *testing.T) {
 		}
 	}
 	for _, s := range replaySeeds() {
-		body := fmt.Sprintf("go test fuzz v1\n[]byte(%s)\nuint64(%d)\nuint64(%d)\nuint32(%d)\nbyte(%d)\nbool(%v)\n",
+		body := fmt.Sprintf("go test fuzz v1\n[]byte(%s)\nuint64(%d)\nuint64(%d)\nuint32(%d)\nbyte(%d)\nbool(%v)\nbyte(0)\n",
 			strconv.Quote(string(s.data)), s.start, s.end, s.blhdr, s.sel, s.big)
 		path := filepath.Join(dir, s.name)
 		if regen {
@@ -677,6 +793,80 @@ func TestWriteReplayCorpus(t *testing.T) {
 			t.Errorf("%s: corpus file is missing or stale (run with HFSPLUS_REGEN_CORPUS=1): %v", path, err)
 		}
 	}
+}
+
+// Kernel details (hfs-715.100.10) the review found the first version had wrong.
+func TestReplayKernelDetails(t *testing.T) {
+	t.Run("check_block_checksums stays set once a list sets it (:1323-1325)", func(t *testing.T) {
+		b := newJB(tSize, 512, 512)
+		n := b.txn(512, 1, first, blk{10, fill(512, 1)})
+		m := b.txn(n, 2, blhdrFirstHeader, blk{11, fill(512, 2)}) // this list does not ask for checks
+		end := m
+		b.buf[n+512+7] ^= 0xff // tear its block
+		ov, err := b.replay(512, end, tVolume)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The kernel still checks the torn block, drops list 2 and keeps list 1.
+		wantBlocks(t, ov, map[int64]byte{10: 1})
+	})
+	t.Run("a list that never asks for checks is not checked", func(t *testing.T) {
+		b := newJB(tSize, 512, 512)
+		end := b.txn(512, 1, blhdrFirstHeader, blk{10, fill(512, 1)})
+		b.buf[512+512+7] ^= 0xff
+		ov, err := b.replay(512, end, tVolume)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ov.units) != 1 {
+			t.Errorf("overlay holds %d units, want the unchecked block", len(ov.units))
+		}
+	})
+	t.Run("a bad bytes_used past end just stops the read", func(t *testing.T) {
+		for _, used := range []uint32{0, 100, 0xffffff00, tSize} {
+			b := newJB(tSize, 512, 512)
+			n := b.txn(512, 1, first, blk{10, fill(512, 1)})
+			b.txn(n, 2, first, blk{11, fill(512, 2)})
+			b.bo.PutUint32(b.buf[n+4:], used)
+			b.bo.PutUint32(b.buf[n+8:], 0)
+			b.bo.PutUint32(b.buf[n+8:], journalChecksum(b.buf[n:n+blhdrChecksumSize]))
+			ov, err := b.replay(512, n, tVolume)
+			if err != nil {
+				t.Fatalf("bytes_used %#x: %v", used, err)
+			}
+			wantBlocks(t, ov, map[int64]byte{10: 1})
+		}
+	})
+	t.Run("a bad bytes_used inside the range is refused or drops the transaction", func(t *testing.T) {
+		b := newJB(tSize, 512, 512)
+		n := b.txn(512, 1, first, blk{10, fill(512, 1)})
+		end := b.txn(n, 2, first, blk{11, fill(512, 2)})
+		b.bo.PutUint32(b.buf[n+4:], 100)
+		b.bo.PutUint32(b.buf[n+8:], 0)
+		b.bo.PutUint32(b.buf[n+8:], journalChecksum(b.buf[n:n+blhdrChecksumSize]))
+		ov, err := b.replay(512, end, tVolume)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBlocks(t, ov, map[int64]byte{})
+	})
+	t.Run("blocks beyond the replay budget are refused by name", func(t *testing.T) {
+		// Three entries of 32 KiB each in a list whose bytes_used says one header:
+		// the kernel would read them one by one; the data held would be 96 KiB in
+		// a 63.5 KiB buffer, and bytes_used is not cross-checked against bsize.
+		b := newJB(4*tSize, 512, 1024)
+		blks := []blk{{0, fill(512, 1)}, {64, fill(512, 1)}, {128, fill(512, 1)}}
+		b.txn(512, 1, blhdrFirstHeader, blks...)
+		for i := uint64(1); i <= 3; i++ {
+			b.bo.PutUint32(b.buf[512+16+16*i+8:], 32768)
+		}
+		b.bo.PutUint32(b.buf[512+4:], 1024)
+		b.bo.PutUint32(b.buf[512+8:], 0)
+		b.bo.PutUint32(b.buf[512+8:], journalChecksum(b.buf[512:512+blhdrChecksumSize]))
+		if _, err := b.replay(512, 1536, tVolume); !errors.Is(err, ErrReplayBudget) || !errors.Is(err, ErrJournalReplay) {
+			t.Fatalf("err = %v, want ErrReplayBudget (wrapping ErrJournalReplay)", err)
+		}
+	})
 }
 
 // BenchmarkReplayThroughput replays a journal of 4 KiB-block lists (blhdr_size

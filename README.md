@@ -203,10 +203,14 @@ serves such a volume as macOS would see it after replaying the journal: the jour
 replayed in memory, over the image, and read from there. The image is not written and the volume
 stays read-only; the size must be known (not -1). It is a port of Apple's `replay_journal`
 (`hfs-715.100.10`, `core/hfs_journal.c`), so a transaction is read past the header's `end` while
-sequence numbers continue, a torn block or block list drops its transaction, and wraparound is
-handled. Every size taken from the journal is bounded (the overlay never exceeds the journal's size,
-256 MiB at most); a journal it refuses fails `Open` with `ErrJournalReplay` (which wraps
-`ErrJournaled`). `OpenWritable` and its variants still refuse such a volume with `ErrJournaled`.
+sequence numbers continue, a torn block drops its transaction, and wraparound is handled. A bad
+block list header inside the journal's `start`..`end` range drops that transaction AND the one
+before it (the kernel restarts at the start of the last list that began a transaction); past `end`
+a bad list just ends the read. Every size taken from the journal is bounded. The bound on the
+replayed block data, `min(journal size, 256 MiB)`, is this driver's own resource limit, not
+Apple's (the kernel streams blocks to the device): past it `Open` fails with `ErrReplayBudget`. A
+journal the replayer refuses fails `Open` with `ErrJournalReplay` (which wraps `ErrJournaled`;
+`ErrReplayBudget` wraps `ErrJournalReplay`). `OpenWritable` and its variants still refuse such a volume with `ErrJournaled`.
 Without the option, `Open` reads the blocks as they are on the medium, without the transactions.
 Design: `docs/design/journal-write.md`, section 4; hfsplus#45.
 
@@ -233,6 +237,7 @@ Design: `docs/design/journal-write.md`, section 4; hfsplus#45.
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
+| `ErrReplayBudget` | `Open(..., WithJournalReplay())` where the blocks to replay exceed this driver's own bound, `min(journal size, 256 MiB)`; wraps `ErrJournalReplay` |
 | `ErrJournalReplay` | `Open(..., WithJournalReplay())` on a journal the replayer cannot replay (the kernel would abandon it, or a size in it is outside the bounds); wraps `ErrJournaled` |
 | `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending, or unreadable / off-volume / other-device / bad checksum / a header field outside Apple's `journal_open` ranges since v0.12.3; three older checks stay stricter than Apple's, see hfsplus#48); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written |
 
