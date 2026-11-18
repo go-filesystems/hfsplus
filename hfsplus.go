@@ -115,13 +115,35 @@ var _ filesystem.Filesystem = (*Volume)(nil)
 
 // Open parses an HFS+ volume from rs. The caller retains ownership of rs unless
 // it implements io.Closer (then Close releases it). Pass size = -1 if unknown.
-func Open(rs io.ReaderAt, size int64) (*Volume, error) {
+//
+// WithJournalReplay serves a journaled volume whose journal holds transactions
+// as macOS would see it after replaying them, read-only and without writing
+// anything to rs.
+func Open(rs io.ReaderAt, size int64, opts ...OpenOption) (*Volume, error) {
+	var cfg openConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	vh, err := readVolumeHeader(rs)
 	if err != nil {
 		return nil, err
 	}
+	orig := rs
+	if cfg.replayJournal {
+		view, replayed, err := replayedView(rs, size, vh)
+		if err != nil {
+			return nil, err
+		}
+		if replayed {
+			// The replayed blocks include the volume header.
+			if vh, err = readVolumeHeader(view); err != nil {
+				return nil, err
+			}
+			rs = view
+		}
+	}
 	v := &Volume{rs: rs, size: size, vh: vh}
-	if c, ok := rs.(io.Closer); ok {
+	if c, ok := orig.(io.Closer); ok {
 		v.closer = c
 	}
 	if err := v.openTrees(); err != nil {
@@ -129,6 +151,18 @@ func Open(rs io.ReaderAt, size int64) (*Volume, error) {
 	}
 	return v, nil
 }
+
+// OpenOption configures Open and OpenFile.
+type OpenOption func(*openConfig)
+
+type openConfig struct{ replayJournal bool }
+
+// WithJournalReplay makes Open replay a non-empty journal in memory (see
+// replay.go). The volume stays read-only and the backing store is not written;
+// OpenWritable and its variants still return ErrJournaled for such a volume.
+// The size passed to Open must be known (not -1). A journal the replayer
+// refuses makes Open fail with ErrJournalReplay.
+func WithJournalReplay() OpenOption { return func(c *openConfig) { c.replayJournal = true } }
 
 // openTrees (re)builds the extents-overflow and catalog B-trees from the
 // current volume header. The extents tree is opened first (from its inline
@@ -176,7 +210,7 @@ func extentsForkNeedsOverflow(fd forkData) bool {
 }
 
 // OpenFile opens the image at path read-only.
-func OpenFile(path string) (*Volume, error) {
+func OpenFile(path string, opts ...OpenOption) (*Volume, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("hfsplus: open %s: %w", path, err)
@@ -186,7 +220,7 @@ func OpenFile(path string) (*Volume, error) {
 		f.Close()
 		return nil, fmt.Errorf("hfsplus: stat %s: %w", path, err)
 	}
-	v, err := Open(f, st.Size())
+	v, err := Open(f, st.Size(), opts...)
 	if err != nil {
 		f.Close()
 		return nil, err
