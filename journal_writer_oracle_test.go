@@ -31,7 +31,11 @@ type jwOp func(v *Volume) error
 type jwScenario struct {
 	name string
 	img  []byte // base image: a journaled volume with an empty journal
-	ops  []jwOp
+	// jbase is where the journal lies; direct allows direct-path commits (mid-commit
+	// images with the journaled bit cleared are then only checked for an empty journal).
+	jbase  int64
+	direct bool
+	ops    []jwOp
 	// points selects the crash points to check (nil: every event prefix).
 	points func(starts, ends []int, ev []crashEvent, jw []jwRange) map[int]bool
 }
@@ -105,10 +109,20 @@ func jwBaseline(t testing.TB, img []byte) consistency {
 
 // jwCheckImage returns "" when img, as a crash image, replays to the volume after
 // j commits for some j in [lo, hi]; otherwise what is wrong.
-func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency) string {
+func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency, jbase int64, direct bool) string {
 	vh, err := readVolumeHeader(bytesReaderAt(img))
 	if err != nil {
 		return "volume header: " + err.Error()
+	}
+	if direct && vh.Attributes&kHFSVolumeJournaledBit == 0 {
+		// Mid-commit on the direct path: the journaled bit is cleared for the span of
+		// the commit, so macOS treats the volume as not journaled and checks it. What
+		// must hold: the journal is empty, or its transactions would be lost.
+		h, err := decodeJournalHeader(img[jbase : jbase+512])
+		if err != nil || h.start != h.end {
+			return fmt.Sprintf("direct-path commit under way with a journal that is not empty: %+v, %v", h, err)
+		}
+		return ""
 	}
 	st, _, err := loadJournalAt(bytesReaderAt(img), int64(len(img)), vh)
 	if err != nil {
@@ -311,7 +325,7 @@ func checkJWScenario(t *testing.T, s jwScenario) {
 	n, bad := 0, []string{}
 	jwCrashImages(s.img, sev, sstarts, sends, points, func(name string, img []byte, lo, hi int) {
 		n++
-		if msg := jwCheckImage(img, lo, hi, states, base); msg != "" {
+		if msg := jwCheckImage(img, lo, hi, states, base, s.jbase, s.direct); msg != "" {
 			bad = append(bad, name+": "+msg)
 		}
 	})
@@ -420,4 +434,20 @@ func TestJournalWriterCrashOracleStaleRing(t *testing.T) {
 	img, jbase := journalImage(t, size, 5000, 0x1000)
 	poisonRing(img, jbase, size, 5001)
 	checkJWScenario(t, jwScenario{name: "stale-ring", img: img, ops: mkdirOps(3)})
+}
+
+// The fallback path entered right after a journal is emptied, and the journal
+// restarted after it (design section 7, "UNVERIFIED: that it stays correct when it
+// is entered right after a journal is emptied, and when it writes 'GoHF'"): journal
+// commits, a commit with file data, then journal commits again.
+func TestJournalWriterCrashOracleFallback(t *testing.T) {
+	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
+	ops := []jwOp{
+		func(v *Volume) error { return v.MkDir("/d000", 0o755) },
+		func(v *Volume) error { return v.MkDir("/d001", 0o755) },
+		func(v *Volume) error { return v.WriteFile("/d002", fill(5000, 9), 0o644) },
+		func(v *Volume) error { return v.MkDir("/d003", 0o755) },
+		func(v *Volume) error { return v.MkDir("/d004", 0o755) },
+	}
+	checkJWScenario(t, jwScenario{name: "fallback", img: img, jbase: jbase, direct: true, ops: ops})
 }
