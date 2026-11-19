@@ -83,6 +83,14 @@ func (v *Volume) SetDurability(d Durability) error {
 			return err
 		}
 	}
+	if v.journaling() && d != DurabilityStrict {
+		// Journal writes only apply at Strict: leave the journal empty before a level
+		// that writes in place.
+		if err := v.emptyJournal(); err != nil {
+			v.failed = err
+			return err
+		}
+	}
 	v.durability = d
 	return nil
 }

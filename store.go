@@ -329,6 +329,25 @@ func (v *Volume) flush() error {
 	if !anyChange && !v.dataDirty {
 		return nil
 	}
+	if v.jw != nil {
+		// Journal writes are on (EnableJournalWrites). A metadata-only commit at
+		// Strict is a journal transaction; everything else writes directly, which
+		// first empties the journal: a direct write with transactions pending would
+		// be overwritten by their replay.
+		if v.durability == DurabilityStrict && !v.dataDirty {
+			done, err := v.flushJournal(meta)
+			if err != nil {
+				return err
+			}
+			if done {
+				v.commitDone()
+				return nil
+			}
+		}
+		if err := v.emptyJournal(); err != nil {
+			return err
+		}
+	}
 	if err := v.stampLastMountedVersion(&hdrP, &hdrA); err != nil {
 		return err
 	}
