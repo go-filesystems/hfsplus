@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 )
 
@@ -39,6 +40,10 @@ import (
 // then T_k's blocks in place. H_k never names T_k: replay reaches it by reading
 // past end (hfs_journal.c:1211-1300), the way macOS reaches the transaction its
 // last F_FULLFSYNC wrote.
+//
+// The first journaled commit of a session starts with scrubRing (hfsplus#58): it
+// zeroes any sector of the ring that verifies as a block list header, then one
+// barrier if it zeroed any, before T_1 is written; a ring with none costs a read.
 //
 // The block list header is one sector (blhdr_size = jhdr_size, set in H_1: a
 // header that fits one sector cannot be torn between sectors, design section 4),
@@ -85,6 +90,9 @@ type journalWriter struct {
 	lastSeq uint32
 	// enc is the byte order of the journal header.
 	enc binary.ByteOrder
+	// scrubbed: this session's ring scrub has run (scrubRing); it runs once, before
+	// the first journaled commit writes anything.
+	scrubbed bool
 }
 
 // EnableJournalWrites opts the volume in to journal writes (see the comment at
@@ -313,6 +321,60 @@ func forgedSector(runs []writeRun) bool {
 	return false
 }
 
+// scrubChunk is how much of the ring scrubRing reads at a time: the scan's whole
+// memory, whatever the journal's size (at most 1 GiB, loadJournalAt).
+const scrubChunk = 64 << 10
+
+// scrubRing closes the gap #56/#57 left (design section 11, risk 5; hfsplus#58):
+// forgedSector keeps new forged block list headers out of the ring, but a sector
+// written by v0.15.0 before the guard, or by another implementation, may be there,
+// and a clean unmount leaves the ring's stale sectors in place. A later
+// transaction that ends right before one makes replay follow it past end.
+//
+// It reads the ring [jhdr_size, size) once, in scrubChunk pieces, and overwrites
+// with zeroes every jhdr_size sector that verifiesAsBlockListHeader accepts (either
+// byte order). When it zeroed anything, one barrier makes the zeroes durable before
+// it returns, so before T_1 or any later write to the ring is issued: otherwise a
+// zero write and a T_1 write to the same sector, in the same group, could land in
+// either order and leave T_1 with a zeroed sector. It writes and syncs nothing when
+// the ring holds no such sector.
+//
+// Why it is crash-safe: it runs on an empty journal (start = end), which replay
+// does not read, and the zeroed sectors are stale (no live transaction exists to
+// own them), so every crash image, whichever zero writes reached the medium,
+// replays to the volume as it was. A sector torn by the crash may still verify (the
+// predicate reads bytes 0-31 only, so a tear that keeps them keeps the verdict);
+// that is harmless, because the next session rescans the ring and zeroes it again.
+func (jw *journalWriter) scrubRing(v *Volume) error {
+	size, jh := jw.loc.hdr.size, uint64(jw.loc.hdr.jhdrSize)
+	buf := make([]byte, min(scrubChunk, size-jh))
+	zero := make([]byte, jh)
+	zeroed := 0
+	for off := jh; off < size; {
+		n := min(uint64(len(buf)), size-off)
+		if got, err := v.readUnder(buf[:n], int64(jw.loc.off+off)); uint64(got) < n {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return fmt.Errorf("hfsplus: scrubbing the journal ring at %d: %w", off, err)
+		}
+		for o := uint64(0); o+jh <= n; o += jh {
+			if !verifiesAsBlockListHeader(buf[o : o+jh]) {
+				continue
+			}
+			if err := v.putAt(zero, int64(jw.loc.off+off+o)); err != nil {
+				return err
+			}
+			zeroed++
+		}
+		off += n
+	}
+	if zeroed == 0 {
+		return nil
+	}
+	return v.fsync()
+}
+
 // flushJournal is flush's journal path for a metadata-only commit at
 // DurabilityStrict. It returns done = false, having written nothing, when the
 // commit has to take the direct path (more than 30 runs, or it does not fit).
@@ -381,6 +443,14 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 		at = jw.end
 	}
 	v.touched = true
+	if first && !jw.scrubbed {
+		// The journal is empty here (checked above), so nothing replays while the
+		// scrub runs and a crash anywhere inside it leaves a volume that opens as it was.
+		if err := jw.scrubRing(v); err != nil {
+			return false, err
+		}
+		jw.scrubbed = true
+	}
 	txn := encodeTxn(jw.enc, seq, runs)
 	if err := jw.ringWrite(v, at, txn); err != nil {
 		return false, err
