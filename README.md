@@ -270,6 +270,10 @@ than `F_FULLFSYNC`; this driver does not offer it and this PR does not change th
 
 **What falls back** to today's direct path, after emptying the journal (2 barriers) if a
 transaction is live: a commit that writes **file data** (user data is not journaled yet), a commit
+that carries a sector which verifies as a block list header (v0.15.1, hfsplus#56: replay follows such a
+sector past the journal's end, and catalog nodes hold file names a user chooses; every 512-byte sector of
+every journaled block is checked, in both byte orders, before the transaction is written, and the writer
+never emits sequence number 0), a commit
 that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit the journal (three transactions
 must fit, TN1150 leaves one sector free), and every durability level but Strict (`SetDurability`
 empties the journal first). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the

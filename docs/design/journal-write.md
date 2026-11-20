@@ -546,6 +546,11 @@ With one barrier, a crash in group k can still replay `T_k` (whole, past
 `end`) while the data blocks it points at did not land. Three rules keep the
 guarantee.
 
+**Every journaled sector passes the forged-header guard first** (section 11,
+risk 5, resolved for metadata by hfsplus#56): file data a user controls
+can hold a sector that verifies as a block list header, so a data block
+with such a sector is not journaled and takes the large-data path below.
+
 **Small data is journaled.** A commit's new data blocks, up to a bound, go into
 `T_k` as ordinary blocks. The proposed bound is the smaller of 1 MiB and
 `(size - jhdr_size) / 8`. That keeps three consecutive transactions under the
@@ -859,10 +864,30 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
    replay would write those sectors. macOS does not journal file data, so it
    has no such exposure.
 
-   This must be designed out before PR 4. Candidates: journal only data
-   blocks that cannot hold a plausible block list header (reject a block
-   whose first 32 bytes verify as one), or keep file data out of the journal
-   and pay the large-data path's 2 barriers. Open, not accepted.
+   **Resolved for metadata (hfsplus#56, v0.15.1), by a guard PR 4 extends to
+   journaled data.** The risk was already live in v0.15.0: the ring holds
+   catalog nodes, which carry file names a user chooses. `flushJournal` now
+   checks every `jhdr_size`-aligned sector of every journaled block (not
+   its own block list header): the checksum field (bytes 8..12) zeroed,
+   `calc_checksum` over the first 32 bytes (`blhdrSum`, the replayer's own
+   code), compared with the stored field read big- and little-endian, since
+   whoever plants the bytes does not know the journal's order. A sector that
+   verifies sends the commit down the direct path (`forgedSector`). A random
+   sector verifies with probability 2^-32, so legitimate commits almost
+   never fall back; an attacker only slows their own. The writer also
+   never emits `sequence_num` 0 (`skipZeroSeq`): Apple never rejects it on
+   sequence (`hfs_journal.c:1268-1271`), though a 0 right at `end` is
+   refused (`:1289-1298`), so the forged list is reachable only behind a
+   transaction that ends on it, as the proof test builds it. PR 4 applies
+   the same check to every sector of journaled data; a sector that verifies
+   goes through the ordered large-data path instead. Not covered: forged
+   sectors already in a ring macOS wrote (macOS journals catalog nodes too).
+   Tests: `TestForgedHeaderPastEndIsFollowed` (the proof, without the
+   guard), `TestJournalWriterForgedSectorFallsBack`,
+   `TestJournalWriterCrashOracleForgedSector`, `FuzzGuardAgreesWithReplayer`.
+   The node bytes are built directly in the tests: a name placed on a sector
+   boundary of a node is not shown to be reachable through the public API
+   (UTF-16 names, ordered by the catalog).
 6. **`jhdr_size` ≠ 512 (4Kn).** Blocks widen to 4 KiB, and write amplification
    grows. The tests need a 4Kn image; whether `hdiutil` supports one is
    **UNVERIFIED**.
