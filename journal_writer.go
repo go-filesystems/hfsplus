@@ -22,8 +22,9 @@ import (
 //     sectors, the two volume headers), at DurabilityStrict, whose changed
 //     sectors make at most 30 runs and whose transaction fits (invariant D);
 //   - direct path: a commit that carries file data (user data is not journaled
-//     in this PR: design section 11, risk 5); a commit with more than 30 runs or
-//     one that does not fit the journal; every durability level but Strict; and a
+//     in this PR: design section 11, risk 5); a commit with a sector that
+//     verifies as a block list header (forgedSector); a commit with more than 30
+//     runs or one that does not fit the journal; every durability level but Strict; and a
 //     volume for which EnableJournalWrites refused (not journaled, journal not
 //     inside the volume or never initialised, jhdr_size other than 512, or any
 //     check of section 4 failing).
@@ -282,6 +283,31 @@ func (v *Volume) journalHeaderRuns(off int64) ([]writeRun, error) {
 	return changedRuns(&region{off: off, buf: b, orig: v.regions[off].orig}), nil
 }
 
+// skipZeroSeq is the writer's only way to a sequence number: 0 is the number of a
+// journal from before sequence numbers existed, which replay_journal never
+// rejects on sequence (hfs_journal.c:1268-1271), so a wrap skips it.
+func skipZeroSeq(seq uint32) uint32 {
+	if seq == 0 {
+		return 1
+	}
+	return seq
+}
+
+// forgedSector reports whether any jhdr_size-aligned sector of any block of runs
+// verifies as a block list header (verifiesAsBlockListHeader). runs are whole
+// sectors (checked by the caller). The transaction's own block list header is not
+// among them. Cost: one 32-byte checksum per journaled sector, no allocation.
+func forgedSector(runs []writeRun) bool {
+	for _, r := range runs {
+		for o := 0; o+jwBlockSize <= len(r.data); o += jwBlockSize {
+			if verifiesAsBlockListHeader(r.data[o : o+jwBlockSize]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // flushJournal is flush's journal path for a metadata-only commit at
 // DurabilityStrict. It returns done = false, having written nothing, when the
 // commit has to take the direct path (more than 30 runs, or it does not fit).
@@ -306,6 +332,13 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 		if r.off%jwBlockSize != 0 || len(r.data)%jwBlockSize != 0 {
 			return false, nil
 		}
+	}
+	// Risk 5 (design section 11; hfsplus#56): replay follows, past end, any sector
+	// that verifies as a block list header, and the blocks of this transaction are
+	// bytes a user chose (file names in catalog nodes). A transaction that carries
+	// such a sector takes the direct path, so a forged list never reaches the ring.
+	if forgedSector(runs) {
+		return false, nil
 	}
 	hdr := jw.loc.hdr
 	size, jh := hdr.size, uint64(hdr.jhdrSize)
@@ -336,16 +369,10 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 		if h.start != h.end {
 			return false, fmt.Errorf("%w: the journal holds transactions the writer did not write (start %d, end %d)", ErrJournaled, h.start, h.end)
 		}
-		seq = h.sequenceNum + uint32(size/jh) + 1 // hfs_journal.c:2097-2099
-		if seq == 0 {
-			seq = 1
-		}
+		seq = skipZeroSeq(h.sequenceNum + uint32(size/jh) + 1) // hfs_journal.c:2097-2099
 		at = jw.wrap(h.end)
 	} else {
-		seq = jw.lastSeq + 1
-		if seq == 0 {
-			seq = 1
-		}
+		seq = skipZeroSeq(jw.lastSeq + 1)
 		at = jw.end
 	}
 	v.touched = true
