@@ -135,6 +135,11 @@ func (v *Volume) EnableJournalWrites() error {
 		return fmt.Errorf("%w: journal size %d", ErrJournalWritesUnavailable, h.size)
 	case h.blhdrSize == 0 || h.blhdrSize%h.jhdrSize != 0:
 		return fmt.Errorf("%w: blhdr_size %d", ErrJournalWritesUnavailable, h.blhdrSize)
+	case h.start%uint64(h.jhdrSize) != 0 || h.end%uint64(h.jhdrSize) != 0:
+		// The writer puts T_1 at end and every block on the sector grid forgedSector
+		// checks. loadJournalAt already refuses this for jhdr_size 512, the only size
+		// accepted above; the check stays here because the writer's placement rests on it.
+		return fmt.Errorf("%w: start %d or end %d is not a multiple of jhdr_size", ErrJournalWritesUnavailable, h.start, h.end)
 	case loc.off%uint64(h.jhdrSize) != 0:
 		return fmt.Errorf("%w: the journal is at %d, not sector-aligned", ErrJournalWritesUnavailable, loc.off)
 	}

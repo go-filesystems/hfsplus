@@ -874,7 +874,10 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
    whoever plants the bytes does not know the journal's order. A sector that
    verifies sends the commit down the direct path (`forgedSector`). A random
    sector verifies with probability 2^-32, so legitimate commits almost
-   never fall back; an attacker only slows their own. The writer also
+   never fall back by chance. A planted sector is a cost, not a lock-out:
+every commit that touches the poisoned catalog node falls back to the
+direct path, whoever makes it, for as long as the sector stays in the
+node. The writer also
    never emits `sequence_num` 0 (`skipZeroSeq`): Apple never rejects it on
    sequence (`hfs_journal.c:1268-1271`), though a 0 right at `end` is
    refused (`:1289-1298`), so the forged list is reachable only behind a
@@ -882,6 +885,11 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
    the same check to every sector of journaled data; a sector that verifies
    goes through the ordered large-data path instead. Not covered: forged
    sectors already in a ring macOS wrote (macOS journals catalog nodes too).
+   **Unproven:** (a) rings that v0.15.0 wrote before the guard, which may
+   already hold such a sector (nothing scans for one); (b) whether the
+   kernel's replay or `fsck_hfs` follows the forged list. The proof test
+   covers this driver's replayer only, which is a port of `replay_journal`,
+   not the kernel's code run.
    Tests: `TestForgedHeaderPastEndIsFollowed` (the proof, without the
    guard), `TestJournalWriterForgedSectorFallsBack`,
    `TestJournalWriterCrashOracleForgedSector`, `FuzzGuardAgreesWithReplayer`.
