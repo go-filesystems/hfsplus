@@ -41,6 +41,8 @@ type jwScenario struct {
 	// inside it replays to the last state. tailSyncs, when not 0, is its barrier count.
 	tail      jwOp
 	tailSyncs int
+	// reverse: a medium that lands each barrier group in reverse order (jwCrashImagesOrder).
+	reverse bool
 	// points selects the crash points to check (nil: every event prefix).
 	points func(starts, ends []int, ev []crashEvent, jw []jwRange) map[int]bool
 }
@@ -204,6 +206,15 @@ func splitSectors(ev []crashEvent, starts, ends []int) ([]crashEvent, []int, []i
 // from a fixed seed), and each sector write of the group torn (its first half
 // reaches the medium).
 func jwCrashImages(orig []byte, ev []crashEvent, starts, ends []int, points map[int]bool, visit func(name string, img []byte, lo, hi int)) {
+	jwCrashImagesOrder(orig, ev, starts, ends, points, false, visit)
+}
+
+// jwCrashImagesOrder is jwCrashImages; reverse makes a medium that lands the writes
+// of one barrier group in the reverse of the order they were issued, both when the
+// group is made durable by its barrier and when a crash cuts it open. Two writes to
+// the same sector in one group then end in the older one: the order a barrier is
+// there to fix.
+func jwCrashImagesOrder(orig []byte, ev []crashEvent, starts, ends []int, points map[int]bool, reverse bool, visit func(name string, img []byte, lo, hi int)) {
 	rng := rand.New(rand.NewSource(1))
 	dur, cur := bytes.Clone(orig), bytes.Clone(orig)
 	durIdx := 0
@@ -212,7 +223,12 @@ func jwCrashImages(orig []byte, ev []crashEvent, starts, ends []int, points map[
 		if p > 0 {
 			e := ev[p-1]
 			if e.sync {
-				for _, w := range ev[durIdx : p-1] {
+				grp := ev[durIdx : p-1]
+				for i := range grp {
+					w := grp[i]
+					if reverse {
+						w = grp[len(grp)-1-i]
+					}
 					if !w.sync {
 						apply(dur, w)
 					}
@@ -248,7 +264,12 @@ func jwCrashImages(orig []byte, ev []crashEvent, starts, ends []int, points map[
 		}
 		with := func(keep func(i int) bool, torn int) []byte {
 			img := bytes.Clone(dur)
-			for i, w := range group {
+			for gi := range group {
+				i := gi
+				if reverse {
+					i = len(group) - 1 - gi
+				}
+				w := group[i]
 				switch {
 				case i == torn:
 					copy(img[w.off:], w.data[:len(w.data)/2])
@@ -344,7 +365,7 @@ func checkJWScenario(t *testing.T, s jwScenario) {
 		points = s.points(sstarts, sends, sev, ranges)
 	}
 	n, bad := 0, []string{}
-	jwCrashImages(s.img, sev, sstarts, sends, points, func(name string, img []byte, lo, hi int) {
+	jwCrashImagesOrder(s.img, sev, sstarts, sends, points, s.reverse, func(name string, img []byte, lo, hi int) {
 		n++
 		if msg := jwCheckImage(img, lo, hi, states, base, s.jbase, s.direct); msg != "" {
 			bad = append(bad, name+": "+msg)
