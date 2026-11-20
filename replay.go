@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -54,6 +55,30 @@ var ErrJournalReplay = fmt.Errorf("%w: journal cannot be replayed", ErrJournaled
 // bound (it streams blocks to the device); it protects the memory of a process
 // that replays an untrusted journal into an overlay. It wraps ErrJournalReplay.
 var ErrReplayBudget = fmt.Errorf("%w: replayed blocks exceed the replay memory budget", ErrJournalReplay)
+
+// blhdrSum is calc_checksum of a block list header as replay_journal computes it
+// (hfs_journal.c:1225-1235): the checksum field, bytes 8..12, zeroed, over the
+// first BLHDR_CHECKSUM_SIZE bytes. hb is not modified. It is the one
+// implementation: the replayer compares it with the stored field, and the writer's
+// guard (verifiesAsBlockListHeader) with the stored field in both byte orders.
+func blhdrSum(hb []byte) uint32 {
+	var f [blhdrChecksumSize]byte
+	copy(f[:], hb)
+	clear(f[8:12])
+	return journalChecksum(f[:])
+}
+
+// verifiesAsBlockListHeader reports whether a sector would pass the replayer's
+// checksum test as a block list header in either byte order of the journal (the
+// order is the journal's, unknown to whoever planted the bytes). Past end, replay
+// follows such a sector (design section 11, risk 5).
+func verifiesAsBlockListHeader(sector []byte) bool {
+	if len(sector) < blhdrChecksumSize { // also keeps sector[8:12] in range
+		return false
+	}
+	sum := blhdrSum(sector)
+	return binary.BigEndian.Uint32(sector[8:12]) == sum || binary.LittleEndian.Uint32(sector[8:12]) == sum
+}
 
 func replayErrorf(format string, a ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrJournalReplay}, a...)...)
@@ -283,8 +308,8 @@ func (p *replayer) attempt() ([]replayEntry, attemptResult, error) {
 		}
 		bo := h.bo
 		orig := bo.Uint32(hb[8:12]) // :1225-1235
-		clear(hb[8:12])
-		if journalChecksum(hb[:blhdrChecksumSize]) != orig {
+		checksum := blhdrSum(hb)
+		if checksum != orig {
 			if p.checkPast && p.uncharted { // :1245-1254: a torn list past end
 				p.checkPast = false
 				p.end = blOff
