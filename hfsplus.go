@@ -81,6 +81,8 @@ type Volume struct {
 	failed error
 	// closed: Close was called; mutations return ErrClosed.
 	closed bool
+	// jw is the journal writer, nil unless EnableJournalWrites succeeded.
+	jw *journalWriter
 	// altOff is the offset of the alternate volume header (see enableWrites).
 	altOff int64
 	// touched: the flush in progress has begun writing (a failure now leaves the
@@ -454,6 +456,13 @@ func (v *Volume) CaseSensitive() bool {
 // closed (it is the caller's).
 func (v *Volume) Close() error {
 	var serr error
+	if v.wr && !v.closed && v.failed == nil && v.journaling() {
+		// Journal writes: empty the journal and put the clean mark back.
+		if err := v.closeJournal(); err != nil {
+			v.failed = err
+			serr = err
+		}
+	}
 	if v.wr && !v.closed && (v.held || v.unsynced || v.failed != nil) {
 		// DurabilityMounted / DurabilityLazy: make the writes durable and put the
 		// clean marks back. A failed volume, at any level (a strict commit that

@@ -244,7 +244,40 @@ because discarding transactions is a loss of data the caller did not ask for. Mo
 volume on macOS to have the journal reset. Read-only `Open` WITHOUT `WithJournalReplay` shows the
 blocks in place; `WithJournalReplay` shows the journal's view, which macOS would discard, not
 what macOS will show. Also still refused: every journal `checkJournalAt` cannot verify.
-The driver still does not write transactions: the write path bypasses the journal.
+By default the driver does not write transactions: the write path bypasses the journal.
+
+### Writing through the journal: `EnableJournalWrites` (opt-in, PR 3 of hfsplus#45)
+
+`v.EnableJournalWrites()` on a writable volume opts in. Off by default; without it, and on every
+non-journaled volume, behaviour is unchanged. When on, a **metadata-only commit at
+`DurabilityStrict`** on a journaled volume is written as a journal transaction instead of in place
+first: **2 barriers on a session's first commit, 1 on every later one** (3 today). The first commit
+also switches `lastMountedVersion` from `GoHF` to `HFSJ`, in the same commit, and clears the unmounted
+bit as macOS does at mount; `Close` empties the journal and puts the clean mark back (3 barriers,
+once). A crash leaves a journal macOS replays to the volume after the last commit that returned, or
+the one in flight, whole (checked against macOS's own replay, and `fsck_hfs` after the mount; a crash inside `Close` is covered too). An **offline `fsck_hfs -fn` taken in the middle of a commit
+cannot verify the image until macOS has mounted it**: on 407 of the 820 crash images measured it exits 8
+("could not be verified completely"), always inside a commit's still-open group, and macOS mounts every one of
+them and `fsck_hfs -fn` then exits 0. The volume is not inconsistent; why fsck's journal stage gives up
+(`fsck_journal.c:517-624`) is not established.
+
+**Cost.** Each barrier is `F_FULLFSYNC`. In one indicative run (load 4-5, 5-minute average 8.6) a steady-state
+metadata commit (1 barrier) took 4.2 ms, the first commit of a session (2 barriers) 8.7 ms, against 12.8 ms for
+today's strict path (3 barriers) and 8.6 / 10.3 ms for macOS's own create / mkdir on Journaled HFS+.
+The design's 2.5-3 ms estimate is not met. A hypothesis, **not measured**: the kernel's journal barrier is
+`DKIOCSYNCHRONIZE` with the barrier option (`hfs_journal.c:469-482`), roughly `F_BARRIERFSYNC` and cheaper
+than `F_FULLFSYNC`; this driver does not offer it and this PR does not change the barrier.
+
+**What falls back** to today's direct path, after emptying the journal (2 barriers) if a
+transaction is live: a commit that writes **file data** (user data is not journaled yet), a commit
+that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit the journal (three transactions
+must fit, TN1150 leaves one sector free), and every durability level but Strict (`SetDurability`
+empties the journal first). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the
+volume keeps writing directly when the writer given to `OpenWritable` cannot `Sync` (every barrier would be
+a no-op; a nil writer or an `OpenFileWritable` file is fine), it is not journaled, the journal was never initialised, its
+`jhdr_size` is not 512, or its size or `blhdr_size` fail the checks of the design. A transaction
+uses a one-sector block list header (`blhdr_size` is set to `jhdr_size` in the first header), so it
+holds at most 30 blocks. Design: `docs/design/journal-write.md`; the full docs come with PR 6.
 
 ## API
 
@@ -269,6 +302,7 @@ The driver still does not write transactions: the write path bypasses the journa
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
+| `ErrJournalWritesUnavailable` | `(*Volume).EnableJournalWrites` on a volume that cannot be written through its journal (not journaled, journal never initialised, `jhdr_size` not 512, checks failed); the volume keeps writing directly |
 | `ErrReplayBudget` | `Open(..., WithJournalReplay())` where the blocks to replay exceed this driver's own bound, `min(journal size, 256 MiB)`; wraps `ErrJournalReplay` |
 | `ErrJournalReplay` | `Open(..., WithJournalReplay())` on a journal the replayer cannot replay (the kernel would abandon it, or a size in it is outside the bounds); wraps `ErrJournaled` |
 | `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending on a volume whose `lastMountedVersion` is not `HFSJ` or that the replayer refuses, or unreadable / off-volume / other-device / bad checksum / a header field outside Apple's `journal_open` ranges since v0.12.3; three older checks stay stricter than Apple's, see hfsplus#48); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written, except when a replay succeeded and a check after it refused the volume (the replayed blocks are then on the medium, the journal empty), or a writer without `Sync` was refused before any write |
