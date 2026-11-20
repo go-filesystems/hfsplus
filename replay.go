@@ -308,7 +308,8 @@ func (p *replayer) attempt() ([]replayEntry, attemptResult, error) {
 		}
 		bo := h.bo
 		orig := bo.Uint32(hb[8:12]) // :1225-1235
-		if blhdrSum(hb) != orig {
+		checksum := blhdrSum(hb)
+		if checksum != orig {
 			if p.checkPast && p.uncharted { // :1245-1254: a torn list past end
 				p.checkPast = false
 				p.end = blOff
