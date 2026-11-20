@@ -70,6 +70,14 @@ func TestVerifiesAsBlockListHeader(t *testing.T) {
 			t.Errorf("%s verifies", name)
 		}
 	}
+	// A slice shorter than the 32 covered bytes is not a header, even when its
+	// zero-padded form would verify (seq 0 makes byte 31 zero) and when it is too
+	// short to hold the checksum field at all.
+	for _, n := range []int{0, 10, 31} {
+		if verifiesAsBlockListHeader(forgedHeader(binary.LittleEndian, 0)[:n]) {
+			t.Errorf("a %d-byte slice verifies", n)
+		}
+	}
 	// Our own block list header verifies, which is why the guard looks at the
 	// blocks and not at the header the encoder writes.
 	enc := encodeTxn(binary.LittleEndian, 5, []writeRun{{off: 512, data: fill(512, 1)}})

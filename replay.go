@@ -73,7 +73,7 @@ func blhdrSum(hb []byte) uint32 {
 // order is the journal's, unknown to whoever planted the bytes). Past end, replay
 // follows such a sector (design section 11, risk 5).
 func verifiesAsBlockListHeader(sector []byte) bool {
-	if len(sector) < blhdrChecksumSize {
+	if len(sector) < blhdrChecksumSize { // also keeps sector[8:12] in range
 		return false
 	}
 	sum := blhdrSum(sector)
