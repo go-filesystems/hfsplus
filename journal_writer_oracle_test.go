@@ -36,6 +36,11 @@ type jwScenario struct {
 	jbase  int64
 	direct bool
 	ops    []jwOp
+	// tail, when set, runs after the commits as one more step that must not change
+	// what the volume shows (Close, SetDurability away from Strict): a crash anywhere
+	// inside it replays to the last state. tailSyncs, when not 0, is its barrier count.
+	tail      jwOp
+	tailSyncs int
 	// points selects the crash points to check (nil: every event prefix).
 	points func(starts, ends []int, ev []crashEvent, jw []jwRange) map[int]bool
 }
@@ -310,6 +315,22 @@ func runJWScenario(t *testing.T, s jwScenario) (ev []crashEvent, starts, ends []
 		states = append(states, names)
 		ranges = append(ranges, jwRange{v.jw.prevStart, v.jw.prevEnd})
 	}
+	if s.tail != nil {
+		starts = append(starts, len(c.events))
+		before := c.syncs
+		if err := s.tail(v); err != nil {
+			t.Fatalf("tail: %v", err)
+		}
+		ends = append(ends, len(c.events))
+		syncs = append(syncs, c.syncs-before)
+		states = append(states, states[len(states)-1])
+		if s.tailSyncs != 0 && syncs[len(syncs)-1] != s.tailSyncs {
+			t.Errorf("the tail paid %d barriers, want %d", syncs[len(syncs)-1], s.tailSyncs)
+		}
+		if ends[len(ends)-1] == starts[len(starts)-1] {
+			t.Error("the tail wrote nothing: the oracle covers no crash inside it")
+		}
+	}
 	return c.events, starts, ends, states, ranges, syncs
 }
 
@@ -358,6 +379,23 @@ func journalImage(t testing.TB, size, seq uint64, end uint64) ([]byte, int64) {
 func TestJournalWriterCrashOracle(t *testing.T) {
 	img, _ := journalImage(t, 0x40000, 100, 0x4400)
 	checkJWScenario(t, jwScenario{name: "k=1..4", img: img, ops: mkdirOps(4)})
+}
+
+// Close and SetDurability away from Strict, after journal commits: the journal is
+// emptied (barrier, header start = end, barrier), then Close writes the clean mark,
+// alternate header first. A crash between the emptying and the clean mark leaves an
+// empty journal and 'HFSJ': nothing to replay, the volume as after the last commit.
+func TestJournalWriterCrashOracleClose(t *testing.T) {
+	img, _ := journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "close", img: img, ops: mkdirOps(4), tailSyncs: 3,
+		tail: func(v *Volume) error { return v.Close() },
+	})
+	img, _ = journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "set-durability", img: img, ops: mkdirOps(4), tailSyncs: 2,
+		tail: func(v *Volume) error { return v.SetDurability(DurabilityMounted) },
+	})
 }
 
 // A wraparound sequence on the smallest journal macOS accepts (256 KiB): enough

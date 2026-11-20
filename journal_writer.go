@@ -102,6 +102,16 @@ func (v *Volume) EnableJournalWrites() error {
 	if v.jw != nil {
 		return nil
 	}
+	// The commit protocol is its two kinds of barrier; a writer that cannot Sync makes
+	// fsync a no-op (store.go), so the journal would run with none and a crash could
+	// leave an emptied or advanced header over blocks that never landed. The same
+	// refusal as the replay at open (replay_write.go). A nil writer is the in-memory
+	// image or a file the volume owns (OpenFileWritable gives it a Sync).
+	if v.wa != nil {
+		if _, ok := v.wa.(interface{ Sync() error }); !ok {
+			return fmt.Errorf("%w: the writer cannot Sync, so the commits could not be ordered", ErrJournalWritesUnavailable)
+		}
+	}
 	if v.vh.Attributes&kHFSVolumeJournaledBit == 0 {
 		return fmt.Errorf("%w: the volume is not journaled", ErrJournalWritesUnavailable)
 	}
@@ -288,6 +298,14 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	runs := journalRuns(meta, hp, ha)
 	if len(runs) == 0 || len(runs) > jwMaxRuns {
 		return false, nil
+	}
+	// A block of the journal is whole sectors (binfo.bnum counts jhdr_size units); a
+	// run that is not (a region whose logical size comes from the image, alloc.go)
+	// takes the direct path.
+	for _, r := range runs {
+		if r.off%jwBlockSize != 0 || len(r.data)%jwBlockSize != 0 {
+			return false, nil
+		}
 	}
 	hdr := jw.loc.hdr
 	size, jh := hdr.size, uint64(hdr.jhdrSize)

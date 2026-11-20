@@ -516,6 +516,20 @@ drops it. macOS's own crash images share this behavior. The oracle (section 9)
 therefore takes the kernel's replay as the reference and runs fsck after the
 mount.
 
+**Measured in PR 3 (what the torn-block prediction above does not explain).** Of
+the 820 distinct crash images of the writer's k = 1..4 sequence, 407 make a
+pre-mount `fsck_hfs -fn` exit non-zero ("could not be verified completely"), and
+the kernel mounts every one of them. They are not torn blocks: all 407 lie inside
+the still-open group, before its barrier, of commits 2 to 4 (none in commit 1,
+none after a barrier), and 286 of them have `T_k` complete. The flip is a single
+event: in-order@19 exits 0 and in-order@20, where the first sector of `T_2` lands
+past `end`, exits 8 before any block is checked. fsck's journal stage gives up on
+that image; the volume is not inconsistent. So an offline `fsck_hfs` taken in the
+middle of a commit cannot verify the image until macOS has mounted it (the mount
+replays and empties the journal); `fsck_hfs -fn` after the mount exits 0 on all 820. The
+root cause, in `fsck_journal.c:517-624` (the loop that reads past `end`), is **not**
+established: this is the measurement, not the explanation.
+
 **fsck -q.** On a journaled volume with `'HFSJ'`, the quick check reports
 clean whatever the unmounted bit says (SControl.c:610-625,
 SVerify1.c:148-157). This is correct here, because the journal brings the
@@ -726,8 +740,10 @@ log, `attachRaw`, `fsckExit` in crash_darwin_test.go).
    `sysctl(HFS_REPLAY_JOURNAL)` (section 5). Then run `fsck_hfs -fn` and the
    durability walk of step 3. The result must equal step 1's.
 6. **Secondary check.** Run `fsck_hfs -fn` on the raw image before mounting.
-   Its result is recorded but not asserted for torn-block images, because of
-   the divergence noted in section 5.
+   Its result is recorded but not asserted: PR 3 measured 413 of 820 images
+   exit 0 and 407 exit 8, all of the latter inside a commit's open group
+   (section 5), where an offline fsck cannot verify the image until it is
+   mounted. Not a torn-block effect, and not a defect of the volume.
 
 **Cost control.** The full set is darwin-only and opt-in, like
 `TestDarwinCrashImagesFsck`. On linux, CI runs the same images against this
@@ -770,6 +786,22 @@ interleaved rounds, a 1-minute load ≤ 8, and a clean clone of the tag.
     the image.
   - It is parity, about 5 ms, if macOS pays one flush plus its own overheads.
   - Which case holds is the UNVERIFIED point of section 3.
+- **Measured in PR 3 (indicative: 1-minute load 4-5, 5-minute 8.6, one run).**
+  The 2.5-3 ms figure is **not** met. A steady-state metadata commit (Chtimes,
+  1 barrier) costs 4.2 ms median, so one `F_FULLFSYNC` costs about 4 ms on that
+  run, not 2.1; the first commit (2 barriers) costs 8.7 ms; `DurabilityMounted`,
+  which does not make each operation durable, costs 4.2 ms for the same
+  Chtimes. macOS's Journaled HFS+ costs 8.6 ms (create) and 10.3 ms (mkdir). So
+  the journal path at its best equals the mounted level in time while
+  keeping per-commit durability, and the gap that is left is the price of
+  `F_FULLFSYNC` itself.
+- **Hypothesis, NOT measured:** the kernel's journal barrier is
+  `DKIOCSYNCHRONIZE` with the barrier option (`hfs_journal.c:469-482`), which is
+  closer to `F_BARRIERFSYNC` than to `F_FULLFSYNC`, and so cheaper than the
+  barrier this driver issues. If true, the gap to the kernel's per-commit cost
+  is the barrier primitive, not the protocol. Measuring it was deferred (load 12
+  when tried), and PR 3 does **not** change the barrier: `F_FULLFSYNC` stays
+  the only primitive offered, as in the write path (README).
 - The first commit of a session costs 2 barriers, so the benchmark reports its
   first round separately.
 - The review fixes (invariant D, the three-transaction revoke window,

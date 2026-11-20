@@ -32,6 +32,18 @@ func jwFile(t *testing.T, img []byte, enable bool) (*Volume, *countingWriter, st
 	return v, instrument(v), path
 }
 
+// memWriter is an io.WriterAt over a slice; syncWriter adds a Sync.
+type memWriter struct{ b []byte }
+
+func (m *memWriter) WriteAt(p []byte, off int64) (int, error) {
+	copy(m.b[off:], p)
+	return len(p), nil
+}
+
+type syncWriter struct{ memWriter }
+
+func (s *syncWriter) Sync() error { return nil }
+
 func journalHeaderOf(t testing.TB, img []byte, jbase int64) journalHeader {
 	t.Helper()
 	h, err := decodeJournalHeader(img[jbase : jbase+512])
@@ -191,6 +203,37 @@ func TestEnableJournalWritesUnavailable(t *testing.T) {
 			}
 		})
 	}
+	// A writer that cannot Sync would make every barrier a no-op: refused, the same
+	// way the replay at open refuses it. A writer that can is accepted.
+	{
+		img, _ := journalImage(t, size, 1000, 0x4400)
+		mem := &memWriter{b: slices.Clone(img)}
+		v, err := OpenWritable(img, onlyWriter{w: mem})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := v.EnableJournalWrites(); !errors.Is(err, ErrJournalWritesUnavailable) {
+			t.Errorf("a writer without Sync: %v, want ErrJournalWritesUnavailable", err)
+		}
+		if v.jw != nil {
+			t.Error("the writer is enabled over a store that cannot Sync")
+		}
+		img, _ = journalImage(t, size, 1000, 0x4400)
+		v, err = OpenWritable(img, &syncWriter{memWriter{b: slices.Clone(img)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := v.EnableJournalWrites(); err != nil {
+			t.Errorf("a writer with Sync: %v", err)
+		}
+		img, _ = journalImage(t, size, 1000, 0x4400)
+		if v, err = OpenWritable(img, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := v.EnableJournalWrites(); err != nil {
+			t.Errorf("no writer (in memory): %v", err)
+		}
+	}
 	// Not journaled.
 	plain, err := Mkfs(8<<20, FormatConfig{Label: "PLAIN"})
 	if err != nil {
@@ -267,6 +310,18 @@ func TestJournalWriterFallbacks(t *testing.T) {
 	n := len(c.events)
 	if done, err := v.flushJournal(many); done || err != nil || len(c.events) != n {
 		t.Errorf("%d runs: done=%v err=%v, %d events written", len(many), done, err, len(c.events)-n)
+	}
+
+	// A run that is not whole sectors (a region's logical size comes from the image):
+	// nothing is written, the caller falls back.
+	for _, r := range []writeRun{
+		{off: 2 << 20, data: fill(100, 1)},
+		{off: 2<<20 + 100, data: fill(512, 1)},
+	} {
+		n = len(c.events)
+		if done, err := v.flushJournal([]writeRun{r}); done || err != nil || len(c.events) != n {
+			t.Errorf("run off %d len %d: done=%v err=%v, %d events written", r.off, len(r.data), done, err, len(c.events)-n)
+		}
 	}
 
 	// A transaction that does not fit (invariant D): force the live size.
