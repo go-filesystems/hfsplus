@@ -41,6 +41,9 @@ type jwScenario struct {
 	// inside it replays to the last state. tailSyncs, when not 0, is its barrier count.
 	tail      jwOp
 	tailSyncs int
+	// noScrub skips the ring scrub, for a scenario that tests what protects a ring
+	// the scrub would empty (the sequence bump) and would be 500 sector writes longer.
+	noScrub bool
 	// reverse: a medium that lands each barrier group in reverse order (jwCrashImagesOrder).
 	reverse bool
 	// points selects the crash points to check (nil: every event prefix).
@@ -320,6 +323,7 @@ func runJWScenario(t *testing.T, s jwScenario) (ev []crashEvent, starts, ends []
 	if err := v.EnableJournalWrites(); err != nil {
 		t.Fatal(err)
 	}
+	v.jw.scrubbed = s.noScrub
 	c := instrument(v)
 	for k, op := range s.ops {
 		starts = append(starts, len(c.events))
@@ -492,7 +496,7 @@ func TestJournalWriterCrashOracleStaleRing(t *testing.T) {
 	const size = 0x40000
 	img, jbase := journalImage(t, size, 5000, 0x1000)
 	poisonRing(img, jbase, size, 5001)
-	checkJWScenario(t, jwScenario{name: "stale-ring", img: img, ops: mkdirOps(3)})
+	checkJWScenario(t, jwScenario{name: "stale-ring", img: img, ops: mkdirOps(3), noScrub: true})
 }
 
 // The fallback path entered right after a journal is emptied, and the journal
