@@ -916,7 +916,8 @@ node. The writer also
    zeroing a sector past any later `end` removes bytes nothing may read. A
    crash during or after the scrub, with any subset of the zero writes on the
    medium, leaves the volume as it was and an empty journal; a sector torn by
-   the crash verifies only with probability 2^-32 and the next session scrubs
+   the crash may still verify (the predicate reads bytes 0-31 only, so a tear
+   that keeps them keeps the verdict), which is harmless: the next session rescans and scrubs
    it again. The barrier orders the scrub against T_1; barrier 1 would
    otherwise be the first to make the zeroes durable, which is too late for a
    zero write that races T_1's write to the same sector.

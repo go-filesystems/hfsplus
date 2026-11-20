@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 )
 
@@ -341,9 +342,9 @@ const scrubChunk = 64 << 10
 // Why it is crash-safe: it runs on an empty journal (start = end), which replay
 // does not read, and the zeroed sectors are stale (no live transaction exists to
 // own them), so every crash image, whichever zero writes reached the medium,
-// replays to the volume as it was. A sector torn by the crash holds some forged
-// bytes and some zeroes and verifies only with probability 2^-32; the next session
-// scrubs it again if it does.
+// replays to the volume as it was. A sector torn by the crash may still verify (the
+// predicate reads bytes 0-31 only, so a tear that keeps them keeps the verdict);
+// that is harmless, because the next session rescans the ring and zeroes it again.
 func (jw *journalWriter) scrubRing(v *Volume) error {
 	size, jh := jw.loc.hdr.size, uint64(jw.loc.hdr.jhdrSize)
 	buf := make([]byte, min(scrubChunk, size-jh))
@@ -352,7 +353,10 @@ func (jw *journalWriter) scrubRing(v *Volume) error {
 	for off := jh; off < size; {
 		n := min(uint64(len(buf)), size-off)
 		if got, err := v.readUnder(buf[:n], int64(jw.loc.off+off)); uint64(got) < n {
-			return fmt.Errorf("hfsplus: scrubbing the journal ring at %d: %v", off, err)
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return fmt.Errorf("hfsplus: scrubbing the journal ring at %d: %w", off, err)
 		}
 		for o := uint64(0); o+jh <= n; o += jh {
 			if !verifiesAsBlockListHeader(buf[o : o+jh]) {

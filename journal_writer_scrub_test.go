@@ -218,6 +218,40 @@ func TestJournalWriterCrashOracleRingScrub(t *testing.T) {
 	}
 }
 
+// The scrub starts at jhdr_size: the journal header sector, offset 0 of the journal,
+// is never written, even when its bytes verify as a block list header (a journal
+// header whose start field happens to equal the sum). A short read is an error that
+// names the cause. scrubRing is driven directly: the ring sits at the end of a
+// 1 MiB volume's free space, a 256 KiB journal with its header forged.
+func TestRingScrubNeverWritesTheJournalHeader(t *testing.T) {
+	img, err := Mkfs(8<<20, FormatConfig{Label: "SCRUB"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size, off = 0x40000, 8<<20 - 0x40000 - 8192
+	plantRing(img, off, 0, forgedHeader(binary.LittleEndian, 0))
+	plantRing(img, off, 512, forgedHeader(binary.LittleEndian, 0))
+	v, err := OpenWritable(img, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jw := &journalWriter{loc: journalLoc{off: off, hdr: journalHeader{size: size, jhdrSize: jwBlockSize}}}
+	if err := jw.scrubRing(v); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(img[off:off+512], forgedHeader(binary.LittleEndian, 0)) {
+		t.Error("the scrub wrote the journal header sector")
+	}
+	if !bytes.Equal(img[off+512:off+1024], make([]byte, 512)) {
+		t.Error("the sector at ring offset 512 was not zeroed")
+	}
+	// A ring that runs past the end of the volume: the read is short, with an error.
+	jw.loc.off = uint64(len(img)) - 4096
+	if err := jw.scrubRing(v); err == nil {
+		t.Error("a ring past the end of the volume scrubbed without error")
+	}
+}
+
 // The scan's memory is one chunk, whatever the ring's size: no allocation grows with
 // it (the benchmark reports allocs/op on an 8 MiB ring).
 func BenchmarkRingScrub(b *testing.B) {
