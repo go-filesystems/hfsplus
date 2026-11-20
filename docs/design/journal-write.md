@@ -883,16 +883,59 @@ node. The writer also
    refused (`:1289-1298`), so the forged list is reachable only behind a
    transaction that ends on it, as the proof test builds it. PR 4 applies
    the same check to every sector of journaled data; a sector that verifies
-   goes through the ordered large-data path instead. Not covered: forged
-   sectors already in a ring macOS wrote (macOS journals catalog nodes too).
-   **Unproven:** (a) rings that v0.15.0 wrote before the guard, which may
-   already hold such a sector (nothing scans for one); (b) whether the
-   kernel's replay or `fsck_hfs` follows the forged list. The proof test
-   covers this driver's replayer only, which is a port of `replay_journal`,
-   not the kernel's code run.
+   goes through the ordered large-data path instead.
+
+   **The gap the guard left, closed by the ring scrub (hfsplus#58, v0.15.2).**
+   The guard keeps new forged sectors out; a sector already in the ring (a
+   v0.15.0 session wrote it before the guard, or another implementation,
+   macOS included, left it) stays there across a clean unmount, which empties
+   the header but not the ring. `scrubRing` reads `[jhdr_size, size)` once per
+   session, in 64 KiB chunks (memory is one chunk for a ring of at most 1 GiB,
+   `loadJournalAt`'s bound), and zeroes every `jhdr_size` sector that
+   `verifiesAsBlockListHeader` accepts, in either byte order (the same
+   predicate as the guard, one implementation). If it zeroed anything, one
+   barrier follows and returns before any write to the ring: the zero write
+   and a T_1 block list header write may target the same sector, and without
+   the barrier they land in either order. Nothing is written or synced when
+   no sector verifies, so the common ring (stale transactions only) costs one
+   sequential read per session and no barrier.
+   *Where it runs:* lazily, in the first journaled commit of a session, after
+   the commit has passed every fallback test and after the journal was read
+   empty, not in `EnableJournalWrites`. A session that never journals a commit
+   (direct path only, a level other than Strict, a read-mostly session) pays
+   nothing; `EnableJournalWrites` keeps its contract of doing no I/O beyond
+   reading; the scrub's writes lie inside commit 1, so the crash oracle's
+   event log covers them with no further plumbing. After an in-session
+   `emptyJournal` the next commit is a first commit again but does not rescan:
+   the ring then holds only transactions this session wrote, the guard checked
+   every block of them, and each one's own block list header is a sector that
+   verifies by design.
+   *Crash safety:* the scrub runs on an empty journal (`start == end`, checked
+   by the first commit), which replay does not read; every sector it zeroes
+   lies in the ring and belongs to no live transaction (none exists), so
+   zeroing a sector past any later `end` removes bytes nothing may read. A
+   crash during or after the scrub, with any subset of the zero writes on the
+   medium, leaves the volume as it was and an empty journal; a sector torn by
+   the crash verifies only with probability 2^-32 and the next session scrubs
+   it again. The barrier orders the scrub against T_1; barrier 1 would
+   otherwise be the first to make the zeroes durable, which is too late for a
+   zero write that races T_1's write to the same sector.
+   Not covered: the kernel's own replay of a ring macOS wrote and this driver
+   never touches (out of scope of #58).
+   **Unproven:** whether the kernel's replay or `fsck_hfs` follows the forged
+   list. The proof test covers this driver's replayer only, which is a port
+   of `replay_journal`, not the kernel's code run.
    Tests: `TestForgedHeaderPastEndIsFollowed` (the proof, without the
    guard), `TestJournalWriterForgedSectorFallsBack`,
-   `TestJournalWriterCrashOracleForgedSector`, `FuzzGuardAgreesWithReplayer`.
+   `TestJournalWriterCrashOracleForgedSector`, `FuzzGuardAgreesWithReplayer`;
+   for the scrub `TestRingScrubClosesTheGap` (the proof: a forged sector where
+   T_2 ends is followed without the scrub, not with it),
+   `TestRingScrubZeroesForgedSectors` (both byte orders, chunk edges, barrier
+   count 3,1,1), `TestRingScrubNothingToZero` (2,1,1, no write below T_1),
+   `TestRingScrubIsLazy`, `TestJournalWriterCrashOracleRingScrub` (a crash
+   inside and after the scrub, also on a medium that lands each barrier group
+   in reverse order), `BenchmarkRingScrub`. Mutations that turn them red: no
+   scrub, no scrub barrier, one byte order.
    The node bytes are built directly in the tests: a name placed on a sector
    boundary of a node is not shown to be reachable through the public API
    (UTF-16 names, ordered by the catalog).

@@ -40,6 +40,10 @@ import (
 // past end (hfs_journal.c:1211-1300), the way macOS reaches the transaction its
 // last F_FULLFSYNC wrote.
 //
+// The first journaled commit of a session starts with scrubRing (hfsplus#58): it
+// zeroes any sector of the ring that verifies as a block list header, then one
+// barrier if it zeroed any, before T_1 is written; a ring with none costs a read.
+//
 // The block list header is one sector (blhdr_size = jhdr_size, set in H_1: a
 // header that fits one sector cannot be torn between sectors, design section 4),
 // so a transaction has at most 30 blocks; each block is one contiguous run of

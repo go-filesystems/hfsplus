@@ -6,8 +6,6 @@ package hfsplus
 import (
 	"bytes"
 	"encoding/binary"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"testing"
@@ -224,23 +222,25 @@ func TestJournalWriterCrashOracleRingScrub(t *testing.T) {
 // it (the benchmark reports allocs/op on an 8 MiB ring).
 func BenchmarkRingScrub(b *testing.B) {
 	const size = 8 << 20
-	img, _ := journalImage(b, size, 100, scrubTxnStart)
-	path := filepath.Join(b.TempDir(), "w.img")
-	if err := os.WriteFile(path, img, 0o644); err != nil {
-		b.Fatal(err)
-	}
-	v, err := OpenFileWritable(path)
+	// An 8 MiB ring does not fit the 8 MiB test volume: scrubRing needs only a volume
+	// to read and a journal location, so the ring sits in a 16 MiB one, filled with
+	// 0x5a (no sector verifies, the common case: the scan reads and writes nothing).
+	img, err := Mkfs(16<<20, FormatConfig{Label: "BENCH"})
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer v.Close()
-	if err := v.EnableJournalWrites(); err != nil {
+	const off = 16<<20 - size - 8192 // clear of the catalog at the start and the alternate header
+	copy(img[off:off+size], fill(size, 0x5a))
+	v, err := OpenWritable(img, nil)
+	if err != nil {
 		b.Fatal(err)
 	}
+	jw := &journalWriter{loc: journalLoc{off: off, hdr: journalHeader{size: size, jhdrSize: jwBlockSize}}}
 	b.ReportAllocs()
 	b.SetBytes(size)
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.jw.scrubRing(v); err != nil {
+		if err := jw.scrubRing(v); err != nil {
 			b.Fatal(err)
 		}
 	}
