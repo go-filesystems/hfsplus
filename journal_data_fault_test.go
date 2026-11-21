@@ -86,7 +86,7 @@ func TestJournalDataFaults(t *testing.T) {
 				t.Fatal(err)
 			}
 			v.jw.prevSize = 0x40000 - 512 - 100
-		},func(v *Volume) error {
+		}, func(v *Volume) error {
 			err := v.WriteFile("/b", pat(300, 8), 0o644)
 			if err == nil && v.journaling() {
 				t.Error("the commit did not fall back: the sweep reaches no writeStaged")
