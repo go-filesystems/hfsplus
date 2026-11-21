@@ -153,6 +153,12 @@ func TestJournalDataSmallIsInTheRing(t *testing.T) {
 // file that reads stale bytes (zeros, another file's old contents) matches no state.
 func fileOracle(t *testing.T, name string, ops []jwOp, reverse bool, syncs []int) {
 	t.Helper()
+	if testing.Short() {
+		// The emulated CI lanes run -test.short under QEMU: these oracles replay tens of
+		// thousands of crash images (13829 to 63854 each) and timed out there at 20 minutes.
+		// The native lanes run them whole, and the barrier and fault tests below still run.
+		t.Skip("crash oracle: native runs only")
+	}
 	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
 	checkJWScenario(t, jwScenario{name: name, img: img, jbase: jbase, ops: ops, reverse: reverse, observe: observeFiles, wantSyncs: syncs})
 }
