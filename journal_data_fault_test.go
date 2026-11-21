@@ -82,8 +82,17 @@ func TestJournalDataFaults(t *testing.T) {
 	})
 	t.Run("direct fallback with candidates", func(t *testing.T) {
 		faultSweep(t, "fallback-small", func(v *Volume) {
-			v.jw.prevSize = 0x40000 - 512 - 4096
-		}, func(v *Volume) error { return v.WriteFile("/b", pat(300, 8), 0o644) })
+			if err := v.MkDir("/m", 0o755); err != nil { // makes the journal live
+				t.Fatal(err)
+			}
+			v.jw.prevSize = 0x40000 - 512 - 100
+		},func(v *Volume) error {
+			err := v.WriteFile("/b", pat(300, 8), 0o644)
+			if err == nil && v.journaling() {
+				t.Error("the commit did not fall back: the sweep reaches no writeStaged")
+			}
+			return err
+		})
 	})
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
