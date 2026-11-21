@@ -34,6 +34,41 @@ type allocator struct {
 
 	cur    []byte // the last chunk read (a scan cache)
 	curIdx int64  // its index, -1 when none
+
+	// The revoke rule (design section 6), for allocData only: zones are the blocks a
+	// replayable transaction journaled, revBound the most bytes of them one commit
+	// takes, revUsed what it has taken. A zone block past the bound is skipped.
+	zones    []span
+	revBound int64
+	revUsed  int64
+	revoke   bool // inside allocData
+}
+
+// allocData is allocFragments for file data: under the revoke rule, a free block
+// that a transaction replay can still reach is taken only while the bytes of such
+// blocks stay within the journal's data bound; past it the block is skipped (the
+// block is journaled in the commit, jforced, and the bound keeps that small).
+func (a *allocator) allocData(count uint32) ([]extentDescriptor, error) {
+	a.revoke = len(a.zones) > 0
+	defer func() { a.revoke = false }()
+	return a.allocFragments(count)
+}
+
+// blocked reports whether block n cannot be allocated now: it is used, or it is in
+// a zone and the commit's zone bytes, with the candidate run's so far in run, would
+// pass the bound. A zone block it accepts is added to run.
+func (a *allocator) blocked(n uint32, run *int64) bool {
+	if a.test(n) {
+		return true
+	}
+	if !a.revoke || !inZones(a.zones, int64(n)*a.bs) {
+		return false
+	}
+	if a.revUsed+*run+a.bs > a.revBound {
+		return true
+	}
+	*run += a.bs
+	return false
 }
 
 // newAllocator prepares the allocation bitmap of the volume for use. It reads
@@ -52,7 +87,7 @@ func (v *Volume) newAllocator() (*allocator, error) {
 		}
 	}
 	bs := int64(v.vh.BlockSize)
-	return &allocator{
+	a := &allocator{
 		v:      v,
 		bits:   v.vh.TotalBlocks,
 		size:   f.size,
@@ -61,7 +96,11 @@ func (v *Volume) newAllocator() (*allocator, error) {
 		chunk:  min(bs, allocChunk),
 		free:   v.vh.FreeBlocks,
 		curIdx: -1,
-	}, nil
+	}
+	if v.stagesData() {
+		a.zones, a.revBound = v.jw.zones, v.jw.dataBound()
+	}
+	return a, nil
 }
 
 // reconcileFreeBlocks counts the free bits of the bitmap and makes the parsed
@@ -202,6 +241,7 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 	}
 	var run uint32
 	var start uint32
+	var rev int64 // zone bytes of the candidate run
 	for n := uint32(0); n < a.bits; n++ {
 		if n%8 == 0 && run == 0 {
 			if m := a.skipUsed(n); m != n {
@@ -209,8 +249,8 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 				continue
 			}
 		}
-		if a.test(n) {
-			run = 0
+		if a.blocked(n, &rev) {
+			run, rev = 0, 0
 			continue
 		}
 		if run == 0 {
@@ -221,6 +261,7 @@ func (a *allocator) allocContiguous(count uint32) (uint32, error) {
 			for i := start; i < start+count; i++ {
 				a.set(i)
 			}
+			a.revUsed += rev
 			return start, a.err
 		}
 	}
@@ -248,6 +289,7 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 	remaining := count
 	var runStart uint32
 	var runLen uint32
+	var rev int64
 	flush := func() {
 		if runLen > 0 {
 			for i := runStart; i < runStart+runLen; i++ {
@@ -256,7 +298,9 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 			runs = append(runs, extentDescriptor{StartBlock: runStart, BlockCount: runLen})
 			remaining -= runLen
 			runLen = 0
+			a.revUsed += rev
 		}
+		rev = 0
 	}
 	for n := uint32(0); n < a.bits && remaining > 0; n++ {
 		if n%8 == 0 && runLen == 0 {
@@ -265,7 +309,7 @@ func (a *allocator) allocFragments(count uint32) ([]extentDescriptor, error) {
 				continue
 			}
 		}
-		if a.test(n) {
+		if a.blocked(n, &rev) {
 			flush()
 			continue
 		}

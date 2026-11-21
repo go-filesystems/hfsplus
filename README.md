@@ -268,9 +268,23 @@ The design's 2.5-3 ms estimate is not met. A hypothesis, **not measured**: the k
 `DKIOCSYNCHRONIZE` with the barrier option (`hfs_journal.c:469-482`), roughly `F_BARRIERFSYNC` and cheaper
 than `F_FULLFSYNC`; this driver does not offer it and this PR does not change the barrier.
 
+**File data through the journal (PR 4 of hfsplus#45, v0.16.0).** A commit that writes file data
+(`WriteFile`) is journaled too, at `DurabilityStrict`. The bound is `min(1 MiB, (journal size - jhdr_size) / 8)`
+of data per commit. **Small data** (staged bytes within the bound) goes into the transaction with the
+metadata: one barrier (2 on a session's first commit). **Large data** is written in place first, then a
+barrier, then the metadata commit: two barriers (3 on the first). Staged data over the bound is spilled to
+in-place writes, so the staging buffer is bounded. **Revoke rule:** replay copies every block of every
+transaction in the ring, in order, so a block journaled in T(k-2), T(k-1) or T(k) that is later freed and
+reused as file data must not be written in place, or a replay would overwrite it with the old bytes. A
+newly allocated data block inside that window is therefore journaled in the new transaction (the allocator
+counts those against the bound and skips a block that would exceed it). A data sector that verifies as a
+block list header is never put in the ring: the data takes the ordered path (in place, barrier first); if
+a revoke-forced block carries one, the commit falls back to the direct path after emptying the journal.
+Checked by crash oracles with byte checks (small, large, the revoke reuse, and the reverse write order) and
+by macOS's own replay (`HFSPLUS_JOURNAL_ORACLE=1`).
+
 **What falls back** to today's direct path, after emptying the journal (2 barriers) if a
-transaction is live: a commit that writes **file data** (user data is not journaled yet), a commit
-that carries a sector which verifies as a block list header (v0.15.1, hfsplus#56: replay follows such a
+transaction is live: a commit that carries a sector which verifies as a block list header (v0.15.1, hfsplus#56: replay follows such a
 sector past the journal's end, and catalog nodes hold file names a user chooses; every 512-byte sector of
 every journaled block is checked, in both byte orders, before the transaction is written, and the writer
 never emits sequence number 0; a planted sector makes every commit that touches the poisoned catalog node take the direct path, whoever makes it; and, since v0.15.2 (hfsplus#58), the first journaled commit of a session first scrubs the ring: it reads the journal once, 64 KiB at a time, and zeroes every 512-byte sector that verifies as a block list header in either byte order (a sector a v0.15.0 session wrote before the guard, or another implementation left), with one extra barrier that makes the zeroes durable before the transaction lands, and only when a sector was zeroed. Unproven: whether the kernel's replay or `fsck_hfs` follows a forged list, since the proof covers this driver's replayer only), a commit
@@ -282,6 +296,9 @@ a no-op; a nil writer or an `OpenFileWritable` file is fine), it is not journale
 `jhdr_size` is not 512, or its size or `blhdr_size` fail the checks of the design. A transaction
 uses a one-sector block list header (`blhdr_size` is set to `jhdr_size` in the first header), so it
 holds at most 30 blocks. Design: `docs/design/journal-write.md`; the full docs come with PR 6.
+
+A commit with several candidates that exceeds 30 runs or does not fit the ring writes its data on the
+ordered path instead (in place, barrier, then the transaction).
 
 ## API
 

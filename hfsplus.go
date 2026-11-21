@@ -67,6 +67,13 @@ type Volume struct {
 	regionBytes int64
 	werr        error // first error of a setter that cannot return one
 	dataDirty   bool  // file data was written since the last fsync
+
+	// File data staged for the journal commit (journal_data.go): jdata are the
+	// candidates for small data, jforced the blocks the revoke rule forces into the
+	// transaction; dataSpilled: the bound was passed, later data goes in place.
+	jdata, jforced           []writeRun
+	jdataBytes, jforcedBytes int64
+	dataSpilled              bool
 	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
 	// every commit with the unmounted bit cleared, then set again.
 	cleanOnDisk bool
