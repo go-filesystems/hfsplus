@@ -5,9 +5,11 @@ package hfsplus
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -431,4 +433,46 @@ func TestJournalWriterCrashOracleBypass(t *testing.T) {
 		name: "bypass-first", img: img, jbase: jbase, direct: true,
 		ops: []jwOp{forged("/d000"), mkdirOps(2)[1], mkdirOps(3)[2]},
 	})
+}
+
+// Every write and barrier of the journal-full commit and of Close as T_c fails once,
+// in turn: the error comes back, never swallowed.
+func TestJournalFullAndCloseFaults(t *testing.T) {
+	live := func(v *Volume) {
+		for _, n := range []string{"/a", "/b"} {
+			if err := v.MkDir(n, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("journal full", func(t *testing.T) {
+		faultSweep(t, "full", live, fullOp("/c"))
+	})
+	t.Run("close as T_c", func(t *testing.T) {
+		faultSweep(t, "close", live, func(v *Volume) error {
+			err := v.MkDir("/c", 0o755)
+			if err != nil {
+				return err
+			}
+			return closeErr(v.Close())
+		})
+	})
+	t.Run("close finds the journal full", func(t *testing.T) {
+		faultSweep(t, "close-full", live, func(v *Volume) error {
+			if err := v.MkDir("/c", 0o755); err != nil {
+				return err
+			}
+			forceFull(v)
+			return closeErr(v.Close())
+		})
+	})
+}
+
+// closeErr maps Close's sticky "an earlier write failed" error, which carries the
+// cause as text, back to the injected one.
+func closeErr(err error) error {
+	if err != nil && !errors.Is(err, errInjected) && strings.Contains(err.Error(), errInjected.Error()) {
+		return errInjected
+	}
+	return err
 }
