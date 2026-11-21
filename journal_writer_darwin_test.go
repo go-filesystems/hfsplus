@@ -47,16 +47,70 @@ func dOnly(names []string) []string {
 //
 // Opt-in (HFSPLUS_JOURNAL_ORACLE=1), like TestDarwinReplayMatchesKernel.
 func TestDarwinJournalWriterKernelReplay(t *testing.T) {
+	darwinKernelReplay(t, "JWORACLE", mkdirOps(4), nil, nil)
+}
+
+// mountView is what the mounted volume shows the oracle: names, and for files
+// their size and checksum, in observeFiles' format.
+func mountView(mnt string) []string {
+	ents, _ := os.ReadDir(mnt)
+	var out []string
+	for _, e := range ents {
+		if e.IsDir() {
+			out = append(out, e.Name()+"/")
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(mnt, e.Name()))
+		if err != nil {
+			out = append(out, e.Name()+":unreadable")
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s:%d:%x", e.Name(), len(b), sha256.Sum256(b)))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestDarwinJournalWriterDataKernelReplay is the same oracle with file contents
+// (PR 4 of hfsplus#45): a small file through the ring, a large file in place
+// before its barrier, an overwrite that reuses the freed blocks (the revoke
+// case), each crash image handed to macOS, whose mount must show the bytes of a
+// state between the commits that returned and the commits that had begun.
+func TestDarwinJournalWriterDataKernelReplay(t *testing.T) {
+	ops := []jwOp{
+		wf("/d000", pat(3000, 1)),
+		wf("/d001", pat(70000, 2)),
+		rm("/d000"),
+		wf("/d002", pat(1500, 3)),
+	}
+	darwinKernelReplay(t, "JWDATA", ops, observeFiles, mountView)
+}
+
+func darwinKernelReplay(t *testing.T, vol string, ops []jwOp, observe jwObserver, view func(string) []string) {
 	if os.Getenv("HFSPLUS_JOURNAL_ORACLE") != "1" {
 		t.Skip("set HFSPLUS_JOURNAL_ORACLE=1")
 	}
 	requireTools(t)
-	src := appleImage(t, "Journaled HFS+", "JWORACLE")
+	src := appleImage(t, "Journaled HFS+", vol)
 	base, err := os.ReadFile(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := jwScenario{name: "apple-jnl", img: base, ops: mkdirOps(4)}
+	if observe == nil {
+		observe = rootNames
+	}
+	if view == nil {
+		view = func(mnt string) []string {
+			ents, _ := os.ReadDir(mnt)
+			var kn []string
+			for _, e := range ents {
+				kn = append(kn, e.Name())
+			}
+			sort.Strings(kn)
+			return kn
+		}
+	}
+	s := jwScenario{name: "apple-jnl", img: base, ops: ops, observe: observe}
 	ev, starts, ends, states, _, syncs := runJWScenario(t, s)
 	for i := range states {
 		states[i] = dOnly(states[i])
@@ -117,13 +171,7 @@ func TestDarwinJournalWriterKernelReplay(t *testing.T) {
 			t.Errorf("%s: macOS cannot mount the crash image: %v", c.name, err)
 			continue
 		}
-		ents, _ := os.ReadDir(mnt)
-		var kn []string
-		for _, e := range ents {
-			kn = append(kn, e.Name())
-		}
-		sort.Strings(kn)
-		kn = dOnly(kn)
+		kn := dOnly(view(mnt))
 		detach(dev)
 		match := false
 		for j := c.lo; j <= c.hi && j < len(states); j++ {
@@ -147,7 +195,7 @@ func TestDarwinJournalWriterKernelReplay(t *testing.T) {
 		// 3. The durability walk with this driver.
 		if v, err := Open(bytesReaderAt(after), int64(len(after))); err != nil {
 			t.Errorf("%s: this driver cannot open the result: %v", c.name, err)
-		} else if names, err := rootNames(v); err != nil || !slices.Equal(dOnly(names), kn) {
+		} else if names, err := observe(v); err != nil || !slices.Equal(dOnly(names), kn) {
 			t.Errorf("%s: this driver lists %v (%v) after the kernel replay, the mount listed %v", c.name, dOnly(names), err, kn)
 		}
 		// 5. The writable fsck path, on a second copy of the crash image.
@@ -170,7 +218,7 @@ func TestDarwinJournalWriterKernelReplay(t *testing.T) {
 				gv, err := Open(bytesReaderAt(gb), int64(len(gb)))
 				var gn []string
 				if err == nil {
-					gn, _ = rootNames(gv)
+					gn, _ = observe(gv)
 				}
 				if fy != 0 || code != 0 || !slices.Equal(dOnly(gn), kn) {
 					t.Errorf("%s: writable fsck -fy exit %d, then -fn exit %d, lists %v, kernel mount listed %v\n%s\n%s", c.name, fy, code, dOnly(gn), kn, fyOut, out)

@@ -295,7 +295,7 @@ func (t *txn) createFile(parent uint32, name string, data []byte, mode uint16) e
 	df.ClumpSize = v.vh.BlockSize
 	df.TotalBlocks = nblocks
 	if nblocks > 0 {
-		runs, err := t.alc.allocFragments(nblocks)
+		runs, err := t.alc.allocData(nblocks)
 		if err != nil {
 			return err
 		}

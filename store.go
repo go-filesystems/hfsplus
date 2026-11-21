@@ -209,6 +209,7 @@ func (v *Volume) discard() {
 	v.regions = nil
 	v.regionBytes = 0
 	v.werr = nil
+	v.dropStaged()
 	v.dropReadCache()
 }
 
@@ -222,6 +223,9 @@ func (v *Volume) writeData(p []byte, off int64) error {
 	}
 	if off < 0 || off > v.size-int64(len(p)) {
 		return fmt.Errorf("%w: data range [%d,+%d) is outside the %d-byte image", ErrCorrupt, off, len(p), v.size)
+	}
+	if v.stagesData() {
+		return v.stageData(p, off)
 	}
 	if err := v.putAt(p, off); err != nil {
 		return err
@@ -326,15 +330,15 @@ func (v *Volume) flush() error {
 			meta = append(meta, runs...)
 		}
 	}
-	if !anyChange && !v.dataDirty {
+	if !anyChange && !v.dataDirty && !v.hasStaged() {
 		return nil
 	}
 	if v.jw != nil {
-		// Journal writes are on (EnableJournalWrites). A metadata-only commit at
-		// Strict is a journal transaction; everything else writes directly, which
-		// first empties the journal: a direct write with transactions pending would
-		// be overwritten by their replay.
-		if v.durability == DurabilityStrict && !v.dataDirty {
+		// Journal writes are on (EnableJournalWrites). A commit at Strict is a journal
+		// transaction, its file data journaled or ordered (journal_data.go);
+		// everything else writes directly, which first empties the journal: a direct
+		// write with transactions pending would be overwritten by their replay.
+		if v.durability == DurabilityStrict {
 			done, err := v.flushJournal(meta)
 			if err != nil {
 				return err
@@ -345,6 +349,10 @@ func (v *Volume) flush() error {
 			}
 		}
 		if err := v.emptyJournal(); err != nil {
+			return err
+		}
+		// Staged data (none unless Strict) goes in place now that nothing replays.
+		if err := v.writeStaged(); err != nil {
 			return err
 		}
 	}
@@ -464,5 +472,6 @@ func (v *Volume) commitDone() {
 	v.regionBytes = 0
 	v.touched = false
 	v.dataDirty = false
+	v.dropStaged()
 	v.dropReadCache()
 }

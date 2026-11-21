@@ -538,6 +538,8 @@ volume back. The current crash test asserts the opposite for mid-commit images
 
 ## 6. File data
 
+*Status: implemented in v0.16.0, see section 12, item 4.*
+
 TN1150 *Journal* says the journal "does not protect the contents of a fork".
 Today's strict guarantee does protect them: data is durable before the
 metadata that points at it, so a crash never shows a file with stale bytes.
@@ -968,6 +970,16 @@ node. The writer also
    - The crash oracle of section 9.
 4. **File data.** Small-data journaling, the large-data ordered path, and the
    revoke set. The crash oracle with byte checks.
+   **Status: done in v0.16.0** (`journal_data.go`). Deviations: a revoke-forced
+   block that carries a forged sector makes the commit take the direct path
+   (journal emptied first) rather than the allocator skipping it; zones are
+   checked per allocation block and only for file data, not B-tree growth.
+   That is safe because B-tree nodes are always journaled, or written after
+   the journal is emptied, and `stageData` forces every write that falls in a
+   zone into the journal, whatever allocated the block;
+   large data stays out of the ring except revoke-forced blocks; a plan that
+   fails with candidates (30-run limit, no fit) puts the candidates on the
+   ordered path; staged bytes past the bound are spilled to in-place writes.
 5. **Journal full, bypass, Close/Sync, and switching levels.** The crash oracle
    across the wrap.
 6. **Default on** for Strict and Mounted. The measurement table, plus README,

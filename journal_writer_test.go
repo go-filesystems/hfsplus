@@ -272,7 +272,10 @@ func TestJournalWriterFallbacks(t *testing.T) {
 	must(v.MkDir("/b", 0o755))
 	seq := v.jw.lastSeq
 
-	// File data: direct. The journal is emptied first (2 barriers), then 3.
+	// File data that does not fit the journal (invariant D, forced live size): direct,
+	// with its data in place after the journal is emptied (2 barriers), then 3. (Data
+	// that fits is journaled: journal_data_test.go.)
+	v.jw.prevSize = 0x80000 - 512 - 4096
 	before := c.syncs
 	must(v.WriteFile("/f.bin", fill(5000, 7), 0o644))
 	if got := c.syncs - before; got != 5 {

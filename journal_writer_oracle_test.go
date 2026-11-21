@@ -28,6 +28,9 @@ import (
 // jwOp is one commit.
 type jwOp func(v *Volume) error
 
+// jwObserver reads the state of a volume that the oracle compares.
+type jwObserver func(v *Volume) ([]string, error)
+
 type jwScenario struct {
 	name string
 	img  []byte // base image: a journaled volume with an empty journal
@@ -46,6 +49,11 @@ type jwScenario struct {
 	noScrub bool
 	// reverse: a medium that lands each barrier group in reverse order (jwCrashImagesOrder).
 	reverse bool
+	// observe reads what a volume shows, compared between states (nil: rootNames).
+	// observeFiles adds every file's size and checksum: the byte checks of PR 4.
+	observe jwObserver
+	// wantSyncs, when set, is the barrier count of each commit.
+	wantSyncs []int
 	// points selects the crash points to check (nil: every event prefix).
 	points func(starts, ends []int, ev []crashEvent, jw []jwRange) map[int]bool
 }
@@ -119,7 +127,10 @@ func jwBaseline(t testing.TB, img []byte) consistency {
 
 // jwCheckImage returns "" when img, as a crash image, replays to the volume after
 // j commits for some j in [lo, hi]; otherwise what is wrong.
-func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency, jbase int64, direct bool) string {
+func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency, jbase int64, direct bool, observe jwObserver) string {
+	if observe == nil {
+		observe = rootNames
+	}
 	vh, err := readVolumeHeader(bytesReaderAt(img))
 	if err != nil {
 		return "volume header: " + err.Error()
@@ -149,7 +160,7 @@ func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency, j
 	if err != nil {
 		return "does not open with replay: " + err.Error()
 	}
-	names, err := rootNames(v)
+	names, err := observe(v)
 	if err != nil {
 		return "replayed volume unreadable: " + err.Error()
 	}
@@ -172,7 +183,7 @@ func jwCheckImage(img []byte, lo, hi int, states [][]string, base consistency, j
 	if err != nil {
 		return "writable open (replay) refused: " + err.Error()
 	}
-	wnames, err := rootNames(wv)
+	wnames, err := observe(wv)
 	if err != nil || !slices.Equal(wnames, names) {
 		return fmt.Sprintf("writable replay shows %v (%v), read replay %v", wnames, err, names)
 	}
@@ -310,7 +321,11 @@ func runJWScenario(t *testing.T, s jwScenario) (ev []crashEvent, starts, ends []
 	if err != nil {
 		t.Fatal(err)
 	}
-	n0, err := rootNames(base)
+	observe := s.observe
+	if observe == nil {
+		observe = rootNames
+	}
+	n0, err := observe(base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +348,7 @@ func runJWScenario(t *testing.T, s jwScenario) (ev []crashEvent, starts, ends []
 		}
 		ends = append(ends, len(c.events))
 		syncs = append(syncs, c.syncs-before)
-		names, err := rootNames(v)
+		names, err := observe(v)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -363,6 +378,9 @@ func checkJWScenario(t *testing.T, s jwScenario) {
 	t.Helper()
 	ev, starts, ends, states, ranges, syncs := runJWScenario(t, s)
 	base := jwBaseline(t, s.img)
+	if s.wantSyncs != nil && !slices.Equal(syncs[:len(s.ops)], s.wantSyncs) {
+		t.Errorf("barriers per commit %v, want %v", syncs[:len(s.ops)], s.wantSyncs)
+	}
 	sev, sstarts, sends := splitSectors(ev, starts, ends)
 	var points map[int]bool
 	if s.points != nil {
@@ -371,7 +389,7 @@ func checkJWScenario(t *testing.T, s jwScenario) {
 	n, bad := 0, []string{}
 	jwCrashImagesOrder(s.img, sev, sstarts, sends, points, s.reverse, func(name string, img []byte, lo, hi int) {
 		n++
-		if msg := jwCheckImage(img, lo, hi, states, base, s.jbase, s.direct); msg != "" {
+		if msg := jwCheckImage(img, lo, hi, states, base, s.jbase, s.direct, s.observe); msg != "" {
 			bad = append(bad, name+": "+msg)
 		}
 	})
@@ -508,7 +526,12 @@ func TestJournalWriterCrashOracleFallback(t *testing.T) {
 	ops := []jwOp{
 		func(v *Volume) error { return v.MkDir("/d000", 0o755) },
 		func(v *Volume) error { return v.MkDir("/d001", 0o755) },
-		func(v *Volume) error { return v.WriteFile("/d002", fill(5000, 9), 0o644) },
+		func(v *Volume) error {
+			// Data that does not fit the journal takes the direct path (data that fits is
+			// journaled: journal_data_test.go).
+			v.jw.prevSize = 0x40000 - 512 - 4096
+			return v.WriteFile("/d002", fill(5000, 9), 0o644)
+		},
 		func(v *Volume) error { return v.MkDir("/d003", 0o755) },
 		func(v *Volume) error { return v.MkDir("/d004", 0o755) },
 	}

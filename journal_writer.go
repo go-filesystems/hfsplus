@@ -93,6 +93,11 @@ type journalWriter struct {
 	// scrubbed: this session's ring scrub has run (scrubRing); it runs once, before
 	// the first journaled commit writes anything.
 	scrubbed bool
+	// sets: the byte ranges T_{k-1} and T_k journaled after commit k (T_{k-2} and
+	// T_{k-1} for commit k+1), zones: their cover in allocation blocks, the blocks the
+	// revoke rule (design section 6) applies to. Both empty when no transaction is live.
+	sets  [2][]span
+	zones []span
 }
 
 // EnableJournalWrites opts the volume in to journal writes (see the comment at
@@ -388,41 +393,20 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	runs := journalRuns(meta, hp, ha)
-	if len(runs) == 0 || len(runs) > jwMaxRuns {
-		return false, nil
+	// The staged file data (journal_data.go): the revoke-forced blocks are always in
+	// the transaction, the candidates when they pass the same checks as metadata and
+	// fit; otherwise they are the ordered data of the large path (design section 6).
+	cand := v.jdata
+	runs, tsize, ok := jw.plan(meta, hp, ha, v.jforced, cand)
+	if !ok && len(cand) > 0 {
+		cand = nil
+		runs, tsize, ok = jw.plan(meta, hp, ha, v.jforced, nil)
 	}
-	// A block of the journal is whole sectors (binfo.bnum counts jhdr_size units); a
-	// run that is not (a region whose logical size comes from the image, alloc.go)
-	// takes the direct path.
-	for _, r := range runs {
-		if r.off%jwBlockSize != 0 || len(r.data)%jwBlockSize != 0 {
-			return false, nil
-		}
-	}
-	// Risk 5 (design section 11; hfsplus#56): replay follows, past end, any sector
-	// that verifies as a block list header, and the blocks of this transaction are
-	// bytes a user chose (file names in catalog nodes). A transaction that carries
-	// such a sector takes the direct path, so a forged list never reaches the ring.
-	if forgedSector(runs) {
+	if !ok {
 		return false, nil
 	}
 	hdr := jw.loc.hdr
 	size, jh := hdr.size, uint64(hdr.jhdrSize)
-	tsize := uint64(jwBlockSize)
-	for _, r := range runs {
-		tsize += uint64(len(r.data))
-	}
-	// Invariant D: the live region during commit k is T_{k-2}, T_{k-1} and T_k, and
-	// the journal is never perfectly full (TN1150, Journal; free_space,
-	// hfs_journal.c:2382-2396).
-	var live uint64
-	if jw.active {
-		live = jw.prevSize + jw.prev2
-	}
-	if live+tsize >= size-jh {
-		return false, nil
-	}
 
 	pOff := int64(volumeHeaderOffset)
 	var seq uint32
@@ -450,6 +434,20 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 			return false, err
 		}
 		jw.scrubbed = true
+	}
+	// Large data (design section 6): in place, made durable by a barrier before the
+	// commit below, so a replay of T_k never shows a file whose bytes did not land.
+	// The blocks are unreferenced by anything durable and outside the revoke zones.
+	if len(cand) == 0 {
+		if err := v.writeOrdered(); err != nil {
+			return false, err
+		}
+	}
+	if v.dataDirty {
+		if err := v.fsync(); err != nil {
+			return false, err
+		}
+		v.dataDirty = false
 	}
 	txn := encodeTxn(jw.enc, seq, runs)
 	if err := jw.ringWrite(v, at, txn); err != nil {
@@ -499,9 +497,13 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	}
 	if first {
 		jw.prev2, jw.prevSize = 0, 0
+		jw.sets[0] = nil
 	} else {
 		jw.prev2 = jw.prevSize
+		jw.sets[0] = jw.sets[1]
 	}
+	jw.sets[1] = spansOf(runs)
+	jw.zones = zonesOf(int64(v.vh.BlockSize), jw.sets[0], jw.sets[1])
 	jw.prevSize = tsize
 	jw.prevStart, jw.prevEnd, jw.prevSeq = at, end, seq
 	jw.lastSeq, jw.end, jw.active = seq, end, true
@@ -531,8 +533,48 @@ func (v *Volume) emptyJournal() error {
 		return err
 	}
 	jw.active = false
+	jw.sets, jw.zones = [2][]span{}, nil
 	v.touched = false
 	return nil
+}
+
+// plan builds the transaction of a commit: the metadata, the two headers, the
+// revoke-forced data and the data candidates, as the blocks of one block list. It
+// reports ok = false, having written nothing, when the commit cannot be one
+// journal transaction: no change, more than 30 blocks, a block that is not whole
+// sectors, a sector that verifies as a block list header (risk 5, design section
+// 11; hfsplus#56: replay follows, past end, such a sector, and these are bytes a
+// user chose), or no room (invariant D: the live region during commit k is
+// T_{k-2}, T_{k-1} and T_k, and the journal is never perfectly full, TN1150
+// Journal; free_space, hfs_journal.c:2382-2396).
+func (jw *journalWriter) plan(meta, hp, ha, forced, cand []writeRun) (runs []writeRun, tsize uint64, ok bool) {
+	runs = journalRuns(meta, hp, ha, forced, cand)
+	if len(runs) == 0 || len(runs) > jwMaxRuns {
+		return nil, 0, false
+	}
+	// A block of the journal is whole sectors (binfo.bnum counts jhdr_size units); a
+	// run that is not (a region whose logical size comes from the image, alloc.go)
+	// takes the direct path.
+	for _, r := range runs {
+		if r.off%jwBlockSize != 0 || len(r.data)%jwBlockSize != 0 {
+			return nil, 0, false
+		}
+	}
+	if forgedSector(runs) {
+		return nil, 0, false
+	}
+	tsize = uint64(jwBlockSize)
+	for _, r := range runs {
+		tsize += uint64(len(r.data))
+	}
+	var live uint64
+	if jw.active {
+		live = jw.prevSize + jw.prev2
+	}
+	if live+tsize >= jw.loc.hdr.size-uint64(jw.loc.hdr.jhdrSize) {
+		return nil, 0, false
+	}
+	return runs, tsize, true
 }
 
 // closeJournal is Close for a volume with transactions in its journal: empty the
