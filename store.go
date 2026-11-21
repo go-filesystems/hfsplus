@@ -252,11 +252,17 @@ func (v *Volume) putAt(p []byte, off int64) error {
 // fsync makes what was written durable, when the backing writer can.
 func (v *Volume) fsync() error {
 	if v.wa == nil {
+		if v.jw != nil {
+			v.jw.pending = false
+		}
 		return nil
 	}
 	if s, ok := v.wa.(interface{ Sync() error }); ok {
 		if err := s.Sync(); err != nil {
 			return fmt.Errorf("hfsplus: sync: %w", err)
+		}
+		if v.jw != nil {
+			v.jw.pending = false
 		}
 	}
 	return nil

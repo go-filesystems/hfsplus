@@ -25,7 +25,9 @@ import (
 //   - direct path: a commit that carries file data (user data is not journaled
 //     in this PR: design section 11, risk 5); a commit with a sector that
 //     verifies as a block list header (forgedSector); a commit with more than 30
-//     runs or one that does not fit the journal; every durability level but Strict; and a
+//     runs or one that does not fit even an empty journal (the bypass: the journal is
+//     emptied, then today's strict path, which writes 'GoHF', store.go flush);
+//     every durability level but Strict; and a
 //     volume for which EnableJournalWrites refused (not journaled, journal not
 //     inside the volume or never initialised, jhdr_size other than 512, or any
 //     check of section 4 failing).
@@ -40,6 +42,13 @@ import (
 // then T_k's blocks in place. H_k never names T_k: replay reaches it by reading
 // past end (hfs_journal.c:1211-1300), the way macOS reaches the transaction its
 // last F_FULLFSYNC wrote.
+//
+// Journal full (PR 5, design section 7): a commit that fits an empty journal but not
+// the live one (invariant D) empties it (2 barriers) and goes in as a first commit
+// (2 more) numbered seq(T_{k-1}) + 1, without the session bump and without a second
+// scrub. Close commits T_c with the unmounted bit (1 barrier), then empties the
+// journal (2): journal_close, hfs_journal.c:2252-2356. Sync costs one barrier when
+// in-place writes are pending (jw.pending), none otherwise.
 //
 // The first journaled commit of a session starts with scrubRing (hfsplus#58): it
 // zeroes any sector of the ring that verifies as a block list header, then one
@@ -93,6 +102,15 @@ type journalWriter struct {
 	// scrubbed: this session's ring scrub has run (scrubRing); it runs once, before
 	// the first journaled commit writes anything.
 	scrubbed bool
+	// pending: in-place writes of a transaction were issued since the last barrier
+	// (cleared by fsync); Sync issues a barrier only when it is set.
+	pending bool
+	// fullCommits counts the commits that found the journal full and emptied it
+	// first (design section 7).
+	fullCommits int
+	// closing: closeJournal's T_c is being planned, its headers keep the unmounted
+	// bit the volume had at open.
+	closing bool
 	// sets: the byte ranges T_{k-1} and T_k journaled after commit k (T_{k-2} and
 	// T_{k-1} for commit k+1), zones: their cover in allocation blocks, the blocks the
 	// revoke rule (design section 6) applies to. Both empty when no transaction is live.
@@ -297,6 +315,9 @@ func (v *Volume) journalHeaderRuns(off int64) ([]writeRun, error) {
 	b := slices.Clone(buf)
 	copy(b[vhLastMountedVersion:], "HFSJ")
 	b[vhAttributes+2] &^= kHFSVolumeUnmountedBit >> 8
+	if v.jw.closing && v.cleanOnDisk {
+		b[vhAttributes+2] |= kHFSVolumeUnmountedBit >> 8 // T_c: the clean mark (design section 7)
+	}
 	b[vhAttributes+2] |= kHFSVolumeJournaledBit >> 8
 	return changedRuns(&region{off: off, buf: b, orig: v.regions[off].orig}), nil
 }
@@ -397,13 +418,32 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	// the transaction, the candidates when they pass the same checks as metadata and
 	// fit; otherwise they are the ordered data of the large path (design section 6).
 	cand := v.jdata
-	runs, tsize, ok := jw.plan(meta, hp, ha, v.jforced, cand)
+	runs, tsize, ok := jw.plan(meta, hp, ha, v.jforced, cand, false)
 	if !ok && len(cand) > 0 {
 		cand = nil
-		runs, tsize, ok = jw.plan(meta, hp, ha, v.jforced, nil)
+		runs, tsize, ok = jw.plan(meta, hp, ha, v.jforced, nil, false)
+	}
+	// Journal full (design section 7): T_k does not fit beside T_{k-2} and T_{k-1}
+	// but fits an empty journal. Empty it (2 barriers) and commit T_k as a first
+	// commit (2 more) instead of taking the direct path.
+	full := false
+	if !ok && jw.active {
+		cand = v.jdata
+		runs, tsize, ok = jw.plan(meta, hp, ha, v.jforced, cand, true)
+		if !ok && len(cand) > 0 {
+			cand = nil
+			runs, tsize, ok = jw.plan(meta, hp, ha, v.jforced, nil, true)
+		}
+		full = ok
 	}
 	if !ok {
 		return false, nil
+	}
+	if full {
+		if err := v.emptyJournal(); err != nil {
+			return false, err
+		}
+		jw.fullCommits++
 	}
 	hdr := jw.loc.hdr
 	size, jh := hdr.size, uint64(hdr.jhdrSize)
@@ -420,7 +460,13 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 		if h.start != h.end {
 			return false, fmt.Errorf("%w: the journal holds transactions the writer did not write (start %d, end %d)", ErrJournaled, h.start, h.end)
 		}
-		seq = skipZeroSeq(h.sequenceNum + uint32(size/jh) + 1) // hfs_journal.c:2097-2099
+		if full {
+			// Journal full: every number still in the ring is at most seq(T_{k-1}), the
+			// header's, so no session-start bump is needed (design section 7).
+			seq = skipZeroSeq(h.sequenceNum + 1)
+		} else {
+			seq = skipZeroSeq(h.sequenceNum + uint32(size/jh) + 1) // hfs_journal.c:2097-2099
+		}
 		at = jw.wrap(h.end)
 	} else {
 		seq = skipZeroSeq(jw.lastSeq + 1)
@@ -495,6 +541,7 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 			return false, err
 		}
 	}
+	jw.pending = true
 	if first {
 		jw.prev2, jw.prevSize = 0, 0
 		jw.sets[0] = nil
@@ -547,7 +594,10 @@ func (v *Volume) emptyJournal() error {
 // user chose), or no room (invariant D: the live region during commit k is
 // T_{k-2}, T_{k-1} and T_k, and the journal is never perfectly full, TN1150
 // Journal; free_space, hfs_journal.c:2382-2396).
-func (jw *journalWriter) plan(meta, hp, ha, forced, cand []writeRun) (runs []writeRun, tsize uint64, ok bool) {
+//
+// emptyJ asks whether the commit fits an empty journal (the journal-full path
+// empties the journal first), not the live one.
+func (jw *journalWriter) plan(meta, hp, ha, forced, cand []writeRun, emptyJ bool) (runs []writeRun, tsize uint64, ok bool) {
 	runs = journalRuns(meta, hp, ha, forced, cand)
 	if len(runs) == 0 || len(runs) > jwMaxRuns {
 		return nil, 0, false
@@ -568,7 +618,7 @@ func (jw *journalWriter) plan(meta, hp, ha, forced, cand []writeRun) (runs []wri
 		tsize += uint64(len(r.data))
 	}
 	var live uint64
-	if jw.active {
+	if jw.active && !emptyJ {
 		live = jw.prevSize + jw.prev2
 	}
 	if live+tsize >= jw.loc.hdr.size-uint64(jw.loc.hdr.jhdrSize) {
@@ -580,12 +630,28 @@ func (jw *journalWriter) plan(meta, hp, ha, forced, cand []writeRun) (runs []wri
 // closeJournal is Close for a volume with transactions in its journal: empty the
 // journal, then put the clean mark back in both headers (alternate first), so the
 // volume is left as macOS leaves it after unmount: an empty journal, 'HFSJ', and
-// the unmounted bit if it was set at open. (Design section 7 commits a T_c for
-// this; PR 5 does, this PR writes the headers in place once the journal is
-// empty, which is crash-safe for the same reason: nothing replays.)
+// the unmounted bit if it was set at open. When the clean mark is to be put back
+// it is a T_c commit (design section 7); only when T_c cannot be a transaction
+// does it write the headers in place once the journal is empty, which is
+// crash-safe because nothing replays.
 func (v *Volume) closeJournal() error {
 	if !v.journaling() {
 		return nil
+	}
+	if v.cleanOnDisk {
+		// Design section 7, as journal_close does (2252-2356): T_c carries both headers
+		// with the unmounted bit (1 barrier, T_c in place), then the empty header with
+		// start = end = end(T_c) and seq(T_c) (2 barriers): 3 in all.
+		v.jw.closing = true
+		done, err := v.flushJournal(nil)
+		v.jw.closing = false
+		v.commitDone()
+		if err != nil {
+			return err
+		}
+		if done {
+			return v.emptyJournal()
+		}
 	}
 	if err := v.emptyJournal(); err != nil {
 		return err

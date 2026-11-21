@@ -125,8 +125,8 @@ func TestJournalWriterBarriersAndState(t *testing.T) {
 	}
 	// Close leaves what macOS leaves: an empty journal, 'HFSJ', the clean mark.
 	onDisk, _ = os.ReadFile(path)
-	if h := journalHeaderOf(t, onDisk, jbase); h.start != h.end || h.sequenceNum != seqs[2] {
-		t.Errorf("journal header after Close: start %d end %d seq %d, want empty, seq %d", h.start, h.end, h.sequenceNum, seqs[2])
+	if h := journalHeaderOf(t, onDisk, jbase); h.start != h.end || h.sequenceNum != seqs[2]+1 {
+		t.Errorf("journal header after Close: start %d end %d seq %d, want empty, seq(T_c) %d", h.start, h.end, h.sequenceNum, seqs[2]+1)
 	}
 	for _, off := range []int{volumeHeaderOffset, len(onDisk) - 1024} {
 		if string(onDisk[off+8:off+12]) != "HFSJ" || onDisk[off+vhAttributes+2]&(kHFSVolumeUnmountedBit>>8) == 0 {
@@ -272,38 +272,23 @@ func TestJournalWriterFallbacks(t *testing.T) {
 	must(v.MkDir("/b", 0o755))
 	seq := v.jw.lastSeq
 
-	// File data that does not fit the journal (invariant D, forced live size): direct,
-	// with its data in place after the journal is emptied (2 barriers), then 3. (Data
-	// that fits is journaled: journal_data_test.go.)
+	// File data when the live journal is full (invariant D, forced live size) but an
+	// empty one holds the commit: journal-full, 2 + 2 barriers, still journaled
+	// (design section 7). (Data that fits is journaled: journal_data_test.go.)
 	v.jw.prevSize = 0x80000 - 512 - 4096
 	before := c.syncs
 	must(v.WriteFile("/f.bin", fill(5000, 7), 0o644))
-	if got := c.syncs - before; got != 5 {
-		t.Errorf("a data commit after journal commits paid %d barriers, want 2 (empty the journal) + 3 (today's path)", got)
+	if got := c.syncs - before; got != 4 {
+		t.Errorf("a data commit on a full journal paid %d barriers, want 2 (empty the journal) + 2 (first commit)", got)
 	}
 	onDisk, _ := os.ReadFile(path)
-	if h := journalHeaderOf(t, onDisk, jbase); h.start != h.end || h.sequenceNum != seq {
-		t.Errorf("journal after the direct commit: start %d end %d seq %d, want empty, seq %d", h.start, h.end, h.sequenceNum, seq)
+	if h := journalHeaderOf(t, onDisk, jbase); h.start == h.end || h.sequenceNum != seq+1 {
+		t.Errorf("journal after the journal-full commit: start %d end %d seq %d, want live, seq %d", h.start, h.end, h.sequenceNum, seq+1)
 	}
-	if got := string(onDisk[vhLastMountedVersionOff : vhLastMountedVersionOff+4]); got != "GoHF" {
-		t.Errorf("after a direct commit lastMountedVersion = %q, want GoHF", got)
+	if !v.journaling() {
+		t.Error("the journal-full commit left the journal not live")
 	}
-	if v.journaling() {
-		t.Error("the writer thinks the journal is live")
-	}
-
-	// A metadata commit is a first commit again (2 barriers) with a bumped number.
-	before = c.syncs
 	must(v.MkDir("/c", 0o755))
-	if got := c.syncs - before; got != 2 {
-		t.Errorf("first commit after a fallback paid %d barriers, want 2", got)
-	}
-	if v.jw.lastSeq != seq+0x80000/512+1 {
-		t.Errorf("sequence %d, want %d (header + size/jhdr_size + 1)", v.jw.lastSeq, seq+0x80000/512+1)
-	}
-	if got := string(mustRead(t, path)[vhLastMountedVersionOff : vhLastMountedVersionOff+4]); got != "HFSJ" {
-		t.Errorf("after a journal commit lastMountedVersion = %q, want HFSJ", got)
-	}
 
 	// Too many runs: nothing is written, the caller falls back.
 	var many []writeRun
@@ -327,16 +312,25 @@ func TestJournalWriterFallbacks(t *testing.T) {
 		}
 	}
 
-	// A transaction that does not fit (invariant D): force the live size.
+	// A transaction that fits no journal, even an empty one: the bypass (a forged
+	// sector stands for it; the size bound itself is flushJournal's plan).
 	must(v.MkDir("/d", 0o755))
-	v.jw.prevSize = 0x80000 - 512 - 4096
 	before = c.syncs
-	must(v.MkDir("/e", 0o755))
+	must(plantForgedMkDir(v, "/e", binary.LittleEndian))
 	if v.journaling() {
-		t.Error("a commit that does not fit left the journal live")
+		t.Error("a bypass left the journal live")
 	}
 	if got := c.syncs - before; got != 5 {
-		t.Errorf("a commit that does not fit paid %d barriers, want 2 + 3", got)
+		t.Errorf("a bypass paid %d barriers, want 2 + 3", got)
+	}
+	if got := string(mustRead(t, path)[vhLastMountedVersionOff : vhLastMountedVersionOff+4]); got != "GoHF" {
+		t.Errorf("after a bypass lastMountedVersion = %q, want GoHF", got)
+	}
+	// A transaction bigger than the whole journal cannot be planned, empty or not.
+	hdr := v.jw.loc.hdr
+	big := []writeRun{{off: 2 << 20, data: fill(int(hdr.size), 1)}}
+	if _, _, ok := v.jw.plan(big, nil, nil, nil, nil, true); ok {
+		t.Error("a transaction larger than the journal was planned")
 	}
 	if got, err := v.ReadFile("/f.bin"); err != nil || !bytes.Equal(got, fill(5000, 7)) {
 		t.Errorf("f.bin: %d bytes, %v", len(got), err)

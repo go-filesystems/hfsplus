@@ -982,6 +982,23 @@ node. The writer also
    ordered path; staged bytes past the bound are spilled to in-place writes.
 5. **Journal full, bypass, Close/Sync, and switching levels.** The crash oracle
    across the wrap.
+   **Status: done in the PR that follows v0.16.0** (`journal_writer.go`,
+   `journal_writer_full_test.go`). Deviations: (a) after a bypass the next journaled
+   commit keeps the session-start bump (`header seq + size/jhdr + 1`), not
+   "emptied header number + 1" as section 7 says; the bump is safe (section 4) and
+   changing it would add risk for no gain; journal-full does use previous + 1.
+   (b) The direct path already writes `GoHF` (`store.go`, `stampLastMountedVersion`
+   in `flush`), so the bypass needed no new write. (c) `Close` takes the T_c path
+   only when the volume was clean at open (`cleanOnDisk`); otherwise it only
+   empties the journal (2 barriers), since T_c would change nothing. If T_c finds
+   the journal full, Close pays the journal-full commit (4) plus the emptying (2).
+   (d) Sync tracks "pending" (in-place writes since the last barrier) in the
+   writer; a journal-mode volume whose last write was a direct path pays none.
+   (e) The size bound of section 6 (`size/8`) keeps three transactions under the
+   threshold, so journal-full is not reached by the ordinary API; the tests force
+   it by raising the live size. Bypass-after-emptying and bypass-first are now run
+   by the oracle (`TestJournalWriterCrashOracleBypass`, and on darwin the
+   fsck/mount sequence in `TestDarwinJournalWriterFallbackFsck`).
 6. **Default on** for Strict and Mounted. The measurement table, plus README,
    docs site and landing page.
 7. **Lazy/Batch as an in-memory group commit** (atomic Batch).
