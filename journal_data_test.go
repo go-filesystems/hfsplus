@@ -378,6 +378,14 @@ func TestJournalDataFlushesStagedWithoutMetadata(t *testing.T) {
 	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
 	v, _, path := jwFile(t, img, true)
 	defer v.Close()
+	// Nothing changed, nothing staged: no barrier, no transaction.
+	c0 := mustRead(t, path)
+	if err := v.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end || !bytes.Equal(c0, mustRead(t, path)) {
+		t.Error("a flush with nothing to write wrote")
+	}
 	if err := v.writeData(pat(512, 1), 1<<20); err != nil {
 		t.Fatal(err)
 	}
