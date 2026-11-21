@@ -8,6 +8,7 @@ package hfsplus
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,7 +87,18 @@ func TestDarwinJournalWriterDataKernelReplay(t *testing.T) {
 	darwinKernelReplay(t, "JWDATA", ops, observeFiles, mountView)
 }
 
+// TestDarwinJournalWriterFullKernelReplay (PR 5): journal-full commits, then
+// Close's T_c, every crash image handed to macOS.
+func TestDarwinJournalWriterFullKernelReplay(t *testing.T) {
+	ops := []jwOp{mkdirOps(1)[0], fullOp("/d001"), mkdirOps(3)[2], fullOp("/d003")}
+	darwinKernelReplayTail(t, "JWFULL", ops, func(v *Volume) error { return v.Close() }, nil, nil)
+}
+
 func darwinKernelReplay(t *testing.T, vol string, ops []jwOp, observe jwObserver, view func(string) []string) {
+	darwinKernelReplayTail(t, vol, ops, nil, observe, view)
+}
+
+func darwinKernelReplayTail(t *testing.T, vol string, ops []jwOp, tail jwOp, observe jwObserver, view func(string) []string) {
 	if os.Getenv("HFSPLUS_JOURNAL_ORACLE") != "1" {
 		t.Skip("set HFSPLUS_JOURNAL_ORACLE=1")
 	}
@@ -110,7 +122,7 @@ func darwinKernelReplay(t *testing.T, vol string, ops []jwOp, observe jwObserver
 			return kn
 		}
 	}
-	s := jwScenario{name: "apple-jnl", img: base, ops: ops, observe: observe}
+	s := jwScenario{name: "apple-jnl", img: base, ops: ops, tail: tail, observe: observe}
 	ev, starts, ends, states, _, syncs := runJWScenario(t, s)
 	for i := range states {
 		states[i] = dOnly(states[i])
@@ -263,6 +275,11 @@ func TestDarwinJournalWriterFallbackFsck(t *testing.T) {
 		func(v *Volume) error { return v.WriteFile("/d002", fill(5000, 9), 0o644) },
 		func(v *Volume) error { return v.MkDir("/d003", 0o755) },
 		func(v *Volume) error { return v.MkDir("/d004", 0o755) },
+		// PR 5: journal-full, then a bypass right after the journal is emptied (a forged
+		// sector, 'GoHF' written), then journal commits again.
+		fullOp("/d005"),
+		func(v *Volume) error { return plantForgedMkDir(v, "/d006", binary.LittleEndian) },
+		func(v *Volume) error { return v.MkDir("/d007", 0o755) },
 	}
 	check := func(label string, want []string) {
 		t.Helper()

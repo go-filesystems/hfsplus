@@ -85,7 +85,9 @@ func TestJournalDataFaults(t *testing.T) {
 			if err := v.MkDir("/m", 0o755); err != nil { // makes the journal live
 				t.Fatal(err)
 			}
-			v.jw.prevSize = 0x40000 - 512 - 100
+			// A journal in which nothing fits, empty or not (a full one would take the
+			// journal-full path, design section 7, not the direct one swept here).
+			v.jw.loc.hdr.size = 1024
 		}, func(v *Volume) error {
 			err := v.WriteFile("/b", pat(300, 8), 0o644)
 			if err == nil && v.journaling() {
@@ -97,7 +99,7 @@ func TestJournalDataFaults(t *testing.T) {
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
 			setup(v)
-			v.jw.prevSize = 0x40000 - 512 - 4096
+			v.jw.loc.hdr.size = 1024
 		}, func(v *Volume) error { return v.WriteFile("/b", pat(8192, 8), 0o644) })
 	})
 }

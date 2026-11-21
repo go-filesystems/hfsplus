@@ -187,6 +187,14 @@ func (v *Volume) flushHeld(meta, hdrP, hdrA []writeRun, old []byte, journaled bo
 // primary) after a barrier that makes every sector durable first. A volume that
 // failed is left as it is, dirty.
 func (v *Volume) settle() error {
+	if v.jw != nil && !v.held && !v.unsynced {
+		// Journal mode (design section 7): every commit is already durable; one barrier
+		// if in-place writes are pending since the last one, nothing otherwise.
+		if v.jw.pending {
+			return v.fsync()
+		}
+		return nil
+	}
 	if v.unsynced || !v.held {
 		if err := v.fsync(); err != nil {
 			return err
