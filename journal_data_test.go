@@ -373,6 +373,25 @@ func TestJournalDataForcedForgedFallsBack(t *testing.T) {
 
 // Staged data of an abandoned transaction is forgotten, and a failed commit leaves
 // nothing staged for the next one.
+// Staged data with no metadata change is still a commit: flush must not return early.
+func TestJournalDataFlushesStagedWithoutMetadata(t *testing.T) {
+	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
+	v, _, path := jwFile(t, img, true)
+	defer v.Close()
+	if err := v.writeData(pat(512, 1), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if v.hasStaged() {
+		t.Error("data still staged after flush")
+	}
+	if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start == h.end {
+		t.Error("flush wrote no transaction for the staged data")
+	}
+}
+
 func TestJournalDataDiscardForgets(t *testing.T) {
 	img, _ := journalImage(t, 0x40000, 100, 0x4400)
 	v, _, _ := jwFile(t, img, true)
