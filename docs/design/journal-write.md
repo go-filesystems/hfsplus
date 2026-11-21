@@ -973,7 +973,10 @@ node. The writer also
    **Status: done in v0.16.0** (`journal_data.go`). Deviations: a revoke-forced
    block that carries a forged sector makes the commit take the direct path
    (journal emptied first) rather than the allocator skipping it; zones are
-   checked per allocation block and only for file data, not B-tree growth;
+   checked per allocation block and only for file data, not B-tree growth.
+   That is safe because B-tree nodes are always journaled, or written after
+   the journal is emptied, and `stageData` forces every write that falls in a
+   zone into the journal, whatever allocated the block;
    large data stays out of the ring except revoke-forced blocks; a plan that
    fails with candidates (30-run limit, no fit) puts the candidates on the
    ordered path; staged bytes past the bound are spilled to in-place writes.

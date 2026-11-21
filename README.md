@@ -273,7 +273,9 @@ than `F_FULLFSYNC`; this driver does not offer it and this PR does not change th
 of data per commit. **Small data** (staged bytes within the bound) goes into the transaction with the
 metadata: one barrier (2 on a session's first commit). **Large data** is written in place first, then a
 barrier, then the metadata commit: two barriers (3 on the first). Staged data over the bound is spilled to
-in-place writes, so the staging buffer is bounded. **Revoke rule:** replay copies every block of every
+in-place writes. Blocks the revoke rule forces into the journal are staged without a bound of their own:
+today the allocator keeps them within the small-data bound, and file creation is the only caller
+(go-filesystems/hfsplus#61). **Revoke rule:** replay copies every block of every
 transaction in the ring, in order, so a block journaled in T(k-2), T(k-1) or T(k) that is later freed and
 reused as file data must not be written in place, or a replay would overwrite it with the old bytes. A
 newly allocated data block inside that window is therefore journaled in the new transaction (the allocator
