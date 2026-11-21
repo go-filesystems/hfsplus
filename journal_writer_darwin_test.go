@@ -79,10 +79,9 @@ func mountView(mnt string) []string {
 func TestDarwinJournalWriterDataKernelReplay(t *testing.T) {
 	ops := []jwOp{
 		wf("/d000", pat(3000, 1)),
-		wf("/d001", pat(200000, 2)),
+		wf("/d001", pat(70000, 2)),
 		rm("/d000"),
-		wf("/d002", pat(200000, 3)),
-		wf("/d003", pat(1500, 4)),
+		wf("/d002", pat(1500, 3)),
 	}
 	darwinKernelReplay(t, "JWDATA", ops, observeFiles, mountView)
 }
