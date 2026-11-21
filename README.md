@@ -122,6 +122,22 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   5.13 ms; `Strict` 12.66 ms (2.47x); `Mounted` 8.20 ms (1.60x); `Lazy` 0.095 ms (not durable until
   `Sync`). The same 6 barriers over plain fsync(2) cost 0.29 ms, so the gap is the `F_FULLFSYNC` count.
   Closing it is hfsplus#45 (journal writes); the design is `docs/design/journal-write.md`.
+
+  Re-measured at v0.16.0 (2026-11-21, 1-min load 4.85 to 5.29 before and after, same test, 30 interleaved
+  rounds, medians of rounds 2-30), create + 1 byte + fsync:
+
+  | Driver | Time | Barriers |
+  |---|--:|--:|
+  | macOS, HFS+ | 5.24 ms | (kernel) |
+  | macOS, Journaled HFS+ | 9.41 ms | (kernel) |
+  | `Strict`, Journaled HFS+ image | 13.41 ms | 3 |
+  | `Mounted` | 8.84 ms | 2 |
+  | `EnableJournalWrites`, Journaled HFS+ image | **4.37 ms** | 1 |
+
+  On a journaled image, journal writes are 3.1x faster than `Strict` and 2.2x faster than macOS's own driver
+  on the same kind of volume. mkdir and Chtimes are metadata-only: they cost 4.24 ms and 4.27 ms, the same as
+  `Mounted` (one barrier each). One run on one machine; the first round of each, which includes the session's
+  first commit, is reported apart in the test log.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
@@ -264,7 +280,9 @@ them and `fsck_hfs -fn` then exits 0. The volume is not inconsistent; why fsck's
 **Cost.** Each barrier is `F_FULLFSYNC`. In one indicative run (load 4-5, 5-minute average 8.6) a steady-state
 metadata commit (1 barrier) took 4.2 ms, the first commit of a session (2 barriers) 8.7 ms, against 12.8 ms for
 today's strict path (3 barriers) and 8.6 / 10.3 ms for macOS's own create / mkdir on Journaled HFS+.
-The design's 2.5-3 ms estimate is not met. A hypothesis, **not measured**: the kernel's journal barrier is
+Since v0.16.0 a commit with small file data also takes 1 barrier: 4.37 ms for create + 1 byte + fsync
+on a quiet machine, against 9.41 ms for macOS on Journaled HFS+ (table above). The design's 2.5-3 ms
+estimate is still not met, because one `F_FULLFSYNC` costs about 4 ms here. A hypothesis, **not measured**: the kernel's journal barrier is
 `DKIOCSYNCHRONIZE` with the barrier option (`hfs_journal.c:469-482`), roughly `F_BARRIERFSYNC` and cheaper
 than `F_FULLFSYNC`; this driver does not offer it and this PR does not change the barrier.
 
