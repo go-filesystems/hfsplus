@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -74,6 +75,15 @@ func TestJournalDataFaults(t *testing.T) {
 	})
 	t.Run("revoke forced", func(t *testing.T) {
 		faultSweep(t, "forced", setup, func(v *Volume) error { return v.WriteFile("/b", pat(8192, 8), 0o644) })
+	})
+	t.Run("forged candidate takes the ordered path", func(t *testing.T) {
+		data := append(pat(512, 2), forgedHeader(binary.LittleEndian, 0)...)
+		faultSweep(t, "ordered", nil, func(v *Volume) error { return v.WriteFile("/f", data, 0o644) })
+	})
+	t.Run("direct fallback with candidates", func(t *testing.T) {
+		faultSweep(t, "fallback-small", func(v *Volume) {
+			v.jw.prevSize = 0x40000 - 512 - 4096
+		}, func(v *Volume) error { return v.WriteFile("/b", pat(300, 8), 0o644) })
 	})
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
