@@ -5,11 +5,9 @@ package hfsplus
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"slices"
-	"strings"
 	"testing"
 )
 
@@ -131,8 +129,9 @@ func TestJournalBypassBarriersAndNumbering(t *testing.T) {
 	if err := v.MkDir("/d", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if v.jw.lastSeq <= seq+1 {
-		t.Errorf("first commit after a bypass numbered %d, want above %d (session bump)", v.jw.lastSeq, seq+1)
+	hdr := v.jw.loc.hdr
+	if want := skipZeroSeq(seq + uint32(hdr.size/uint64(hdr.jhdrSize)) + 1); v.jw.lastSeq != want {
+		t.Errorf("first commit after a bypass numbered %d, want %d (header seq + size/jhdr + 1)", v.jw.lastSeq, want)
 	}
 	if !v.journaling() {
 		t.Error("the journal did not resume")
@@ -454,7 +453,7 @@ func TestJournalFullAndCloseFaults(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			return closeErr(v.Close())
+			return v.Close()
 		})
 	})
 	t.Run("close finds the journal full", func(t *testing.T) {
@@ -463,16 +462,45 @@ func TestJournalFullAndCloseFaults(t *testing.T) {
 				return err
 			}
 			forceFull(v)
-			return closeErr(v.Close())
+			return v.Close()
 		})
 	})
 }
 
-// closeErr maps Close's sticky "an earlier write failed" error, which carries the
-// cause as text, back to the injected one.
-func closeErr(err error) error {
-	if err != nil && !errors.Is(err, errInjected) && strings.Contains(err.Error(), errInjected.Error()) {
-		return errInjected
+// What the public API reaches on the smallest journal the driver accepts (256 KiB,
+// journal.go: Apple's journal_open range; EnableJournalWrites' own 16 KiB floor is
+// never reached because the loader refuses below 256 KiB first). Measured: a mkdir
+// or a delete is a transaction of 3.5 KiB, a file of up to size/8 = 32 KiB of data
+// one of about 24 KiB beside its metadata, and revoke-forced data is bounded by the
+// same size/8 (the allocator skips the zone once it is spent). Three such
+// transactions stay far under the journal-full threshold, so on the volumes this
+// suite can build only the forced states (forceFull, a forged sector, a shrunk
+// loc.hdr.size) reach journal-full and the bypass; this test pins that bound, so a
+// change that makes ordinary commits larger fails here and gets a natural scenario.
+func TestJournalOrdinaryCommitsStayUnderFull(t *testing.T) {
+	img, _ := journalImage(t, 0x40000, 100, 0x4400)
+	v, _, _ := jwFile(t, img, true)
+	defer v.Close()
+	hdr := v.jw.loc.hdr
+	limit := hdr.size - uint64(hdr.jhdrSize)
+	var largest uint64
+	step := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		largest = max(largest, v.jw.prevSize)
 	}
-	return err
+	for r := 0; r < 4; r++ {
+		step(v.MkDir(fmt.Sprintf("/d%d", r), 0o755))
+		step(v.WriteFile("/a", pat(int(v.jw.dataBound()), byte(r)), 0o644))
+		step(v.DeleteFile("/a"))
+	}
+	if 3*largest >= limit {
+		t.Errorf("three transactions of %d bytes reach the journal-full threshold %d: add a natural scenario", largest, limit)
+	}
+	if v.jw.fullCommits != 0 {
+		t.Errorf("%d journal-full commits through ordinary operations", v.jw.fullCommits)
+	}
+	t.Logf("largest ordinary transaction %d bytes, threshold %d", largest, limit)
 }

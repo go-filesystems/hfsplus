@@ -994,10 +994,20 @@ node. The writer also
    the journal full, Close pays the journal-full commit (4) plus the emptying (2).
    (d) Sync tracks "pending" (in-place writes since the last barrier) in the
    writer; a journal-mode volume whose last write was a direct path pays none.
-   (e) The size bound of section 6 (`size/8`) keeps three transactions under the
-   threshold, so journal-full is not reached by the ordinary API; the tests force
-   it by raising the live size. Bypass-after-emptying and bypass-first are now run
-   by the oracle (`TestJournalWriterCrashOracleBypass`, and on darwin the
+   (e) Journal-full and the size-based bypass are possible in production but not
+   reached by the ordinary operations on the volumes the tests can build. The
+   loader refuses journals under 256 KiB (`journal.go`, Apple's `journal_open`
+   range), so on the smallest journal a `MkDir` or a delete is a 3.5 KiB
+   transaction and a file of `size/8` = 32 KiB of data one of about 24 KiB, and
+   revoke-forced data is bounded by the same `size/8` (the allocator skips the
+   zone once it is spent): `TestJournalOrdinaryCommitsStayUnderFull` pins that
+   three of them stay far under the threshold. What can exceed it is a run that
+   scales with the allocation span, such as the bitmap runs of an allocation
+   spread over several GiB (by reading `plan`; not measured here), or a block
+   list of more than `jwMaxRuns` runs. The tests therefore force the state
+   (`forceFull`, a forged sector, a shrunk `loc.hdr.size`); no scenario reaches
+   it through the public API alone. Bypass-after-emptying and bypass-first are
+   run by the oracle (`TestJournalWriterCrashOracleBypass`, and on darwin the
    fsck/mount sequence in `TestDarwinJournalWriterFallbackFsck`).
 6. **Default on** for Strict and Mounted. The measurement table, plus README,
    docs site and landing page.

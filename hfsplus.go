@@ -475,7 +475,7 @@ func (v *Volume) Close() error {
 		// clean marks back. A failed volume, at any level (a strict commit that
 		// failed mid-write holds nothing, but is not consistent), gets Sync's
 		// latched ErrVolumeFailed.
-		serr = v.Sync()
+		serr = errors.Join(serr, v.Sync())
 	}
 	if v.wr {
 		v.closed = true
