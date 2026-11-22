@@ -265,6 +265,7 @@ func TestWriteIntoEmptyJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	noJournal(v) // the in-place path
 	if err := v.WriteFile("/hello.txt", []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -308,6 +309,7 @@ func TestLargeWriteSparesJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	noJournal(v)
 	free := int(v.VolumeHeader().FreeBlocks)
 	data := bytes.Repeat([]byte{0xA5}, (free-16)*4096)
 	if err := v.WriteFile("/big", data, 0o644); err != nil {

@@ -315,6 +315,7 @@ func TestDarwinWriteIntoJournaledImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFileWritable on a journaled volume with an empty journal: %v", err)
 	}
+	noJournal(v) // this test covers the in-place path
 	if v.vh.Attributes&kHFSVolumeJournaledBit == 0 {
 		t.Fatal("hdiutil made a volume that is not journaled; the test proves nothing")
 	}

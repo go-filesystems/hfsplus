@@ -99,6 +99,32 @@ func darwinKernelReplay(t *testing.T, vol string, ops []jwOp, observe jwObserver
 }
 
 func darwinKernelReplayTail(t *testing.T, vol string, ops []jwOp, tail jwOp, observe jwObserver, view func(string) []string) {
+	darwinKernelReplayAt(t, vol, DurabilityStrict, nil, ops, tail, observe, view)
+}
+
+// TestDarwinJournalWriterMountedKernelReplay: the same oracle at DurabilityMounted
+// (a Mounted commit is the journal commit since PR 6), with a commit that falls
+// back in the middle (a forged sector: journal emptied, written in place, bracketed,
+// never held) followed by journal commits again, then Close. Every crash image goes
+// to macOS: mount, fsck_hfs -fn, the durability walk.
+func TestDarwinJournalWriterMountedKernelReplay(t *testing.T) {
+	ops := []jwOp{
+		mkdirOps(1)[0],
+		func(v *Volume) error { return plantForgedMkDir(v, "/d001", binary.LittleEndian) },
+		func(v *Volume) error { return v.MkDir("/d002", 0o755) },
+		func(v *Volume) error { return v.MkDir("/d003", 0o755) },
+	}
+	// Op 1 is the direct commit: a crash inside it leaves the volume dirty by design
+	// (fsck_hfs repairs it; TestDarwinCrashImagesFsck covers that path), so macOS may
+	// refuse to mount those images. The oracle checks every other crash point, in
+	// particular the journal commits before and after it.
+	darwinKernelReplayAt(t, "JWMOUNT", DurabilityMounted, []int{1}, ops, func(v *Volume) error { return v.Close() }, nil, nil)
+}
+
+// darwinKernelReplayAt runs the kernel-replay oracle at a durability level; direct
+// lists the ops that take the direct path, whose inner crash points are not offered
+// to the mount.
+func darwinKernelReplayAt(t *testing.T, vol string, dur Durability, direct []int, ops []jwOp, tail jwOp, observe jwObserver, view func(string) []string) {
 	if os.Getenv("HFSPLUS_JOURNAL_ORACLE") != "1" {
 		t.Skip("set HFSPLUS_JOURNAL_ORACLE=1")
 	}
@@ -122,7 +148,7 @@ func darwinKernelReplayTail(t *testing.T, vol string, ops []jwOp, tail jwOp, obs
 			return kn
 		}
 	}
-	s := jwScenario{name: "apple-jnl", img: base, ops: ops, tail: tail, observe: observe}
+	s := jwScenario{name: "apple-jnl", img: base, ops: ops, tail: tail, observe: observe, durability: dur}
 	ev, starts, ends, states, _, syncs := runJWScenario(t, s)
 	for i := range states {
 		states[i] = dOnly(states[i])
@@ -136,7 +162,19 @@ func darwinKernelReplayTail(t *testing.T, vol string, ops []jwOp, tail jwOp, obs
 	}
 	uniq := map[[32]byte]*cand{}
 	var order [][32]byte
-	jwCrashImages(base, sev, sstarts, sends, nil, func(name string, img []byte, lo, hi int) {
+	var points map[int]bool
+	if len(direct) > 0 {
+		points = map[int]bool{}
+		for p := 0; p <= len(sev); p++ {
+			points[p] = true
+		}
+		for _, k := range direct {
+			for p := sstarts[k] + 1; p < sends[k]; p++ {
+				delete(points, p)
+			}
+		}
+	}
+	jwCrashImages(base, sev, sstarts, sends, points, func(name string, img []byte, lo, hi int) {
 		k := sha256.Sum256(img)
 		if c, ok := uniq[k]; ok {
 			c.lo, c.hi = max(c.lo, lo), min(c.hi, hi)

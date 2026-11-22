@@ -12,22 +12,26 @@ import (
 )
 
 // The journal writer (docs/design/journal-write.md sections 4, 5 and 7;
-// hfsplus#45, PR 3). Behind an explicit opt-in, EnableJournalWrites, a Strict
-// commit on a journaled volume writes its metadata as a journal transaction
-// instead of in place first: one barrier per commit instead of three.
+// hfsplus#45, PR 3, on by default since PR 6). A commit at DurabilityStrict or
+// DurabilityMounted on a journaled volume writes its metadata as a journal
+// transaction instead of in place first: one barrier per commit instead of three
+// (Strict) or instead of a dirty span plus one (Mounted: the journal makes the
+// commit atomic, so the volume is never marked dirty). The writable opens turn it
+// on by calling EnableJournalWrites; when its checks fail the volume keeps writing
+// directly and JournalWritesReason says why.
 //
 // What it journals, and what falls back to the direct path (the one the driver
 // has always used, emptying the journal first when it is not empty):
 //
 //   - journaled: a commit that changes only metadata (B-tree nodes, bitmap
-//     sectors, the two volume headers), at DurabilityStrict, whose changed
+//     sectors, the two volume headers), at DurabilityStrict or DurabilityMounted, whose changed
 //     sectors make at most 30 runs and whose transaction fits (invariant D);
 //   - direct path: a commit that carries file data (user data is not journaled
 //     in this PR: design section 11, risk 5); a commit with a sector that
 //     verifies as a block list header (forgedSector); a commit with more than 30
 //     runs or one that does not fit even an empty journal (the bypass: the journal is
 //     emptied, then today's strict path, which writes 'GoHF', store.go flush);
-//     every durability level but Strict; and a
+//     DurabilityLazy and Batch (PR 7); and a
 //     volume for which EnableJournalWrites refused (not journaled, journal not
 //     inside the volume or never initialised, jhdr_size other than 512, or any
 //     check of section 4 failing).
@@ -118,13 +122,51 @@ type journalWriter struct {
 	zones []span
 }
 
-// EnableJournalWrites opts the volume in to journal writes (see the comment at
-// the top of journal_writer.go). It returns ErrJournalWritesUnavailable, with the
-// reason, when the volume is not journaled or its journal fails the checks of
-// section 4; the volume then keeps writing directly, unchanged. It must be called
-// on a writable volume, between mutations, and the journal must be empty (a
-// non-empty one is replayed at open, see replay_write.go).
+// autoJournal is what every writable open does last: it turns journal writes on
+// when EnableJournalWrites' checks pass, and otherwise leaves the volume writing
+// directly, silently, with the reason kept for JournalWritesReason.
+func (v *Volume) autoJournal() { _ = v.EnableJournalWrites() }
+
+// JournalWritesReason reports why the volume writes directly instead of through
+// its journal: nil when journal writes are on, ErrReadOnly for a read-only
+// volume, otherwise an error wrapping ErrJournalWritesUnavailable that says which
+// check failed (not journaled, journal never initialised, a writer that cannot
+// Sync, ...). A non-journaled volume always answers that error: it is the
+// expected case, not a fault.
+func (v *Volume) JournalWritesReason() error {
+	if !v.wr {
+		return ErrReadOnly
+	}
+	if v.closed {
+		return ErrClosed
+	}
+	return v.jwReason
+}
+
+// EnableJournalWrites turns journal writes on (see the comment at the top of
+// journal_writer.go). The writable opens already call it, so a caller needs it
+// only to retry after an open that fell back; it is a no-op when journal writes
+// are already on. It returns ErrJournalWritesUnavailable, with the reason, when
+// the volume is not journaled or its journal fails the checks of section 4; the
+// volume then keeps writing directly, unchanged. It must be called on a writable
+// volume, between mutations, and the journal must be empty (a non-empty one is
+// replayed at open, see replay_write.go).
 func (v *Volume) EnableJournalWrites() error {
+	err := v.enableJournalWrites()
+	if err == nil || errors.Is(err, ErrJournalWritesUnavailable) {
+		v.jwReason = err
+	}
+	return err
+}
+
+// journalLevel reports whether the current level takes the journal path when
+// journal writes are on: Strict and Mounted (design section 8). Lazy, and so
+// Batch, still write in place.
+func (v *Volume) journalLevel() bool {
+	return v.durability == DurabilityStrict || v.durability == DurabilityMounted
+}
+
+func (v *Volume) enableJournalWrites() error {
 	if !v.wr {
 		return ErrReadOnly
 	}

@@ -88,8 +88,10 @@ type Volume struct {
 	failed error
 	// closed: Close was called; mutations return ErrClosed.
 	closed bool
-	// jw is the journal writer, nil unless EnableJournalWrites succeeded.
-	jw *journalWriter
+	// jw is the journal writer, nil unless journal writes are on: the writable opens
+	// call EnableJournalWrites and keep the reason it refused in jwReason.
+	jw       *journalWriter
+	jwReason error
 	// altOff is the offset of the alternate volume header (see enableWrites).
 	altOff int64
 	// touched: the flush in progress has begun writing (a failure now leaves the
@@ -264,6 +266,7 @@ func OpenWritable(img []byte, wa io.WriterAt) (*Volume, error) {
 	}
 	v.img = img
 	v.wa = wa
+	v.autoJournal()
 	return v, nil
 }
 
@@ -390,6 +393,7 @@ func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
 		return nil, err
 	}
 	v.wa = rw
+	v.autoJournal()
 	return v, nil
 }
 

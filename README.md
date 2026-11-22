@@ -56,7 +56,7 @@ correctness test.
 
 **Out of scope** (as with the `btrfs`/`xfs` siblings — these are deliberate non-goals, not partial implementations):
 
-- **Journaling** — the driver does not write transactions (volumes are authored cleanly-unmounted); a non-empty `HFSJ` journal is replayed at a writable open, and by `Open(..., WithJournalReplay())` in memory, see below. A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were (since v0.12.3 the first commit that changes anything stamps `lastMountedVersion` = `GoHF` into both volume headers, journaled or not; not `HFSJ`, the driver does not maintain the journal). One whose journal holds transactions is replayed first when its `lastMountedVersion` is `HFSJ` (see "Writable opens replay it too" below) and refused with `ErrJournaled` otherwise; one whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch, or since v0.12.3 the Apple `journal_open` range checks: `jhdr_size` 0, journal size outside [256 KiB, 1 GiB], start/end 0, beyond the journal size or 1 GiB, or not a multiple of 512; three older checks stay stricter than Apple's and can refuse a journal macOS opens: the magic, where we accept only `JNLx` and Apple also accepts `JHDR`; the endian field; and the journal size recorded in the journal header against the Journal Info Block's, hfsplus#48) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused.
+- **Journaling** — since v0.18.0 a writable open of a journaled volume writes its commits as journal transactions at `DurabilityStrict` and `DurabilityMounted` (see "Writing through the journal" below; every other case, including non-journaled volumes, writes directly as described next). The rest of this bullet describes the direct path. A non-empty `HFSJ` journal is replayed at a writable open, and by `Open(..., WithJournalReplay())` in memory, see below. A **journaled** volume (`kHFSVolumeJournaledBit`, e.g. `hdiutil create -fs "Journaled HFS+"`) whose journal is **empty** (`start == end`, the state after a clean unmount) is opened read/write and written directly: macOS's replay at mount has nothing to copy over the written blocks, and the journal info block, journal and attribute are left as they were (since v0.12.3 the first commit that changes anything stamps `lastMountedVersion` = `GoHF` into both volume headers, journaled or not; not `HFSJ`, the driver does not maintain the journal). One whose journal holds transactions is replayed first when its `lastMountedVersion` is `HFSJ` (see "Writable opens replay it too" below) and refused with `ErrJournaled` otherwise; one whose journal cannot be verified (info block or journal outside the volume, other-device journal, bad magic or checksum, size mismatch, or since v0.12.3 the Apple `journal_open` range checks: `jhdr_size` 0, journal size outside [256 KiB, 1 GiB], start/end 0, beyond the journal size or 1 GiB, or not a multiple of 512; three older checks stay stricter than Apple's and can refuse a journal macOS opens: the magic, where we accept only `JNLx` and Apple also accepts `JHDR`; the endian field; and the journal size recorded in the journal header against the Journal Info Block's, hfsplus#48) is refused by `OpenWritable` / `OpenFileWritable` with `ErrJournaled`, because macOS would replay the journalled blocks over the driver's writes. Read-only `Open` is never refused.
 - **Do not write an image that is mounted.** macOS keeps its own view of a mounted volume (cached nodes, bitmap and headers) and the two clobber each other (see `detach` in `macos_validation_test.go`).
 - **Hardlinks / compression / resource forks / xattrs** — indirect-node hardlinks, decmpfs compression, resource forks, and the Attributes B-tree are not handled (compression is detected and rejected rather than returning wrong bytes).
 
@@ -95,6 +95,14 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   | `DurabilityStrict` (default) | 3 | 3 | 3 | 1 | yes | marked clean |
   | `DurabilityMounted` | 2 | 1 | 2 | 1 | yes | marked dirty until `Sync`/`Close` |
   | `DurabilityLazy` | 1 | 0 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
+  | `Strict` or `Mounted`, journaled volume, journal writes on (**default since v0.18.0**) | 2 | 1 | 1 (small data) | 0 or 1 | yes | mounted, journal live; `Close` marks it clean |
+
+  The first three rows are the direct path: every non-journaled volume, `DurabilityLazy` and `Batch`, and a
+  journaled volume that fell back (see "Writing through the journal"). The last row replaces the `Strict` and
+  `Mounted` rows on a journaled volume, which is where the journal is on by default: both levels run the same
+  journal commit, so `Mounted` no longer has a dirty span there (the journal makes each commit atomic). A single
+  commit that cannot be journaled while the journal is on (a forged sector, more than 30 runs) takes the `Strict`
+  direct path at `Mounted` too: the volume is never held dirty while it journals.
 
   `Mounted` is data-ordered (like ext4 `data=ordered`): a commit that wrote file data puts a barrier
   between the data and the metadata that points at it, so no crash image shows a file holding bytes it
@@ -130,14 +138,21 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   |---|--:|--:|
   | macOS, HFS+ | 5.24 ms | (kernel) |
   | macOS, Journaled HFS+ | 9.41 ms | (kernel) |
-  | `Strict`, Journaled HFS+ image | 13.41 ms | 3 |
-  | `Mounted` | 8.84 ms | 2 |
+  | `Strict`, Journaled HFS+ image (direct path) | 13.41 ms | 3 |
+  | `Mounted` (direct path) | 8.84 ms | 2 |
   | `EnableJournalWrites`, Journaled HFS+ image | **4.37 ms** | 1 |
 
   On a journaled image, journal writes are 3.1x faster than `Strict` and 2.2x faster than macOS's own driver
   on the same kind of volume. mkdir and Chtimes are metadata-only: they cost 4.24 ms and 4.27 ms, the same as
   `Mounted` (one barrier each). One run on one machine; the first round of each, which includes the session's
   first commit, is reported apart in the test log.
+
+  Since v0.18.0 (PR 6 of hfsplus#45) the journal is the default at `Strict` and `Mounted` on a journaled
+  volume, so on that volume both levels now run the code of the `EnableJournalWrites` row and cost what it
+  costs; the `Strict` and `Mounted` rows above are what they cost on a journaled volume that falls back, and on
+  a non-journaled one. **That the default path reproduces the 4.37 ms row has not been re-measured**: the
+  measurement was deferred because the machine's 1-minute load was 63 to 82 at the time (the rule is below 8).
+  The barrier counts, which do not depend on load, are asserted by `TestJournalWritesDefaultOn`: 2, 1, 1 at both levels.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
@@ -260,13 +275,30 @@ because discarding transactions is a loss of data the caller did not ask for. Mo
 volume on macOS to have the journal reset. Read-only `Open` WITHOUT `WithJournalReplay` shows the
 blocks in place; `WithJournalReplay` shows the journal's view, which macOS would discard, not
 what macOS will show. Also still refused: every journal `checkJournalAt` cannot verify.
-By default the driver does not write transactions: the write path bypasses the journal.
+Before v0.18.0 the driver did not write transactions by default: the write path bypassed the journal.
 
-### Writing through the journal: `EnableJournalWrites` (opt-in, PR 3 of hfsplus#45)
+### Writing through the journal (on by default since v0.18.0, PR 3 and PR 6 of hfsplus#45)
 
-`v.EnableJournalWrites()` on a writable volume opts in. Off by default; without it, and on every
-non-journaled volume, behaviour is unchanged. When on, a **metadata-only commit at
-`DurabilityStrict`** on a journaled volume is written as a journal transaction instead of in place
+**What changes for an existing caller (v0.18.0).** `OpenWritable`, `OpenWritableAt` and `OpenFileWritable`
+now call `EnableJournalWrites` themselves. On a journaled volume whose journal passes its checks, `Strict`
+(the default) and `Mounted` commits become journal transactions: fewer barriers (2 on a session's first
+commit, 1 after, instead of 3, or 2 and 1 for `Mounted`), the volume reads `lastMountedVersion` `HFSJ`
+(not `GoHF`) and not-cleanly-unmounted while the session runs, and `Close` writes a last transaction and
+empties the journal, so **`Close` (or `Sync`) matters more than before**: a volume that is never closed is
+left with a live journal that macOS replays at its next mount, which is correct but is not the clean image
+the direct path left. `Mounted` on a journaled volume no longer keeps a dirty span. `SetDurability(Lazy)`
+and `Batch` still write in place, and empty the journal first; switching between `Strict` and `Mounted` does
+not. A non-journaled volume is written byte for byte as before (`TestNonJournaledVolumeUnchangedByDefault`).
+When the checks fail (not journaled, no `Sync` on the writer, journal never initialised, `jhdr_size` not
+512, ...) the open still succeeds, silently, and the volume writes directly exactly as in v0.17.0:
+`(*Volume).JournalWritesReason()` returns nil when the journal is on and otherwise the reason, wrapping
+`ErrJournalWritesUnavailable`. There is no opt-out switch: no caller in the go-filesystems organisation
+used `EnableJournalWrites`, and a caller that wants in-place writes on a journaled volume has
+`DurabilityLazy`/`Batch`; say so on hfsplus#45 if you need one. `EnableJournalWrites()` stays, a no-op when
+the journal is already on, and re-tries the checks after a fallback.
+
+`v.EnableJournalWrites()` is what the opens call. When on, a **metadata-only commit at
+`DurabilityStrict` or `DurabilityMounted`** on a journaled volume is written as a journal transaction instead of in place
 first: **2 barriers on a session's first commit, 1 on every later one** (3 today). The first commit
 also switches `lastMountedVersion` from `GoHF` to `HFSJ`, in the same commit, and clears the unmounted
 bit as macOS does at mount; `Close` commits a last transaction whose headers carry the clean mark,
@@ -309,18 +341,21 @@ transaction is live: a commit that carries a sector which verifies as a block li
 sector past the journal's end, and catalog nodes hold file names a user chooses; every 512-byte sector of
 every journaled block is checked, in both byte orders, before the transaction is written, and the writer
 never emits sequence number 0; a planted sector makes every commit that touches the poisoned catalog node take the direct path, whoever makes it; and, since v0.15.2 (hfsplus#58), the first journaled commit of a session first scrubs the ring: it reads the journal once, 64 KiB at a time, and zeroes every 512-byte sector that verifies as a block list header in either byte order (a sector a v0.15.0 session wrote before the guard, or another implementation left), with one extra barrier that makes the zeroes durable before the transaction lands, and only when a sector was zeroed. Unproven: whether the kernel's replay or `fsck_hfs` follows a forged list, since the proof covers this driver's replayer only), a commit
-that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit even an empty journal, and every durability level but Strict (`SetDurability`
-empties the journal first). A commit that fits an empty journal but not the live one (three transactions
+that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit even an empty journal, and `DurabilityLazy` and `Batch` (`SetDurability`
+empties the journal first; PR 7 of hfsplus#45 covers them). A commit that fits an empty journal but not the live one (three transactions
 must fit, TN1150 leaves one sector free) is **journal full**, no longer a fallback (PR 5): the journal is
 emptied (2 barriers) and the commit goes in as a first commit (2 more), numbered previous + 1, with no
-ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before; the next
+ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before. At `Mounted`
+the fallback commit takes the `Strict` direct path (bracketed, three barriers), never the held dirty span: a volume
+is never held dirty while it journals, so the clean marks `Sync`, `Close` and `SetDurability` write never land over a
+live journal (`TestMountedFallbackNeverHeldWhileJournaling`); the next
 journaled commit is a first commit with the session-start sequence bump (the design text says previous + 1
 there; the bump is the more conservative and was kept). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the
 volume keeps writing directly when the writer given to `OpenWritable` cannot `Sync` (every barrier would be
 a no-op; a nil writer or an `OpenFileWritable` file is fine), it is not journaled, the journal was never initialised, its
 `jhdr_size` is not 512, or its size or `blhdr_size` fail the checks of the design. A transaction
 uses a one-sector block list header (`blhdr_size` is set to `jhdr_size` in the first header), so it
-holds at most 30 blocks. Design: `docs/design/journal-write.md`; the full docs come with PR 6.
+holds at most 30 blocks. Design: `docs/design/journal-write.md`.
 
 A commit with several candidates that exceeds 30 runs or does not fit the ring writes its data on the
 ordered path instead (in place, barrier, then the transaction).
@@ -340,6 +375,7 @@ ordered path instead (in place, barrier, then the transaction).
 | `(*Volume) WriteFile / MkDir / DeleteFile / DeleteDir / Rename` | Mutate the volume |
 | `(*Volume) SetLabel / Symlink / Truncate` | Optional `Labeller` / `Symlinker` / `Truncater` capabilities |
 | `(*Volume) Sync() error` | Final fsync; at `DurabilityMounted`/`DurabilityLazy` also makes everything durable and restores the clean marks |
+| `(*Volume) JournalWritesReason() error` | nil when commits go through the journal (default on a journaled volume, v0.18.0), `ErrReadOnly` on a read-only volume, else why the volume writes directly (wraps `ErrJournalWritesUnavailable`) |
 | `(*Volume) SetDurability(Durability) error` / `Durability()` | Choose `DurabilityStrict` (default), `DurabilityMounted` or `DurabilityLazy`; see "Durability levels" |
 | `(*Volume) Batch(fn func() error) error` | Run `fn` lazily, then one `Sync` |
 | `(*Volume) ListDir / ReadFile / Stat / ReadLink` | Read paths |
@@ -348,7 +384,7 @@ ordered path instead (in place, barrier, then the transaction).
 | `(*Volume) Times` | `filesystem.TimesReader`: createDate, contentModDate, attributeModDate (ctime), accessDate from the catalog record, GMT seconds since 1904, resolution 1 s; a zero date and the root folder are unrecorded |
 | `(*Volume) OpenFile` (`filesystem.Opener`) | Positional reads of a data fork: each `ReadAt` reads only the extents of its window. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | `(*Volume) CaseSensitive() bool` | Report HFSX binary key comparison |
-| `ErrJournalWritesUnavailable` | `(*Volume).EnableJournalWrites` on a volume that cannot be written through its journal (not journaled, journal never initialised, `jhdr_size` not 512, checks failed); the volume keeps writing directly |
+| `ErrJournalWritesUnavailable` | `(*Volume).EnableJournalWrites`, and `(*Volume).JournalWritesReason()` after an open that fell back to direct writes, on a volume that cannot be written through its journal (not journaled, journal never initialised, `jhdr_size` not 512, checks failed); the volume keeps writing directly |
 | `ErrReplayBudget` | `Open(..., WithJournalReplay())` where the blocks to replay exceed this driver's own bound, `min(journal size, 256 MiB)`; wraps `ErrJournalReplay` |
 | `ErrJournalReplay` | `Open(..., WithJournalReplay())` on a journal the replayer cannot replay (the kernel would abandon it, or a size in it is outside the bounds); wraps `ErrJournaled` |
 | `ErrJournaled` | `OpenWritable` / `OpenFileWritable` on a journaled volume whose journal is not provably empty (transactions pending on a volume whose `lastMountedVersion` is not `HFSJ` or that the replayer refuses, or unreadable / off-volume / other-device / bad checksum / a header field outside Apple's `journal_open` ranges since v0.12.3; three older checks stay stricter than Apple's, see hfsplus#48); `errors.Is(err, ErrJournaled)`, the reason is in the message. Nothing is written, except when a replay succeeded and a check after it refused the volume (the replayed blocks are then on the medium, the journal empty), or a writer without `Sync` was refused before any write |
