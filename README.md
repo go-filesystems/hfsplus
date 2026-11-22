@@ -269,8 +269,9 @@ non-journaled volume, behaviour is unchanged. When on, a **metadata-only commit 
 `DurabilityStrict`** on a journaled volume is written as a journal transaction instead of in place
 first: **2 barriers on a session's first commit, 1 on every later one** (3 today). The first commit
 also switches `lastMountedVersion` from `GoHF` to `HFSJ`, in the same commit, and clears the unmounted
-bit as macOS does at mount; `Close` empties the journal and puts the clean mark back (3 barriers,
-once). A crash leaves a journal macOS replays to the volume after the last commit that returned, or
+bit as macOS does at mount; `Close` commits a last transaction whose headers carry the clean mark,
+then empties the journal as macOS's unmount does (3 barriers, once; since PR 5 of hfsplus#45). `Sync` in
+journal mode costs one barrier if in-place writes are pending since the last one, none otherwise. A crash leaves a journal macOS replays to the volume after the last commit that returned, or
 the one in flight, whole (checked against macOS's own replay, and `fsck_hfs` after the mount; a crash inside `Close` is covered too). An **offline `fsck_hfs -fn` taken in the middle of a commit
 cannot verify the image until macOS has mounted it**: on 407 of the 820 crash images measured it exits 8
 ("could not be verified completely"), always inside a commit's still-open group, and macOS mounts every one of
@@ -308,9 +309,13 @@ transaction is live: a commit that carries a sector which verifies as a block li
 sector past the journal's end, and catalog nodes hold file names a user chooses; every 512-byte sector of
 every journaled block is checked, in both byte orders, before the transaction is written, and the writer
 never emits sequence number 0; a planted sector makes every commit that touches the poisoned catalog node take the direct path, whoever makes it; and, since v0.15.2 (hfsplus#58), the first journaled commit of a session first scrubs the ring: it reads the journal once, 64 KiB at a time, and zeroes every 512-byte sector that verifies as a block list header in either byte order (a sector a v0.15.0 session wrote before the guard, or another implementation left), with one extra barrier that makes the zeroes durable before the transaction lands, and only when a sector was zeroed. Unproven: whether the kernel's replay or `fsck_hfs` follows a forged list, since the proof covers this driver's replayer only), a commit
-that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit the journal (three transactions
-must fit, TN1150 leaves one sector free), and every durability level but Strict (`SetDurability`
-empties the journal first). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the
+that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit even an empty journal, and every durability level but Strict (`SetDurability`
+empties the journal first). A commit that fits an empty journal but not the live one (three transactions
+must fit, TN1150 leaves one sector free) is **journal full**, no longer a fallback (PR 5): the journal is
+emptied (2 barriers) and the commit goes in as a first commit (2 more), numbered previous + 1, with no
+ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before; the next
+journaled commit is a first commit with the session-start sequence bump (the design text says previous + 1
+there; the bump is the more conservative and was kept). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the
 volume keeps writing directly when the writer given to `OpenWritable` cannot `Sync` (every barrier would be
 a no-op; a nil writer or an `OpenFileWritable` file is fine), it is not journaled, the journal was never initialised, its
 `jhdr_size` is not 512, or its size or `blhdr_size` fail the checks of the design. A transaction

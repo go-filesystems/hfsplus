@@ -19,7 +19,7 @@ func faultSweep(t *testing.T, name string, prelude func(*Volume), op func(*Volum
 		hit := 0
 		for i := 0; i < 400; i++ {
 			img, _ := journalImage(t, 0x40000, 100, 0x4400)
-			v, c, _ := jwFile(t, img, true)
+			v, c, path := jwFile(t, img, true)
 			if prelude != nil {
 				prelude(v)
 			}
@@ -39,6 +39,16 @@ func faultSweep(t *testing.T, name string, prelude func(*Volume), op func(*Volum
 			hit++
 			if !errors.Is(err, errInjected) {
 				t.Errorf("%s: failing %s %d returned %v, want the injected error", name, map[bool]string{false: "write", true: "barrier"}[syncs], i, err)
+			}
+			// After the failure nothing else reaches the device: the volume is failed,
+			// and a retried write or barrier would land on a half-written commit.
+			if c.failedEvents == 0 || len(c.events)+1 != c.failedEvents {
+				t.Errorf("%s: failing %s %d: %d events after the failure, want 0", name, map[bool]string{false: "write", true: "barrier"}[syncs], i, len(c.events)+1-c.failedEvents)
+			}
+			// What the device holds is a crash image: it must open and replay.
+			left := mustRead(t, path)
+			if _, err := Open(bytesReaderAt(left), int64(len(left)), WithJournalReplay()); err != nil {
+				t.Errorf("%s: failing %s %d: the image left on the device does not replay: %v", name, map[bool]string{false: "write", true: "barrier"}[syncs], i, err)
 			}
 			c.failAt, c.syncFailAt = -1, -1
 		}
@@ -85,7 +95,9 @@ func TestJournalDataFaults(t *testing.T) {
 			if err := v.MkDir("/m", 0o755); err != nil { // makes the journal live
 				t.Fatal(err)
 			}
-			v.jw.prevSize = 0x40000 - 512 - 100
+			// A journal in which nothing fits, empty or not (a full one would take the
+			// journal-full path, design section 7, not the direct one swept here).
+			v.jw.loc.hdr.size = 1024
 		}, func(v *Volume) error {
 			err := v.WriteFile("/b", pat(300, 8), 0o644)
 			if err == nil && v.journaling() {
@@ -97,7 +109,7 @@ func TestJournalDataFaults(t *testing.T) {
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
 			setup(v)
-			v.jw.prevSize = 0x40000 - 512 - 4096
+			v.jw.loc.hdr.size = 1024
 		}, func(v *Volume) error { return v.WriteFile("/b", pat(8192, 8), 0o644) })
 	})
 }

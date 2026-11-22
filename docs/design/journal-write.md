@@ -982,6 +982,33 @@ node. The writer also
    ordered path; staged bytes past the bound are spilled to in-place writes.
 5. **Journal full, bypass, Close/Sync, and switching levels.** The crash oracle
    across the wrap.
+   **Status: done in the PR that follows v0.16.0** (`journal_writer.go`,
+   `journal_writer_full_test.go`). Deviations: (a) after a bypass the next journaled
+   commit keeps the session-start bump (`header seq + size/jhdr + 1`), not
+   "emptied header number + 1" as section 7 says; the bump is safe (section 4) and
+   changing it would add risk for no gain; journal-full does use previous + 1.
+   (b) The direct path already writes `GoHF` (`store.go`, `stampLastMountedVersion`
+   in `flush`), so the bypass needed no new write. (c) `Close` takes the T_c path
+   only when the volume was clean at open (`cleanOnDisk`); otherwise it only
+   empties the journal (2 barriers), since T_c would change nothing. If T_c finds
+   the journal full, Close pays the journal-full commit (4) plus the emptying (2).
+   (d) Sync tracks "pending" (in-place writes since the last barrier) in the
+   writer; a journal-mode volume whose last write was a direct path pays none.
+   (e) Journal-full and the size-based bypass are possible in production but not
+   reached by the ordinary operations on the volumes the tests can build. The
+   loader refuses journals under 256 KiB (`journal.go`, Apple's `journal_open`
+   range), so on the smallest journal a `MkDir` or a delete is a 3.5 KiB
+   transaction and a file of `size/8` = 32 KiB of data one of about 24 KiB, and
+   revoke-forced data is bounded by the same `size/8` (the allocator skips the
+   zone once it is spent): `TestJournalOrdinaryCommitsStayUnderFull` pins that
+   three of them stay far under the threshold. What can exceed it is a run that
+   scales with the allocation span, such as the bitmap runs of an allocation
+   spread over several GiB (by reading `plan`; not measured here), or a block
+   list of more than `jwMaxRuns` runs. The tests therefore force the state
+   (`forceFull`, a forged sector, a shrunk `loc.hdr.size`); no scenario reaches
+   it through the public API alone. Bypass-after-emptying and bypass-first are
+   run by the oracle (`TestJournalWriterCrashOracleBypass`, and on darwin the
+   fsck/mount sequence in `TestDarwinJournalWriterFallbackFsck`).
 6. **Default on** for Strict and Mounted. The measurement table, plus README,
    docs site and landing page.
 7. **Lazy/Batch as an in-memory group commit** (atomic Batch).

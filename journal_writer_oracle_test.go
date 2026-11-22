@@ -517,10 +517,10 @@ func TestJournalWriterCrashOracleStaleRing(t *testing.T) {
 	checkJWScenario(t, jwScenario{name: "stale-ring", img: img, ops: mkdirOps(3), noScrub: true})
 }
 
-// The fallback path entered right after a journal is emptied, and the journal
-// restarted after it (design section 7, "UNVERIFIED: that it stays correct when it
-// is entered right after a journal is emptied, and when it writes 'GoHF'"): journal
-// commits, a commit with file data, then journal commits again.
+// A commit with file data on a journal whose live part is full: journal-full
+// (journal_writer_full_test.go has the bypass scenarios, which run the direct
+// path right after a journal is emptied and write 'GoHF'), then journal commits
+// again.
 func TestJournalWriterCrashOracleFallback(t *testing.T) {
 	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
 	ops := []jwOp{

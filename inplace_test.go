@@ -32,6 +32,9 @@ type countingWriter struct {
 	// events is every write and every successful fsync in order: the log the
 	// crash model replays.
 	events []crashEvent
+	// failedEvents is len(events)+1 at the moment an injected failure fired (0: none
+	// yet), to tell whether anything reached the device after it.
+	failedEvents int
 }
 
 // crashEvent is one entry of the log: a write (off, data) or an fsync.
@@ -51,6 +54,7 @@ var errInjected = errors.New("hfsplus: injected failure")
 func (c *countingWriter) WriteAt(p []byte, off int64) (int, error) {
 	if c.failAt >= 0 && len(c.writes) == c.failAt {
 		c.writes = append(c.writes, writeRec{off: -1})
+		c.failedEvents = len(c.events) + 1
 		return 0, errInjected
 	}
 	c.writes = append(c.writes, writeRec{off: off, data: bytes.Clone(p)})
@@ -61,6 +65,7 @@ func (c *countingWriter) WriteAt(p []byte, off int64) (int, error) {
 func (c *countingWriter) Sync() error {
 	if c.syncFailAt >= 0 && c.syncs == c.syncFailAt {
 		c.syncFailAt = -2 // fail once
+		c.failedEvents = len(c.events) + 1
 		return errInjected
 	}
 	c.syncs++
