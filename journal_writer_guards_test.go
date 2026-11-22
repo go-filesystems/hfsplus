@@ -128,14 +128,14 @@ func TestSetDurabilityEdges(t *testing.T) {
 		t.Errorf("same level: %v, journaling %v, %d events", err, v.journaling(), len(c.events)-n)
 	}
 	// At a level that holds writes back, asking for the same level does not flush them.
-	if err := v.SetDurability(DurabilityMounted); err != nil {
+	if err := v.SetDurability(DurabilityLazy); err != nil {
 		t.Fatal(err)
 	}
 	if err := v.MkDir("/b", 0o755); err != nil {
 		t.Fatal(err)
 	}
 	n, s := len(c.events), c.syncs
-	if err := v.SetDurability(DurabilityMounted); err != nil || len(c.events) != n || c.syncs != s || !v.held {
+	if err := v.SetDurability(DurabilityLazy); err != nil || len(c.events) != n || c.syncs != s || !v.held {
 		t.Errorf("same level, writes held: %v, %d events, %d barriers, held %v", err, len(c.events)-n, c.syncs-s, v.held)
 	}
 }

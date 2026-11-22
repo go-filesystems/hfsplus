@@ -1011,6 +1011,18 @@ node. The writer also
    fsck/mount sequence in `TestDarwinJournalWriterFallbackFsck`).
 6. **Default on** for Strict and Mounted. The measurement table, plus README,
    docs site and landing page.
+   **Status: done in the PR that follows v0.17.0** (`journal_writer.go`,
+   `journal_default_test.go`); the release is v0.18.0 (a behaviour change for every
+   caller, MINOR below v1). Deviations: (a) `OpenWritable*` call `EnableJournalWrites`
+   at the end of the open and keep the refusal in `JournalWritesReason()`; there is
+   no opt-out (no caller used `EnableJournalWrites`; Lazy/Batch write in place).
+   (b) Mounted on a journaled volume today (`flushHeld`, durability.go: one dirty
+   barrier, then one per commit) is replaced, not adjusted: the journal commit is
+   atomic, so there is no dirty span and `SetDurability` between Strict and Mounted
+   needs no emptying; Lazy still empties. (c) The measurement table through the
+   default path was deferred, the machine's load was above the rule's 8 (63 to 82);
+   the barrier counts are asserted instead. README, docs site and landing: README
+   here, the other two follow.
 7. **Lazy/Batch as an in-memory group commit** (atomic Batch).
 
 Each PR keeps today's behavior for non-journaled volumes, byte for byte.

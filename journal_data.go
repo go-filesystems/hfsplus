@@ -39,7 +39,7 @@ func (jw *journalWriter) dataBound() int64 {
 
 // stagesData reports whether writeData stages instead of writing.
 func (v *Volume) stagesData() bool {
-	return v.jw != nil && v.durability == DurabilityStrict
+	return v.jw != nil && v.journalLevel()
 }
 
 // hasStaged reports whether data waits for the commit.

@@ -340,11 +340,11 @@ func (v *Volume) flush() error {
 		return nil
 	}
 	if v.jw != nil {
-		// Journal writes are on (EnableJournalWrites). A commit at Strict is a journal
-		// transaction, its file data journaled or ordered (journal_data.go);
-		// everything else writes directly, which first empties the journal: a direct
-		// write with transactions pending would be overwritten by their replay.
-		if v.durability == DurabilityStrict {
+		// Journal writes are on (the default on a journaled volume). A commit at Strict
+		// or Mounted is a journal transaction, its file data journaled or ordered
+		// (journal_data.go); Lazy writes directly, which first empties the journal: a
+		// direct write with transactions pending would be overwritten by their replay.
+		if v.journalLevel() {
 			done, err := v.flushJournal(meta)
 			if err != nil {
 				return err

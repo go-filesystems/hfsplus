@@ -307,7 +307,7 @@ func TestJournalSyncPending(t *testing.T) {
 // first commit.
 func TestJournalSwitchingLevels(t *testing.T) {
 	const size = 0x40000
-	for _, lvl := range []Durability{DurabilityMounted, DurabilityLazy} {
+	for _, lvl := range []Durability{DurabilityLazy} {
 		t.Run(lvl.String(), func(t *testing.T) {
 			img, jbase := journalImage(t, size, 100, 0x4400)
 			v, c, path := jwFile(t, img, true)

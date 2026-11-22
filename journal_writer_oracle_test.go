@@ -34,6 +34,9 @@ type jwObserver func(v *Volume) ([]string, error)
 type jwScenario struct {
 	name string
 	img  []byte // base image: a journaled volume with an empty journal
+	// durability is the level the commits run at (Strict, the zero value, or Mounted:
+	// both take the journal path).
+	durability Durability
 	// jbase is where the journal lies; direct allows direct-path commits (mid-commit
 	// images with the journaled bit cleared are then only checked for an empty journal).
 	jbase  int64
@@ -335,8 +338,14 @@ func runJWScenario(t *testing.T, s jwScenario) (ev []crashEvent, starts, ends []
 		t.Fatal(err)
 	}
 	defer v.Close()
-	if err := v.EnableJournalWrites(); err != nil {
-		t.Fatal(err)
+	// No EnableJournalWrites: the oracle runs through the default path (PR 6).
+	if v.jw == nil {
+		t.Fatalf("journal writes are not on after open: %v", v.JournalWritesReason())
+	}
+	if s.durability != DurabilityStrict {
+		if err := v.SetDurability(s.durability); err != nil {
+			t.Fatal(err)
+		}
 	}
 	v.jw.scrubbed = s.noScrub
 	c := instrument(v)
@@ -437,7 +446,22 @@ func TestJournalWriterCrashOracleClose(t *testing.T) {
 	img, _ = journalImage(t, 0x40000, 100, 0x4400)
 	checkJWScenario(t, jwScenario{
 		name: "set-durability", img: img, ops: mkdirOps(4), tailSyncs: 2,
-		tail: func(v *Volume) error { return v.SetDurability(DurabilityMounted) },
+		tail: func(v *Volume) error { return v.SetDurability(DurabilityLazy) },
+	})
+}
+
+// The same oracle at DurabilityMounted, through the default path: a Mounted commit
+// is the journal commit, 2 barriers then 1, and the volume is never marked dirty.
+func TestJournalWriterCrashOracleMounted(t *testing.T) {
+	img, _ := journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "mounted k=1..4", img: img, ops: mkdirOps(4), durability: DurabilityMounted,
+		wantSyncs: []int{2, 1, 1, 1},
+	})
+	img, _ = journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "mounted close", img: img, ops: mkdirOps(4), durability: DurabilityMounted, tailSyncs: 3,
+		tail: func(v *Volume) error { return v.Close() },
 	})
 }
 

@@ -28,6 +28,7 @@ func TestEnableJournalWritesRefusesMisalignedEnds(t *testing.T) {
 		binary.LittleEndian.PutUint32(h[44:], 1000)
 		resignJournalHeader(h)
 		copy(img[jbase:], h)
+		noJournal(v) // the open already enabled it; ask again for the changed header
 		err = v.EnableJournalWrites()
 		if !errors.Is(err, ErrJournalWritesUnavailable) {
 			t.Errorf("start = end = %#x: %v, want ErrJournalWritesUnavailable", off, err)

@@ -23,7 +23,9 @@ const (
 	// between commits, so a crash at ANY point outside a commit leaves a volume
 	// fsck_hfs -q passes. Cost: three barriers per commit on a volume that was
 	// clean when opened (data and the cleared bit; B-tree and bitmap sectors;
-	// alternate and primary header).
+	// alternate and primary header). On a journaled volume whose journal passes the
+	// checks (the default, see JournalWritesReason) a commit is a journal
+	// transaction instead: one barrier, two for a session's first.
 	DurabilityStrict Durability = iota
 	// DurabilityMounted behaves like a mounted HFS+ volume: the first commit
 	// marks the volume as not cleanly unmounted (one barrier), later commits write
@@ -37,7 +39,10 @@ const (
 	// metadata that points at it, so a crash never shows a file holding bytes it
 	// was not written with; a commit without data takes one barrier. The
 	// journaled bit stays cleared for the whole held span, so after a crash in it
-	// the journal stays off until diskutil enableJournal.
+	// the journal stays off until diskutil enableJournal. None of this applies on a
+	// journaled volume written through its journal (the default, see
+	// JournalWritesReason): there Mounted is the journal commit, the same as Strict,
+	// and the volume is never held dirty.
 	DurabilityMounted
 	// DurabilityLazy is DurabilityMounted without the per-commit barrier: a
 	// mutation is durable only after Sync, Close or SetDurability(DurabilityStrict)
@@ -83,9 +88,9 @@ func (v *Volume) SetDurability(d Durability) error {
 			return err
 		}
 	}
-	if v.journaling() && d != DurabilityStrict {
-		// Journal writes only apply at Strict: leave the journal empty before a level
-		// that writes in place.
+	if v.journaling() && d != DurabilityStrict && d != DurabilityMounted {
+		// Journal writes apply at Strict and Mounted; Strict <-> Mounted needs no
+		// emptying. Leave the journal empty before a level that writes in place.
 		if err := v.emptyJournal(); err != nil {
 			v.failed = err
 			return err

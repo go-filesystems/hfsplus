@@ -87,6 +87,7 @@ func TestDarwinCrashImagesFsck(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", kind.name, err)
 			}
+			noJournal(v) // this test covers the in-place path
 			if err := v.SetDurability(op.dur); err != nil {
 				t.Fatal(err)
 			}

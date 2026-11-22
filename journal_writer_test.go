@@ -154,17 +154,21 @@ func mustOpen(t testing.TB, img []byte, replay bool) *Volume {
 	return v
 }
 
-// Without the opt-in, nothing changes: the journal is never written, the commit
-// pays 3 barriers and stamps 'GoHF', exactly as v0.14.0.
-func TestJournalWritesOffByDefault(t *testing.T) {
+// At Lazy the journal is not written (PR 7 covers it): the commit goes in place
+// and stamps 'GoHF', as v0.14.0. (Until PR 6 this test ran at Strict with no
+// opt-in; Strict is now on the journal path by default, journal_default_test.go.)
+func TestJournalWritesNotUsedAtLazy(t *testing.T) {
 	img, jbase := journalImage(t, 0x80000, 1000, 0x4400)
 	jh := bytes.Clone(img[jbase : jbase+512])
 	v, c, path := jwFile(t, img, false)
+	if err := v.SetDurability(DurabilityLazy); err != nil {
+		t.Fatal(err)
+	}
 	if err := v.MkDir("/a", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if c.syncs != 3 {
-		t.Errorf("%d barriers, want 3 (today's strict commit)", c.syncs)
+	if c.syncs != 1 {
+		t.Errorf("%d barriers, want 1 (the dirty mark; Lazy has no per-commit barrier)", c.syncs)
 	}
 	v.Close()
 	onDisk, _ := os.ReadFile(path)
@@ -335,20 +339,25 @@ func TestJournalWriterFallbacks(t *testing.T) {
 	if got, err := v.ReadFile("/f.bin"); err != nil || !bytes.Equal(got, fill(5000, 7)) {
 		t.Errorf("f.bin: %d bytes, %v", len(got), err)
 	}
-	// Leaving Strict empties the journal; Mounted then writes in place.
+	// Leaving the journal levels empties the journal; Lazy then writes in place.
+	// (Mounted is a journal level since PR 6: journal_default_test.go.)
 	must(v.MkDir("/g", 0o755)) // journal live again
 	if !v.journaling() {
 		t.Fatal("expected a live journal")
 	}
-	must(v.SetDurability(DurabilityMounted))
+	must(v.SetDurability(DurabilityLazy))
 	if v.journaling() {
-		t.Error("SetDurability(Mounted) left the journal live")
+		t.Error("SetDurability(Lazy) left the journal live")
 	}
 	if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end {
 		t.Errorf("journal not empty after leaving Strict: %d %d", h.start, h.end)
 	}
 	must(v.MkDir("/h", 0o755))
 	must(v.SetDurability(DurabilityStrict))
+	must(v.MkDir("/i", 0o755))
+	if !v.journaling() {
+		t.Error("Strict after Lazy did not return to the journal")
+	}
 }
 
 func mustRead(t testing.TB, path string) []byte {
