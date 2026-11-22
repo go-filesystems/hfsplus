@@ -5,6 +5,7 @@ package hfsplus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"testing"
@@ -130,7 +131,8 @@ func TestJournalWritesFallbackReason(t *testing.T) {
 	})
 	t.Run("writer without Sync", func(t *testing.T) {
 		img, _ := journalImage(t, size, 1000, 0x4400)
-		v, err := OpenWritable(img, onlyWriter{w: &memWriter{b: slices.Clone(img)}})
+		mem := &memWriter{b: slices.Clone(img)}
+		v, err := OpenWritable(img, onlyWriter{w: mem})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,12 +147,25 @@ func TestJournalWritesFallbackReason(t *testing.T) {
 				t.Errorf("direct write at %v after the fallback: %v", d, err)
 			}
 		}
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Written in place, as v0.17.0 did (the bytes are pinned by
+		// TestWritesMatchV017Golden): the volume header keeps the journaled and
+		// unmounted bits it had.
+		attr := func(b []byte) uint32 { return binary.BigEndian.Uint32(b[volumeHeaderOffset+4:]) }
+		if a, w := attr(mem.b), attr(img); a != w {
+			t.Errorf("volume attributes %#x after the writes, %#x before", a, w)
+		}
+		if names, _ := rootNames(mustOpen(t, mem.b, false)); !slices.Equal(names, []string{"mounted", "strict"}) {
+			t.Errorf("directories %v", names)
+		}
 	})
 	t.Run("journal never initialised", func(t *testing.T) {
 		img, _, _ := journaledImage(t, kJIJournalInFSMask|kJIJournalNeedInitMask, make([]byte, 512), size)
 		v, err := OpenWritable(img, nil)
 		if err != nil {
-			t.Skipf("the open refuses it already: %v", err)
+			t.Fatalf("the open refuses the fixture: %v", err)
 		}
 		if v.jw != nil || !errors.Is(v.JournalWritesReason(), ErrJournalWritesUnavailable) {
 			t.Errorf("jw=%v reason=%v", v.jw, v.JournalWritesReason())
@@ -160,6 +175,19 @@ func TestJournalWritesFallbackReason(t *testing.T) {
 		img, _ := journalImage(t, size, 1000, 0x4400)
 		if err := mustOpen(t, img, false).JournalWritesReason(); !errors.Is(err, ErrReadOnly) {
 			t.Errorf("read-only: %v", err)
+		}
+	})
+	t.Run("closed", func(t *testing.T) {
+		img, _ := journalImage(t, size, 1000, 0x4400)
+		v, _, _ := jwFile(t, img, false)
+		if v.JournalWritesReason() != nil {
+			t.Fatalf("reason %v before Close", v.JournalWritesReason())
+		}
+		if err := v.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := v.JournalWritesReason(); !errors.Is(err, ErrClosed) {
+			t.Errorf("after Close: %v, want ErrClosed", err)
 		}
 	})
 	t.Run("writer with Sync is on", func(t *testing.T) {
@@ -225,5 +253,55 @@ func TestNonJournaledVolumeUnchangedByDefault(t *testing.T) {
 				t.Error("the image differs from the one the pre-PR-6 open produces")
 			}
 		})
+	}
+}
+
+// A commit that falls back at Mounted (here a forged sector, which the journal
+// refuses) used to leave the volume held dirty while the journal stayed on: the next
+// commit journaled inside the dirty span and settle wrote the clean mark over a live
+// journal. The invariant, checked after every step: with journal writes on, the
+// volume is never held, and the journaled bit on the medium is never cleared outside
+// a commit.
+func TestMountedFallbackNeverHeldWhileJournaling(t *testing.T) {
+	img, _ := journalImage(t, 0x40000, 100, 0x4400)
+	v, _, path := jwFile(t, img, false)
+	defer v.Close()
+	if err := v.SetDurability(DurabilityMounted); err != nil {
+		t.Fatal(err)
+	}
+	check := func(step string) []byte {
+		t.Helper()
+		raw := mustRead(t, path)
+		if v.jw == nil {
+			t.Fatalf("%s: journal writes went off", step)
+		}
+		if v.held {
+			t.Errorf("%s: the volume is held dirty while it journals", step)
+		}
+		if a := binary.BigEndian.Uint32(raw[volumeHeaderOffset+4:]); a&kHFSVolumeJournaledBit == 0 {
+			t.Errorf("%s: journaled bit cleared on the medium (attributes %#x)", step, a)
+		}
+		return raw
+	}
+	check("open")
+	if err := v.MkDir("/a", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	check("journal commit")
+	if err := plantForgedMkDir(v, "/f", binary.LittleEndian); err != nil {
+		t.Fatal(err)
+	}
+	check("fallback commit")
+	if err := v.MkDir("/b", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	check("commit after the fallback")
+	if err := v.SetDurability(DurabilityStrict); err != nil {
+		t.Fatal(err)
+	}
+	raw := check("SetDurability(Strict)")
+	names, err := rootNames(mustOpen(t, raw, true))
+	if err != nil || !slices.Equal(names, []string{"a", "b", "f"}) {
+		t.Errorf("the image shows %v, %v", names, err)
 	}
 }

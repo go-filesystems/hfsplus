@@ -137,6 +137,9 @@ func (v *Volume) JournalWritesReason() error {
 	if !v.wr {
 		return ErrReadOnly
 	}
+	if v.closed {
+		return ErrClosed
+	}
 	return v.jwReason
 }
 

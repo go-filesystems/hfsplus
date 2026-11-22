@@ -378,7 +378,11 @@ func (v *Volume) flush() error {
 	// written last, restores the bit. (The journal was empty at open, see
 	// checkJournal, and is never written.)
 	journaled := old[vhAttributes+2]&(kHFSVolumeJournaledBit>>8) != 0
-	if v.durability != DurabilityStrict {
+	// With journal writes on, a commit that fell back at Mounted takes the Strict
+	// direct path below (bracketed, never held), so a volume is never held dirty while
+	// it journals: the next commit would journal inside a dirty span and settle would
+	// write the clean mark over a live journal.
+	if v.durability == DurabilityLazy || (v.durability == DurabilityMounted && v.jw == nil) {
 		return v.flushHeld(meta, hdrP, hdrA, old, journaled)
 	}
 	if v.cleanOnDisk || journaled {

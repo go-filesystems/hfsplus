@@ -42,7 +42,9 @@ const (
 	// the journal stays off until diskutil enableJournal. None of this applies on a
 	// journaled volume written through its journal (the default, see
 	// JournalWritesReason): there Mounted is the journal commit, the same as Strict,
-	// and the volume is never held dirty.
+	// and the volume is never held dirty. A commit that cannot be journaled (see the
+	// list in journal_writer.go) takes the Strict direct path at Mounted too, bracketed
+	// and three barriers, so the volume is not held dirty while it journals.
 	DurabilityMounted
 	// DurabilityLazy is DurabilityMounted without the per-commit barrier: a
 	// mutation is durable only after Sync, Close or SetDurability(DurabilityStrict)

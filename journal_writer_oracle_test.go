@@ -463,6 +463,23 @@ func TestJournalWriterCrashOracleMounted(t *testing.T) {
 		name: "mounted close", img: img, ops: mkdirOps(4), durability: DurabilityMounted, tailSyncs: 3,
 		tail: func(v *Volume) error { return v.Close() },
 	})
+	// A commit that falls back at Mounted (forged sector) takes the bracketed direct
+	// path and is never held: journal commits follow it, and SetDurability(Strict) and
+	// Close settle a volume that is not dirty. A crash anywhere shows the volume with
+	// the journaled bit set or an empty journal (jwCheckImage, direct).
+	forged := func(n string) jwOp {
+		return func(v *Volume) error { return plantForgedMkDir(v, n, binary.LittleEndian) }
+	}
+	ops := []jwOp{mkdirOps(1)[0], forged("/d001"), mkdirOps(3)[2], forged("/d003"), mkdirOps(5)[4]}
+	img, jbase := journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "mounted fallback", img: img, jbase: jbase, direct: true, ops: ops, durability: DurabilityMounted,
+	})
+	img, jbase = journalImage(t, 0x40000, 100, 0x4400)
+	checkJWScenario(t, jwScenario{
+		name: "mounted fallback close", img: img, jbase: jbase, direct: true, ops: ops, durability: DurabilityMounted,
+		tail: func(v *Volume) error { return v.Close() },
+	})
 }
 
 // A wraparound sequence on the smallest journal macOS accepts (256 KiB): enough

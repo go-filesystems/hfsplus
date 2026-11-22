@@ -100,7 +100,9 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   The first three rows are the direct path: every non-journaled volume, `DurabilityLazy` and `Batch`, and a
   journaled volume that fell back (see "Writing through the journal"). The last row replaces the `Strict` and
   `Mounted` rows on a journaled volume, which is where the journal is on by default: both levels run the same
-  journal commit, so `Mounted` no longer has a dirty span there (the journal makes each commit atomic).
+  journal commit, so `Mounted` no longer has a dirty span there (the journal makes each commit atomic). A single
+  commit that cannot be journaled while the journal is on (a forged sector, more than 30 runs) takes the `Strict`
+  direct path at `Mounted` too: the volume is never held dirty while it journals.
 
   `Mounted` is data-ordered (like ext4 `data=ordered`): a commit that wrote file data puts a barrier
   between the data and the metadata that points at it, so no crash image shows a file holding bytes it
@@ -343,7 +345,10 @@ that changes more than 30 runs of 512-byte sectors, a run that is not whole sect
 empties the journal first; PR 7 of hfsplus#45 covers them). A commit that fits an empty journal but not the live one (three transactions
 must fit, TN1150 leaves one sector free) is **journal full**, no longer a fallback (PR 5): the journal is
 emptied (2 barriers) and the commit goes in as a first commit (2 more), numbered previous + 1, with no
-ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before; the next
+ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before. At `Mounted`
+the fallback commit takes the `Strict` direct path (bracketed, three barriers), never the held dirty span: a volume
+is never held dirty while it journals, so the clean marks `Sync`, `Close` and `SetDurability` write never land over a
+live journal (`TestMountedFallbackNeverHeldWhileJournaling`); the next
 journaled commit is a first commit with the session-start sequence bump (the design text says previous + 1
 there; the bump is the more conservative and was kept). `EnableJournalWrites` itself returns `ErrJournalWritesUnavailable` and the
 volume keeps writing directly when the writer given to `OpenWritable` cannot `Sync` (every barrier would be
