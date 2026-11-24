@@ -220,6 +220,11 @@ func (v *Volume) enableJournalWrites() error {
 		// checks. loadJournalAt already refuses this for jhdr_size 512, the only size
 		// accepted above; the check stays here because the writer's placement rests on it.
 		return fmt.Errorf("%w: start %d or end %d is not a multiple of jhdr_size", ErrJournalWritesUnavailable, h.start, h.end)
+	case h.size > loc.jibSize:
+		// Apple does not compare the two sizes, so a reader accepts this journal; the
+		// writer lays its ring over [off, off+hdr.size) and must stay inside the
+		// extent the journal info block gives it (hfsplus#48).
+		return fmt.Errorf("%w: the journal header's size %d exceeds the journal info block's %d", ErrJournalWritesUnavailable, h.size, loc.jibSize)
 	case loc.off%uint64(h.jhdrSize) != 0:
 		return fmt.Errorf("%w: the journal is at %d, not sector-aligned", ErrJournalWritesUnavailable, loc.off)
 	}
@@ -305,6 +310,11 @@ func (jw *journalWriter) headerSector(v *Volume, start, end uint64, seq uint32) 
 		return nil, fmt.Errorf("hfsplus: reading the journal header: %v", err)
 	}
 	bo := jw.enc
+	// A 'JHDR' header is rewritten as 'JNLx' with its endian field, which is what
+	// Apple's journal_open does with it (hfs_journal.c:1997) and what makes the
+	// checksum below meaningful.
+	bo.PutUint32(b[0:], journalHeaderMagic)
+	bo.PutUint32(b[4:], journalEndianMagic)
 	bo.PutUint64(b[8:], start)
 	bo.PutUint64(b[16:], end)
 	bo.PutUint32(b[32:], jwBlockSize)

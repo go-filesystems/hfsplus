@@ -189,7 +189,9 @@ func TestCheckJournal(t *testing.T) {
 		{"no magic", kJIJournalInFSMask, make([]byte, 512), size, nil, "magic"},
 		{"other device", kJIJournalOnOtherDeviceMask, empty, size, nil, "not inside the volume"},
 		{"neither flag", 0, empty, size, nil, "not inside the volume"},
-		{"size mismatch", kJIJournalInFSMask, empty, size + 4096, nil, "differs"},
+		// Apple never compares the header's size with the info block's (hfsplus#48).
+		{"info block size larger than the header's", kJIJournalInFSMask, empty, size + 4096, nil, ""},
+		{"info block size smaller than the header's", kJIJournalInFSMask, empty, size - 4096, nil, ""},
 		{"size too small", kJIJournalInFSMask, empty, 8, nil, "outside the volume"},
 		{"size past the volume", kJIJournalInFSMask, empty, 1 << 40, nil, "outside the volume"},
 		// What Apple's journal_open refuses (hfs_journal.c:2019-2033 start/end <= 0
