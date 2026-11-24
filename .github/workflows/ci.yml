@@ -216,3 +216,37 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+  # 32-bit: int is 32 bits wide, so a subtraction converted to int (a sort
+  # comparator over byte offsets) wraps where 64-bit does not. An x86-64 runner
+  # executes 386 binaries natively.
+  linux-386:
+    name: linux 386
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hfsplus
+        uses: actions/checkout@v7
+        with:
+          path: go-filesystems/hfsplus
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v7
+        with:
+          repository: go-filesystems/interface
+          path: go-filesystems/interface
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          check-latest: true
+          cache: true
+          cache-dependency-path: go-filesystems/hfsplus/go.mod
+
+      - name: Test (GOARCH=386)
+        working-directory: go-filesystems/hfsplus
+        env:
+          GOOS: linux
+          GOARCH: "386"
+          CGO_ENABLED: "0"
+        run: go test -short -timeout 20m ./...

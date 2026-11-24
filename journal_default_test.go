@@ -9,6 +9,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 )
 
 // hfsplus#45, PR 6: journal writes are on by default on a journaled volume, at
@@ -220,6 +221,11 @@ func openDirect(t testing.TB, img []byte) *Volume {
 
 // A non-journaled volume is written byte for byte as before, at every level.
 func TestNonJournaledVolumeUnchangedByDefault(t *testing.T) {
+	// The two runs stamp the clock into the records: pinned, a second boundary between
+	// them cannot make the images differ.
+	fixed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	timeNow = func() time.Time { return fixed }
+	t.Cleanup(func() { timeNow = time.Now })
 	plain, err := Mkfs(8<<20, FormatConfig{Label: "PLAIN"})
 	if err != nil {
 		t.Fatal(err)

@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"cmp"
 	"slices"
 	"sort"
 )
@@ -153,7 +154,7 @@ func zonesOf(bs int64, sets ...[]span) []span {
 			all = append(all, span{r.lo / bs * bs, (r.hi + bs - 1) / bs * bs})
 		}
 	}
-	slices.SortFunc(all, func(a, b span) int { return int(a.lo - b.lo) })
+	slices.SortFunc(all, func(a, b span) int { return cmp.Compare(a.lo, b.lo) })
 	var out []span
 	for _, s := range all {
 		if k := len(out); k > 0 && s.lo <= out[k-1].hi {

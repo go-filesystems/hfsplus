@@ -139,7 +139,9 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   every crash prefix, both write orders; and macOS's own mount and `fsck_hfs` on sampled crash images,
   `TestDarwinJournalWriterBatchKernelReplay`). A Batch larger than one group is NOT atomic: it is a sequence
   of groups, each made of whole mutations, so a crash leaves a prefix of the mutations, never part of one
-  (`TestGroupBatchLargerThanOneGroupLeavesAPrefix`). If `fn` returns an error the mutations it made stay and
+  (`TestGroupBatchLargerThanOneGroupLeavesAPrefix`); an overwrite or a `Truncate`, which commit twice, are
+  never split by the bound (`TestGroupBatchNeverSplitsAMutation`). A single mutation too large for an empty
+  group is not atomic, as on Strict. If `fn` returns an error the mutations it made stay and
   are committed by the Batch's `Sync`, as before; the error is returned. `Close` settles. A failed volume is left
   dirty. Checked by `TestDurabilityCrashModel` (both crash models plus every write of every fsync group
   landing alone or missing alone) and `TestDarwinCrashImagesFsck` at every level.
@@ -309,8 +311,8 @@ the direct path left. `Mounted` on a journaled volume no longer keeps a dirty sp
 `SetDurability(Lazy)` and `Batch` are a group commit on a journaled volume: nothing is written until
 `Sync`, `Close` or a level switch, then one transaction; no level switch empties the journal. For an existing
 caller of `Lazy` or `Batch`: the volume is no longer marked dirty or written in place between `Sync`s, a Batch
-that fits one group is atomic, and `Bytes()` of an in-memory journaled volume shows the image as of the last
-flush, not the last mutation.) A non-journaled volume is written byte for byte as before (`TestNonJournaledVolumeUnchangedByDefault`).
+that fits one group is atomic, and `Bytes()` of an in-memory journaled volume flushes the open group first, so it shows the last
+mutation (`TestGroupBytesIsCurrent`).) A non-journaled volume is written byte for byte as before (`TestNonJournaledVolumeUnchangedByDefault`).
 When the checks fail (not journaled, no `Sync` on the writer, journal never initialised, `jhdr_size` not
 512, ...) the open still succeeds, silently, and the volume writes directly exactly as in v0.17.0:
 `(*Volume).JournalWritesReason()` returns nil when the journal is on and otherwise the reason, wrapping

@@ -251,6 +251,8 @@ func (v *Volume) WriteFile(p string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
+	// An overwrite is two commits (delete, create): a group flush never falls between.
+	defer v.beginScope()()
 	t, err := v.begin()
 	if err != nil {
 		return err
@@ -703,6 +705,8 @@ func (v *Volume) Truncate(p string, newSize int64) error {
 	if mode == 0 {
 		mode = modeFileDefault
 	}
+	// Delete then create: two commits, a group flush never falls between them.
+	defer v.beginScope()()
 	t, err := v.begin()
 	if err != nil {
 		return err

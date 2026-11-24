@@ -4,6 +4,8 @@
 package hfsplus
 
 import (
+	"bytes"
+	"cmp"
 	"fmt"
 	"slices"
 )
@@ -72,7 +74,7 @@ func mergeSpans(sets ...[]span) []span {
 	for _, s := range sets {
 		all = append(all, s...)
 	}
-	slices.SortFunc(all, func(a, b span) int { return int(a.lo - b.lo) })
+	slices.SortFunc(all, func(a, b span) int { return cmp.Compare(a.lo, b.lo) })
 	var out []span
 	for _, s := range all {
 		if k := len(out); k > 0 && s.lo <= out[k-1].hi {
@@ -201,6 +203,55 @@ func (v *Volume) overlayGroup(p []byte, off int64) int {
 	return hiMax
 }
 
+// beginScope marks the start of a public mutation that commits more than once
+// (an overwrite is a delete then a create). While it is open, a commit that does not
+// fit flushes only what the group held BEFORE the mutation (splitGroup), so a
+// transaction never ends between two commits of one mutation. The returned func
+// ends the scope. It does nothing outside group mode.
+func (v *Volume) beginScope() func() {
+	if !v.groupMode() {
+		return func() {}
+	}
+	base := &jgroup{sectors: map[int64][]byte{}}
+	if g := v.grp; g != nil {
+		base.dirty = g.dirty
+		base.freed = slices.Clone(g.freed)
+		for k, b := range g.sectors {
+			base.sectors[k] = b
+		}
+	}
+	v.scopeBase = base
+	return func() { v.scopeBase = nil }
+}
+
+// splitGroup makes room for the commit in progress. Outside a scope it flushes the
+// whole group. Inside one it flushes the group as it was before the mutation and
+// keeps the mutation's earlier commits (the sectors that differ from it, and every
+// freed span: a block the mutation freed is still referenced by the durable volume)
+// as the next group.
+func (v *Volume) splitGroup() error {
+	base, cur := v.scopeBase, v.grp
+	if base == nil || cur == nil {
+		return v.flushGroup()
+	}
+	delta := &jgroup{sectors: map[int64][]byte{}, freed: cur.freed, dirty: cur.dirty}
+	for k, b := range cur.sectors {
+		if ob, ok := base.sectors[k]; ok && bytes.Equal(ob, b) {
+			continue
+		}
+		delta.sectors[k] = b
+	}
+	if err := v.writeGroup(base); err != nil {
+		return err
+	}
+	v.scopeBase = &jgroup{sectors: map[int64][]byte{}}
+	v.grp = delta
+	if len(delta.sectors) == 0 && len(delta.freed) == 0 {
+		v.grp = nil
+	}
+	return nil
+}
+
 // flushGroup makes the group one journal transaction. Nothing happens when there is
 // no group.
 func (v *Volume) flushGroup() error {
@@ -208,8 +259,17 @@ func (v *Volume) flushGroup() error {
 	if g == nil {
 		return nil
 	}
+	if err := v.writeGroup(g); err != nil {
+		return err
+	}
+	v.grp = nil
+	return nil
+}
+
+// writeGroup writes g as one journal transaction (or only the barrier it owes when it
+// holds no sector). It leaves v.grp alone.
+func (v *Volume) writeGroup(g *jgroup) error {
 	if len(g.sectors) == 0 {
-		v.grp = nil
 		if g.dirty {
 			return v.fsync()
 		}
@@ -245,7 +305,6 @@ func (v *Volume) flushGroup() error {
 	if _, err := v.emitTxn(planned, tsize, full, false, g.dirty); err != nil {
 		return err
 	}
-	v.grp = nil
 	v.touched = false
 	return nil
 }

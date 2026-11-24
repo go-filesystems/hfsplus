@@ -123,7 +123,9 @@ func (v *Volume) Durability() Durability { return v.durability }
 // one group (the bounds on DurabilityLazy) is ATOMIC: after a crash the volume
 // shows all of it or none of it, file bytes included. A larger Batch is a sequence
 // of groups made of whole mutations: a crash leaves a prefix of the mutations,
-// never part of one. On any other volume it is not a transaction: the mutations may
+// never part of one (an overwrite's delete and create are one mutation: a group is
+// never flushed between them). The one exception is a single mutation too large for
+// even an empty group, which is as torn as it is on DurabilityStrict. On any other volume it is not a transaction: the mutations may
 // be partly lost and the volume is left marked dirty, with DurabilityLazy's
 // data-writeback exposure.
 //

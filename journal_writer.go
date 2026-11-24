@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -339,7 +340,7 @@ func journalRuns(parts ...[]writeRun) []writeRun {
 	for _, p := range parts {
 		all = append(all, p...)
 	}
-	slices.SortFunc(all, func(a, b writeRun) int { return int(a.off - b.off) })
+	slices.SortFunc(all, func(a, b writeRun) int { return cmp.Compare(a.off, b.off) })
 	var out []writeRun
 	for _, r := range all {
 		if k := len(out); k > 0 && out[k-1].off+int64(len(out[k-1].data)) == r.off {

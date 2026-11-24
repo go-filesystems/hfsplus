@@ -359,12 +359,17 @@ func (v *Volume) flush() error {
 				v.commitDone()
 				return nil
 			}
-			if err := v.flushGroup(); err != nil {
+			if err := v.splitGroup(); err != nil {
 				return err
 			}
 			if v.absorb(meta, hdrP, hdrA) {
 				v.commitDone()
 				return nil
+			}
+			// The mutation's own commits do not fit one group: whatever the group holds
+			// is flushed so the commit goes alone (such a mutation is not atomic).
+			if err := v.flushGroup(); err != nil {
+				return err
 			}
 		}
 		if v.journalLevel() || v.groupMode() {

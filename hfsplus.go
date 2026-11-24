@@ -79,6 +79,9 @@ type Volume struct {
 	// the commit in progress freed.
 	grp    *jgroup
 	jfreed []span
+	// scopeBase, non-nil inside a public mutation that commits more than once
+	// (beginScope): the group as it was before the mutation's first commit.
+	scopeBase *jgroup
 	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
 	// every commit with the unmounted bit cleared, then set again.
 	cleanOnDisk bool
@@ -405,8 +408,19 @@ func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
 // Bytes returns the current (possibly mutated) image bytes of a volume opened
 // with OpenWritable over a []byte, or nil for any other volume (read-only, or
 // file-backed, which holds no copy of the image). The slice aliases the
-// volume's buffer; copy it if you need a stable snapshot.
-func (v *Volume) Bytes() []byte { return v.img }
+// volume's buffer; copy it if you need a stable snapshot. On a journaled volume at
+// DurabilityLazy the commits not yet written (the open group, journal_group.go) are
+// flushed first, as one journal transaction, so the image is current; a failure of
+// that flush latches like any other write failure and shows in the next call that
+// returns an error.
+func (v *Volume) Bytes() []byte {
+	if v.wr && !v.closed && v.failed == nil && v.grp != nil {
+		if err := v.flushGroup(); err != nil {
+			v.failed = err
+		}
+	}
+	return v.img
+}
 
 // Sync makes what the volume has written durable. Every mutator has already
 // written its changes (data, then B-trees and bitmap, then the alternate and the
