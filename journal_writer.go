@@ -30,8 +30,7 @@ import (
 //     in this PR: design section 11, risk 5); a commit with a sector that
 //     verifies as a block list header (forgedSector); a commit with more than 30
 //     runs or one that does not fit even an empty journal (the bypass: the journal is
-//     emptied, then today's strict path, which writes 'GoHF', store.go flush);
-//     DurabilityLazy and Batch (PR 7); and a
+//     emptied, then today's strict path, which writes 'GoHF', store.go flush); and a
 //     volume for which EnableJournalWrites refused (not journaled, journal not
 //     inside the volume or never initialised, jhdr_size other than 512, or any
 //     check of section 4 failing).
@@ -53,6 +52,13 @@ import (
 // scrub. Close commits T_c with the unmounted bit (1 barrier), then empties the
 // journal (2): journal_close, hfs_journal.c:2252-2356. Sync costs one barrier when
 // in-place writes are pending (jw.pending), none otherwise.
+//
+// Group commit (PR 7, journal_group.go): at DurabilityLazy (and so in Batch) a commit
+// that the journal could take is not written; its sectors join a group in memory and
+// Sync, Close, a switch away from Lazy or the group's size bound write the whole group
+// as ONE transaction (one barrier, two for a session's first). The volume is never held
+// dirty. A commit the group cannot take beside what it holds flushes the group first;
+// one that cannot be a group at all takes the Strict path above.
 //
 // The first journaled commit of a session starts with scrubRing (hfsplus#58): it
 // zeroes any sector of the ring that verifies as a block list header, then one
@@ -159,9 +165,9 @@ func (v *Volume) EnableJournalWrites() error {
 	return err
 }
 
-// journalLevel reports whether the current level takes the journal path when
-// journal writes are on: Strict and Mounted (design section 8). Lazy, and so
-// Batch, still write in place.
+// journalLevel reports whether the current level commits through the journal one
+// commit at a time: Strict and Mounted (design section 8). Lazy accumulates the
+// commits into a group (journal_group.go) that is one transaction.
 func (v *Volume) journalLevel() bool {
 	return v.durability == DurabilityStrict || v.durability == DurabilityMounted
 }
@@ -481,6 +487,16 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	if !ok {
 		return false, nil
 	}
+	return v.emitTxn(runs, tsize, full, len(cand) == 0, false)
+}
+
+// emitTxn writes one planned transaction (the commit protocol of the header
+// comment). ordered: the staged candidates go in place first (large path);
+// extraDirty: data written in place earlier (a group's spilled data) is not in
+// v.dataDirty any more and needs its barrier before the transaction. A group
+// flush passes ordered = false: v.jdata then belongs to the commit in flight.
+func (v *Volume) emitTxn(runs []writeRun, tsize uint64, full, ordered, extraDirty bool) (bool, error) {
+	jw := v.jw
 	if full {
 		if err := v.emptyJournal(); err != nil {
 			return false, err
@@ -526,12 +542,12 @@ func (v *Volume) flushJournal(meta []writeRun) (done bool, err error) {
 	// Large data (design section 6): in place, made durable by a barrier before the
 	// commit below, so a replay of T_k never shows a file whose bytes did not land.
 	// The blocks are unreferenced by anything durable and outside the revoke zones.
-	if len(cand) == 0 {
+	if ordered {
 		if err := v.writeOrdered(); err != nil {
 			return false, err
 		}
 	}
-	if v.dataDirty {
+	if v.dataDirty || extraDirty {
 		if err := v.fsync(); err != nil {
 			return false, err
 		}

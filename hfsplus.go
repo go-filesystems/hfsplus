@@ -74,6 +74,11 @@ type Volume struct {
 	jdata, jforced           []writeRun
 	jdataBytes, jforcedBytes int64
 	dataSpilled              bool
+	// Group commit at Lazy on a journaled volume (journal_group.go): grp holds the
+	// absorbed commits until they are flushed as one transaction; jfreed the blocks
+	// the commit in progress freed.
+	grp    *jgroup
+	jfreed []span
 	// cleanOnDisk: the volume was cleanly unmounted when opened, so flush brackets
 	// every commit with the unmounted bit cleared, then set again.
 	cleanOnDisk bool
@@ -467,6 +472,13 @@ func (v *Volume) CaseSensitive() bool {
 // closed (it is the caller's).
 func (v *Volume) Close() error {
 	var serr error
+	if v.wr && !v.closed && v.failed == nil && v.grp != nil {
+		// Group commit: the accumulated commits become one transaction first.
+		if err := v.flushGroup(); err != nil {
+			v.failed = err
+			serr = err
+		}
+	}
 	if v.wr && !v.closed && v.failed == nil && v.journaling() {
 		// Journal writes: empty the journal and put the clean mark back.
 		if err := v.closeJournal(); err != nil {

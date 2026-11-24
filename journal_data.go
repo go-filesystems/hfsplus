@@ -39,7 +39,7 @@ func (jw *journalWriter) dataBound() int64 {
 
 // stagesData reports whether writeData stages instead of writing.
 func (v *Volume) stagesData() bool {
-	return v.jw != nil && v.journalLevel()
+	return v.jw != nil
 }
 
 // hasStaged reports whether data waits for the commit.
@@ -66,7 +66,9 @@ func inZones(zones []span, off int64) bool {
 // is a candidate for small data, and is written in place (the large path) when
 // the staged bytes would pass the bound.
 func (v *Volume) stageData(p []byte, off int64) error {
-	zones := v.jw.zones
+	// The zones of the ring plus the blocks the open group freed: still durably
+	// referenced until the group's transaction lands, so data over them is journaled.
+	zones := v.allocZones()
 	for len(p) > 0 {
 		n, forced := int64(len(p)), false
 		i := sort.Search(len(zones), func(i int) bool { return zones[i].hi > off })

@@ -32,6 +32,14 @@ var goldenV017 = map[string]string{
 	"journaled-no-sync/strict":  "b2a1279713afe3aa029966dec7819ae907bf18fdb15a5211fd26828849648633",
 	"journaled-no-sync/mounted": "22d71b5f256c7a13ce1f68416c6bf707eb65765a1d262272b2a8889d9c94e9d5",
 	"journaled-no-sync/lazy":    "22d71b5f256c7a13ce1f68416c6bf707eb65765a1d262272b2a8889d9c94e9d5",
+
+	// Batch, digests of a clean checkout of v0.18.0 (origin/main 814dd8d).
+	"plain/strict-batch":              "3ea3445bce967691d2631962413d2dcd0454e261a7ddf19c4193a18e5c934d44",
+	"plain/mounted-batch":             "3ea3445bce967691d2631962413d2dcd0454e261a7ddf19c4193a18e5c934d44",
+	"plain/lazy-batch":                "3ea3445bce967691d2631962413d2dcd0454e261a7ddf19c4193a18e5c934d44",
+	"journaled-no-sync/strict-batch":  "22d71b5f256c7a13ce1f68416c6bf707eb65765a1d262272b2a8889d9c94e9d5",
+	"journaled-no-sync/mounted-batch": "22d71b5f256c7a13ce1f68416c6bf707eb65765a1d262272b2a8889d9c94e9d5",
+	"journaled-no-sync/lazy-batch":    "22d71b5f256c7a13ce1f68416c6bf707eb65765a1d262272b2a8889d9c94e9d5",
 }
 
 // goldenBase returns the committed base image of a kind.
@@ -76,7 +84,7 @@ func goldenBase(t *testing.T, kind string) []byte {
 	return img
 }
 
-func goldenRun(t *testing.T, kind string, d Durability) string {
+func goldenRun(t *testing.T, kind string, d Durability, batch bool) string {
 	t.Helper()
 	fixed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	timeNow = func() time.Time { return fixed }
@@ -101,12 +109,20 @@ func goldenRun(t *testing.T, kind string, d Durability) string {
 	if err := v.SetDurability(d); err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []string{"/a", "/b"} {
-		if err := v.MkDir(n, 0o755); err != nil {
-			t.Fatal(err)
+	ops := func() error {
+		for _, n := range []string{"/a", "/b"} {
+			if err := v.MkDir(n, 0o755); err != nil {
+				return err
+			}
 		}
+		return v.WriteFile("/f", fill(9000, 3), 0o644)
 	}
-	if err := v.WriteFile("/f", fill(9000, 3), 0o644); err != nil {
+	if batch {
+		err = v.Batch(ops)
+	} else {
+		err = ops()
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := v.Close(); err != nil {
@@ -119,14 +135,19 @@ func goldenRun(t *testing.T, kind string, d Durability) string {
 func TestWritesMatchV017Golden(t *testing.T) {
 	for _, kind := range []string{"plain", "journaled-no-sync"} {
 		for _, d := range allDurabilities {
-			key := kind + "/" + d.String()
-			t.Run(key, func(t *testing.T) {
-				got := goldenRun(t, kind, d)
-				t.Logf("GOLDEN %q: %q,", key, got)
-				if want := goldenV017[key]; got != want {
-					t.Errorf("image digest %s, v0.17.0 wrote %q", got, want)
+			for _, batch := range []bool{false, true} {
+				key := kind + "/" + d.String()
+				if batch {
+					key += "-batch" // Batch from level d: the same writes inside Lazy, then a Sync
 				}
-			})
+				t.Run(key, func(t *testing.T) {
+					got := goldenRun(t, kind, d, batch)
+					t.Logf("GOLDEN %q: %q,", key, got)
+					if want := goldenV017[key]; got != want {
+						t.Errorf("image digest %s, v0.18.0 wrote %q", got, want)
+					}
+				})
+			}
 		}
 	}
 }

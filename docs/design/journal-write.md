@@ -680,22 +680,19 @@ is the default, so the default gets the gain.
 as fast as today's Mounted and needs no dirty span. On non-journaled volumes,
 Mounted keeps its current meaning.
 
-**Lazy on a journaled volume** (later PR): commits accumulate into one
-in-memory transaction until Sync or a size bound. The regions are already
-kept through the overlay. Each flush is one journal commit (1 barrier), and it
-is atomic.
+**Lazy on a journaled volume** (PR 7, `journal_group.go`): commits accumulate
+into one in-memory transaction until Sync, Close, a level switch or a size bound.
+The regions are kept through the overlay. Each flush is one journal commit (1
+barrier, 2 for a session's first), and it is atomic. A Lazy commit writes nothing.
 
-**Batch** then becomes a real transaction when its mutations fit one block
-list: all or nothing after a crash. Today Batch is documented as "not a
-transaction" (durability.go:96). Until the Lazy PR lands:
+**Batch** is a real transaction when its mutations fit one group: all or nothing
+after a crash, file bytes included. A larger Batch is a sequence of groups of
+whole mutations, so a crash leaves a prefix of the mutations. On fn error the
+mutations stay and the Sync commits them.
 
-- Batch keeps today's behavior;
-- the journal is emptied before switching to a held level (`SetDurability`
-  already settles).
-
-**Switching levels.** A switch between the journal path and a bypass level
-always goes through "empty the journal" (2 barriers). The two paths never
-interleave.
+**Switching levels.** Journal writes apply at every level, so no switch empties
+the journal; leaving Lazy flushes the group (one transaction). The direct path is
+used only by non-journaled volumes and by a commit the journal cannot take.
 
 ## 9. What macOS must accept: the replay oracle
 
@@ -1024,5 +1021,14 @@ node. The writer also
    the barrier counts are asserted instead. README, docs site and landing: README
    here, the other two follow.
 7. **Lazy/Batch as an in-memory group commit** (atomic Batch).
+   **Status: done in the PR that follows v0.18.0** (`journal_group.go`,
+   `journal_group_test.go`); the release is v0.19.0. Bounds: the group holds at most
+   `dataBound()` bytes of sectors, 30 runs and 4096 freed spans. Blocks freed inside
+   the group are revoke zones for new data, so a Batch that deletes then reuses
+   blocks cannot expose the old bytes (`delete-then-reuse` case, red before the fix).
+   Verified by every-prefix crash oracles in both write orders and by a macOS kernel
+   replay of two Batches. Non-journaled volumes are byte-identical to v0.18.0
+   (`TestWritesMatchV017Golden`, now with Batch). The measurement was deferred if the
+   machine's load was above 8; see the PR.
 
 Each PR keeps today's behavior for non-journaled volumes, byte for byte.

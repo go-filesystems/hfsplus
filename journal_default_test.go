@@ -68,8 +68,8 @@ func TestJournalWritesDefaultOn(t *testing.T) {
 // Strict <-> Mounted is a switch between two journal-path levels: no emptying, the
 // transaction chain goes on; Lazy still empties.
 func TestJournalWritesStrictMountedSwitch(t *testing.T) {
-	img, jbase := journalImage(t, 0x80000, 1000, 0x4400)
-	v, c, path := jwFile(t, img, false)
+	img, _ := journalImage(t, 0x80000, 1000, 0x4400)
+	v, c, _ := jwFile(t, img, false)
 	defer v.Close()
 	must := func(err error) {
 		t.Helper()
@@ -94,18 +94,19 @@ func TestJournalWritesStrictMountedSwitch(t *testing.T) {
 	if c.syncs != before || !v.journaling() {
 		t.Errorf("Mounted -> Strict: %d barriers, journaling %v; want none, still live", c.syncs-before, v.journaling())
 	}
+	before = c.syncs
 	must(v.SetDurability(DurabilityLazy))
-	if v.journaling() {
-		t.Error("SetDurability(Lazy) left the journal live")
+	if !v.journaling() || c.syncs != before {
+		t.Errorf("Strict -> Lazy: %d barriers, journaling %v; want none, still live", c.syncs-before, v.journaling())
 	}
-	if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end {
-		t.Errorf("journal not empty after leaving the journal levels: %d %d", h.start, h.end)
+	must(v.MkDir("/c", 0o755)) // Lazy: accumulated in memory, never held dirty
+	if v.held || v.grp == nil || c.syncs != before {
+		t.Errorf("a Lazy commit on a journaled volume: held %v, group %v, %d barriers", v.held, v.grp != nil, c.syncs-before)
 	}
-	must(v.MkDir("/c", 0o755)) // Lazy: in place, held dirty
-	if !v.held {
-		t.Error("a Lazy commit on a journaled volume did not hold the volume dirty")
+	must(v.SetDurability(DurabilityMounted)) // flushes the group: one transaction
+	if v.grp != nil || c.syncs != before+1 {
+		t.Errorf("leaving Lazy: group %v, %d barriers, want none pending and 1", v.grp != nil, c.syncs-before)
 	}
-	must(v.SetDurability(DurabilityMounted)) // settles the held span, back on the journal
 	must(v.MkDir("/d", 0o755))
 	if !v.journaling() || v.held {
 		t.Errorf("Mounted after Lazy: journaling %v held %v", v.journaling(), v.held)

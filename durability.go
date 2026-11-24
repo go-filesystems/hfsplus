@@ -47,13 +47,26 @@ const (
 	// and three barriers, so the volume is not held dirty while it journals.
 	DurabilityMounted
 	// DurabilityLazy is DurabilityMounted without the per-commit barrier: a
-	// mutation is durable only after Sync, Close or SetDurability(DurabilityStrict)
+	// mutation is durable only after Sync, Close or a switch to another level
 	// (Batch does this for a group of mutations). A crash before that loses the
-	// mutations made since the last Sync, in whole or in part, and leaves the
-	// volume marked dirty. It is data-writeback: nothing orders file data before
-	// the metadata that references it, so after a crash a file may contain stale
-	// bytes of a previously deleted file. Do not use it where different users
-	// share a volume.
+	// mutations made since the last Sync.
+	//
+	// On a journaled volume written through its journal (the default) Lazy is a
+	// GROUP COMMIT: a commit writes nothing and pays no barrier, its sectors (and
+	// small file data) are kept in memory, and Sync, Close, a switch away from Lazy
+	// or the group's size bound write them as ONE journal transaction (one barrier,
+	// two for a session's first; none when nothing is pending). The volume is never
+	// marked dirty, a crash leaves the volume as of the last flush (a prefix of whole
+	// commits), and the stale-data exposure below does not exist: data written in
+	// place goes only into blocks no durable state references, ordered by a barrier
+	// before the transaction. The memory held is bounded by the journal's data bound
+	// (see journal_group.go): at most min(1 MiB, journal/8) of sectors, 30 runs and
+	// 4096 freed spans.
+	//
+	// On every other volume it is data-writeback: the volume is held dirty, nothing
+	// orders file data before the metadata that references it, and after a crash a
+	// file may contain stale bytes of a previously deleted file. Do not use it there
+	// where different users share a volume.
 	DurabilityLazy
 )
 
@@ -85,19 +98,14 @@ func (v *Volume) SetDurability(d Durability) error {
 	if d == v.durability {
 		return nil
 	}
-	if v.held || v.unsynced {
+	if v.held || v.unsynced || v.grp != nil {
+		// Leaving Lazy on a journaled volume flushes the group: one transaction.
 		if err := v.Sync(); err != nil {
 			return err
 		}
 	}
-	if v.journaling() && d != DurabilityStrict && d != DurabilityMounted {
-		// Journal writes apply at Strict and Mounted; Strict <-> Mounted needs no
-		// emptying. Leave the journal empty before a level that writes in place.
-		if err := v.emptyJournal(); err != nil {
-			v.failed = err
-			return err
-		}
-	}
+	// Journal writes apply at every level now (Lazy accumulates a group), so no level
+	// switch needs the journal emptied.
 	v.durability = d
 	return nil
 }
@@ -108,10 +116,19 @@ func (v *Volume) Durability() Durability { return v.durability }
 // Batch runs fn with DurabilityLazy, then makes everything fn wrote durable with
 // one Sync and restores the previous level: a group of mutations pays one set of
 // barriers instead of one per mutation (an SMB request that writes and sets times,
-// say). It is not a transaction: if fn fails or the machine dies, the mutations
-// made so far stay (or are partly lost) and the volume is left marked dirty; fn's
-// error is returned in preference to Sync's. Like SetDurability, it must not run
-// concurrently with mutators; it has DurabilityLazy's data-writeback exposure.
+// say).
+//
+// On a journaled volume written through its journal, a Batch whose mutations fit
+// one group (the bounds on DurabilityLazy) is ATOMIC: after a crash the volume
+// shows all of it or none of it, file bytes included. A larger Batch is a sequence
+// of groups made of whole mutations: a crash leaves a prefix of the mutations,
+// never part of one. On any other volume it is not a transaction: the mutations may
+// be partly lost and the volume is left marked dirty, with DurabilityLazy's
+// data-writeback exposure.
+//
+// If fn fails, the mutations it already made stay and are committed by the Sync
+// (they are not rolled back); fn's error is returned in preference to Sync's. Like
+// SetDurability, it must not run concurrently with mutators.
 func (v *Volume) Batch(fn func() error) error {
 	prev := v.durability
 	if err := v.SetDurability(DurabilityLazy); err != nil {
@@ -197,6 +214,10 @@ func (v *Volume) settle() error {
 	if v.jw != nil && !v.held && !v.unsynced {
 		// Journal mode (design section 7): every commit is already durable; one barrier
 		// if in-place writes are pending since the last one, nothing otherwise.
+		if v.grp != nil {
+			// Group commit: the transaction's own barrier is the Sync's.
+			return v.flushGroup()
+		}
 		if v.jw.pending {
 			return v.fsync()
 		}

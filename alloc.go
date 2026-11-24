@@ -98,7 +98,7 @@ func (v *Volume) newAllocator() (*allocator, error) {
 		curIdx: -1,
 	}
 	if v.stagesData() {
-		a.zones, a.revBound = v.jw.zones, v.jw.dataBound()
+		a.zones, a.revBound = v.allocZones(), v.jw.dataBound()
 	}
 	return a, nil
 }
@@ -221,6 +221,9 @@ func (a *allocator) clear(n uint32) {
 	}
 	a.edit(int64(n/8), func(b byte) byte { return b &^ (0x80 >> (n % 8)) })
 	a.free++
+	if a.v.groupMode() {
+		a.v.noteFreed(n, a.bs)
+	}
 }
 
 // skipUsed returns n advanced past the whole used bytes starting at n (n must be

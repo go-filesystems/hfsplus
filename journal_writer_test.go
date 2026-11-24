@@ -154,10 +154,9 @@ func mustOpen(t testing.TB, img []byte, replay bool) *Volume {
 	return v
 }
 
-// At Lazy the journal is not written (PR 7 covers it): the commit goes in place
-// and stamps 'GoHF', as v0.14.0. (Until PR 6 this test ran at Strict with no
-// opt-in; Strict is now on the journal path by default, journal_default_test.go.)
-func TestJournalWritesNotUsedAtLazy(t *testing.T) {
+// At Lazy a commit writes nothing (PR 7: it joins the group in memory, no barrier, no
+// journal write); Close flushes the group as one transaction and empties the journal.
+func TestJournalWritesAtLazyAreGrouped(t *testing.T) {
 	img, jbase := journalImage(t, 0x80000, 1000, 0x4400)
 	jh := bytes.Clone(img[jbase : jbase+512])
 	v, c, path := jwFile(t, img, false)
@@ -167,16 +166,24 @@ func TestJournalWritesNotUsedAtLazy(t *testing.T) {
 	if err := v.MkDir("/a", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if c.syncs != 1 {
-		t.Errorf("%d barriers, want 1 (the dirty mark; Lazy has no per-commit barrier)", c.syncs)
+	if c.syncs != 0 || len(c.events) != 0 {
+		t.Errorf("%d barriers and %d writes, want none (Lazy has no per-commit cost)", c.syncs, len(c.events))
 	}
-	v.Close()
+	if onDisk, _ := os.ReadFile(path); !bytes.Equal(onDisk[jbase:jbase+512], jh) {
+		t.Error("the journal header changed before any flush")
+	}
+	if err := v.Close(); err != nil {
+		t.Fatal(err)
+	}
 	onDisk, _ := os.ReadFile(path)
-	if !bytes.Equal(onDisk[jbase:jbase+512], jh) {
-		t.Error("the journal header changed without the opt-in")
+	if h := journalHeaderOf(t, onDisk, jbase); h.start != h.end {
+		t.Errorf("journal not empty after Close: %d %d", h.start, h.end)
 	}
-	if got := string(onDisk[vhLastMountedVersionOff : vhLastMountedVersionOff+4]); got != "GoHF" {
-		t.Errorf("lastMountedVersion %q, want GoHF", got)
+	if got := string(onDisk[vhLastMountedVersionOff : vhLastMountedVersionOff+4]); got != "HFSJ" {
+		t.Errorf("lastMountedVersion %q, want HFSJ", got)
+	}
+	if names, _ := rootNames(mustOpen(t, onDisk, false)); !slices.Equal(names, []string{"a"}) {
+		t.Errorf("the closed image shows %v", names)
 	}
 }
 
@@ -339,24 +346,30 @@ func TestJournalWriterFallbacks(t *testing.T) {
 	if got, err := v.ReadFile("/f.bin"); err != nil || !bytes.Equal(got, fill(5000, 7)) {
 		t.Errorf("f.bin: %d bytes, %v", len(got), err)
 	}
-	// Leaving the journal levels empties the journal; Lazy then writes in place.
-	// (Mounted is a journal level since PR 6: journal_default_test.go.)
+	// Every level journals since PR 7 (Lazy accumulates a group): no switch empties the
+	// journal, and a switch away from Lazy flushes the group.
 	must(v.MkDir("/g", 0o755)) // journal live again
 	if !v.journaling() {
 		t.Fatal("expected a live journal")
 	}
 	must(v.SetDurability(DurabilityLazy))
-	if v.journaling() {
-		t.Error("SetDurability(Lazy) left the journal live")
-	}
-	if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end {
-		t.Errorf("journal not empty after leaving Strict: %d %d", h.start, h.end)
+	if !v.journaling() {
+		t.Error("SetDurability(Lazy) took the journal off")
 	}
 	must(v.MkDir("/h", 0o755))
+	if v.held || v.grp == nil {
+		t.Errorf("a Lazy commit: held %v, group %v", v.held, v.grp != nil)
+	}
 	must(v.SetDurability(DurabilityStrict))
+	if v.grp != nil {
+		t.Error("SetDurability(Strict) left the group pending")
+	}
+	if names, _ := rootNames(mustOpen(t, mustRead(t, path), true)); !slices.Contains(names, "h") {
+		t.Errorf("the group was not flushed by the switch: %v", names)
+	}
 	must(v.MkDir("/i", 0o755))
 	if !v.journaling() {
-		t.Error("Strict after Lazy did not return to the journal")
+		t.Error("Strict after Lazy did not stay on the journal")
 	}
 }
 
