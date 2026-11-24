@@ -418,9 +418,15 @@ func checkJWScenario(t *testing.T, s jwScenario) {
 // header sequence number seq) for the scenarios, and the ring's absolute offset.
 func journalImage(t testing.TB, size, seq uint64, end uint64) ([]byte, int64) {
 	t.Helper()
-	h := buildJournalHeader(binary.LittleEndian, end, end, size, false)
-	binary.LittleEndian.PutUint32(h[32:], 0x2000)
-	binary.LittleEndian.PutUint32(h[44:], uint32(seq))
+	return journalImageOrder(t, binary.LittleEndian, size, seq, end)
+}
+
+// journalImageOrder is journalImage with the journal header in byte order bo.
+func journalImageOrder(t testing.TB, bo binary.ByteOrder, size, seq uint64, end uint64) ([]byte, int64) {
+	t.Helper()
+	h := buildJournalHeader(bo, end, end, size, false)
+	bo.PutUint32(h[32:], 0x2000)
+	bo.PutUint32(h[44:], uint32(seq))
 	resignJournalHeader(h)
 	img, _, jBlock := journaledImage(t, kJIJournalInFSMask, h, size)
 	return img, int64(jBlock) * 4096
