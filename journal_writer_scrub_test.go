@@ -133,13 +133,8 @@ func TestRingScrubIsLazy(t *testing.T) {
 	plantRing(img, jbase, 0x9000, forgedHeader(binary.LittleEndian, 0))
 	v, _, path := jwFile(t, img, true)
 	defer v.Close()
-	if err := v.SetDurability(DurabilityLazy); err != nil {
-		t.Fatal(err)
-	}
-	if err := v.WriteFile("/f", fill(5000, 9), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := v.SetDurability(DurabilityStrict); err != nil {
+	// A commit the journal cannot take (a forged sector) goes the direct path.
+	if err := plantForgedMkDir(v, "/f", binary.LittleEndian); err != nil {
 		t.Fatal(err)
 	}
 	if v.jw.scrubbed {

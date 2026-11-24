@@ -70,6 +70,9 @@ func (o overlayReader) ReadAt(p []byte, off int64) (int, error) {
 		return n, err
 	}
 	end := off + int64(len(p))
+	if hi := v.overlayGroup(p, off); hi > n {
+		n = hi
+	}
 	for _, r := range v.regions {
 		rEnd := r.off + int64(len(r.buf))
 		if r.off >= end || rEnd <= off {
@@ -169,6 +172,7 @@ func (v *Volume) region(off int64, n int) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("hfsplus: read [%d,+%d): %w", off, n, err)
 	}
+	v.overlayGroup(buf, off) // the commits a Lazy group holds are the volume's state
 	if v.regions == nil {
 		v.regions = make(map[int64]*region)
 	}
@@ -209,6 +213,7 @@ func (v *Volume) discard() {
 	v.regions = nil
 	v.regionBytes = 0
 	v.werr = nil
+	v.jfreed = nil
 	v.dropStaged()
 	v.dropReadCache()
 }
@@ -342,9 +347,32 @@ func (v *Volume) flush() error {
 	if v.jw != nil {
 		// Journal writes are on (the default on a journaled volume). A commit at Strict
 		// or Mounted is a journal transaction, its file data journaled or ordered
-		// (journal_data.go); Lazy writes directly, which first empties the journal: a
-		// direct write with transactions pending would be overwritten by their replay.
-		if v.journalLevel() {
+		// (journal_data.go); a Lazy commit joins the in-memory group (below). Only a
+		// commit the journal cannot take writes directly, which first empties the
+		// journal: a direct write with transactions pending would be overwritten by
+		// their replay.
+		if v.groupMode() {
+			// Lazy: the commit joins the group (journal_group.go). When it does not fit
+			// beside what the group holds, the group is flushed first and the commit starts
+			// the next one; when it cannot be a group at all it takes the Strict path below.
+			if v.absorb(meta, hdrP, hdrA) {
+				v.commitDone()
+				return nil
+			}
+			if err := v.splitGroup(); err != nil {
+				return err
+			}
+			if v.absorb(meta, hdrP, hdrA) {
+				v.commitDone()
+				return nil
+			}
+			// The mutation's own commits do not fit one group: whatever the group holds
+			// is flushed so the commit goes alone (such a mutation is not atomic).
+			if err := v.flushGroup(); err != nil {
+				return err
+			}
+		}
+		if v.journalLevel() || v.groupMode() {
 			done, err := v.flushJournal(meta)
 			if err != nil {
 				return err
@@ -382,7 +410,7 @@ func (v *Volume) flush() error {
 	// direct path below (bracketed, never held), so a volume is never held dirty while
 	// it journals: the next commit would journal inside a dirty span and settle would
 	// write the clean mark over a live journal.
-	if v.durability == DurabilityLazy || (v.durability == DurabilityMounted && v.jw == nil) {
+	if v.jw == nil && v.durability != DurabilityStrict {
 		return v.flushHeld(meta, hdrP, hdrA, old, journaled)
 	}
 	if v.cleanOnDisk || journaled {
@@ -482,6 +510,7 @@ func (v *Volume) commitDone() {
 	v.regionBytes = 0
 	v.touched = false
 	v.dataDirty = false
+	v.jfreed = nil
 	v.dropStaged()
 	v.dropReadCache()
 }

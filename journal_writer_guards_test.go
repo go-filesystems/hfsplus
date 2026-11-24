@@ -135,8 +135,8 @@ func TestSetDurabilityEdges(t *testing.T) {
 		t.Fatal(err)
 	}
 	n, s := len(c.events), c.syncs
-	if err := v.SetDurability(DurabilityLazy); err != nil || len(c.events) != n || c.syncs != s || !v.held {
-		t.Errorf("same level, writes held: %v, %d events, %d barriers, held %v", err, len(c.events)-n, c.syncs-s, v.held)
+	if err := v.SetDurability(DurabilityLazy); err != nil || len(c.events) != n || c.syncs != s || v.grp == nil {
+		t.Errorf("same level, group pending: %v, %d events, %d barriers, group %v", err, len(c.events)-n, c.syncs-s, v.grp != nil)
 	}
 }
 

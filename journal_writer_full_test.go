@@ -309,38 +309,37 @@ func TestJournalSwitchingLevels(t *testing.T) {
 	const size = 0x40000
 	for _, lvl := range []Durability{DurabilityLazy} {
 		t.Run(lvl.String(), func(t *testing.T) {
-			img, jbase := journalImage(t, size, 100, 0x4400)
+			img, _ := journalImage(t, size, 100, 0x4400)
 			v, c, path := jwFile(t, img, true)
 			defer v.Close()
 			if err := v.MkDir("/a", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			seq := v.jw.lastSeq
 			before := c.syncs
 			if err := v.SetDurability(lvl); err != nil {
 				t.Fatal(err)
 			}
-			if got := c.syncs - before; got != 2 {
-				t.Errorf("leaving the journal path paid %d barriers, want 2", got)
-			}
-			if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end || h.sequenceNum != seq || v.journaling() {
-				t.Errorf("after the switch: header %+v, journaling %v", h, v.journaling())
+			if got := c.syncs - before; got != 0 || !v.journaling() {
+				t.Errorf("entering Lazy paid %d barriers, journaling %v: the journal stays live, no emptying", got, v.journaling())
 			}
 			if err := v.MkDir("/b", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if v.journaling() {
-				t.Error("a commit at a held level went through the journal")
+			if !v.journaling() || v.held || v.grp == nil || c.syncs != before {
+				t.Errorf("a Lazy commit: journaling %v, held %v, group %v, %d barriers", v.journaling(), v.held, v.grp != nil, c.syncs-before)
 			}
 			if err := v.SetDurability(DurabilityStrict); err != nil {
 				t.Fatal(err)
+			}
+			if got := c.syncs - before; got != 1 || v.grp != nil {
+				t.Errorf("leaving Lazy paid %d barriers, group pending %v, want 1 and none", got, v.grp != nil)
 			}
 			before = c.syncs
 			if err := v.MkDir("/c", 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if got := c.syncs - before; got != 2 || !v.journaling() {
-				t.Errorf("first commit after the switch back: %d barriers, journaling %v", got, v.journaling())
+			if got := c.syncs - before; got != 1 || !v.journaling() {
+				t.Errorf("commit after the switch back: %d barriers, journaling %v", got, v.journaling())
 			}
 			names, _ := rootNames(mustOpen(t, mustRead(t, path), true))
 			if !slices.Equal(names, []string{"a", "b", "c"}) {
@@ -349,18 +348,22 @@ func TestJournalSwitchingLevels(t *testing.T) {
 		})
 	}
 	t.Run("Batch", func(t *testing.T) {
-		img, jbase := journalImage(t, size, 100, 0x4400)
-		v, _, path := jwFile(t, img, true)
+		img, _ := journalImage(t, size, 100, 0x4400)
+		v, c, _ := jwFile(t, img, true)
 		defer v.Close()
 		if err := v.MkDir("/a", 0o755); err != nil {
 			t.Fatal(err)
 		}
+		before := c.syncs
 		err := v.Batch(func() error {
-			if h := journalHeaderOf(t, mustRead(t, path), jbase); h.start != h.end {
-				t.Errorf("journal not empty inside Batch: %+v", h)
+			if !v.journaling() || c.syncs != before {
+				t.Errorf("entering a Batch: journaling %v, %d barriers; want live, none", v.journaling(), c.syncs-before)
 			}
 			return v.MkDir("/b", 0o755)
 		})
+		if got := c.syncs - before; got != 1 {
+			t.Errorf("the Batch paid %d barriers, want 1", got)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}

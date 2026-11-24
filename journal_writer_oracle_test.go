@@ -443,11 +443,8 @@ func TestJournalWriterCrashOracleClose(t *testing.T) {
 		name: "close", img: img, ops: mkdirOps(4), tailSyncs: 3,
 		tail: func(v *Volume) error { return v.Close() },
 	})
-	img, _ = journalImage(t, 0x40000, 100, 0x4400)
-	checkJWScenario(t, jwScenario{
-		name: "set-durability", img: img, ops: mkdirOps(4), tailSyncs: 2,
-		tail: func(v *Volume) error { return v.SetDurability(DurabilityLazy) },
-	})
+	// (SetDurability(Lazy) no longer empties the journal since PR 7: a Lazy session is a
+	// group commit, whose crash oracle is journal_group_test.go.)
 }
 
 // The same oracle at DurabilityMounted, through the default path: a Mounted commit

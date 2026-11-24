@@ -87,6 +87,33 @@ func TestDarwinJournalWriterDataKernelReplay(t *testing.T) {
 	darwinKernelReplay(t, "JWDATA", ops, observeFiles, mountView)
 }
 
+// TestDarwinJournalWriterBatchKernelReplay (PR 7): each op is a Batch, one group
+// commit (metadata, small and large data, a delete whose blocks the next Batch
+// reuses). Every crash image goes to macOS, whose mount must show the volume before
+// the Batch or after all of it, bytes included, never part of it.
+func TestDarwinJournalWriterBatchKernelReplay(t *testing.T) {
+	batch := func(ops ...jwOp) jwOp {
+		return func(v *Volume) error {
+			return v.Batch(func() error {
+				for _, op := range ops {
+					if err := op(v); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+	}
+	ops := []jwOp{
+		batch(
+			func(v *Volume) error { return v.MkDir("/dirA", 0o755) },
+			wf("/f1", pat(3000, 1)), wf("/f2", pat(12000, 2)), rm("/f1"), wf("/f3", pat(1500, 3)),
+		),
+		batch(rm("/f2"), wf("/f4", pat(12000, 4)), wf("/f5", pat(500, 5))),
+	}
+	darwinKernelReplay(t, "JWBATCH", ops, observeFiles, mountView)
+}
+
 // TestDarwinJournalWriterFullKernelReplay (PR 5): journal-full commits, then
 // Close's T_c, every crash image handed to macOS.
 func TestDarwinJournalWriterFullKernelReplay(t *testing.T) {

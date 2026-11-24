@@ -96,22 +96,34 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   | `DurabilityMounted` | 2 | 1 | 2 | 1 | yes | marked dirty until `Sync`/`Close` |
   | `DurabilityLazy` | 1 | 0 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
   | `Strict` or `Mounted`, journaled volume, journal writes on (**default since v0.18.0**) | 2 | 1 | 1 (small data) | 0 or 1 | yes | mounted, journal live; `Close` marks it clean |
+  | `Lazy` or `Batch`, journaled volume, journal writes on (**v0.19.0**) | 0 | 0 | 0 (large data: written in place, ordered by one barrier before the transaction) | 2 for a session's first flush, 1 after; the first `Sync` after a flush pays 1 more (its in-place writes), then 0 | no, only after `Sync`/`Close`/a level switch | mounted, journal live, never marked dirty |
 
-  The first three rows are the direct path: every non-journaled volume, `DurabilityLazy` and `Batch`, and a
-  journaled volume that fell back (see "Writing through the journal"). The last row replaces the `Strict` and
-  `Mounted` rows on a journaled volume, which is where the journal is on by default: both levels run the same
-  journal commit, so `Mounted` no longer has a dirty span there (the journal makes each commit atomic). A single
-  commit that cannot be journaled while the journal is on (a forged sector, more than 30 runs) takes the `Strict`
-  direct path at `Mounted` too: the volume is never held dirty while it journals.
+  The first three rows are the direct path: every non-journaled volume, and a journaled volume that fell back
+  (see "Writing through the journal"). The fourth row replaces the `Strict` and `Mounted` rows on a journaled
+  volume, which is where the journal is on by default: both levels run the same journal commit, so `Mounted` no
+  longer has a dirty span there (the journal makes each commit atomic). A single commit that cannot be
+  journaled while the journal is on (a forged sector, more than 30 runs) takes the `Strict` direct path at
+  `Mounted` too: the volume is never held dirty while it journals. The last row replaces the `Lazy` row on a
+  journaled volume: **a group commit**. A Lazy commit writes nothing and takes no barrier; its changed sectors
+  (and its small data) are kept in memory, and `Sync`, `Close`, `SetDurability` away from `Lazy` or the group's
+  size bound write them as ONE journal transaction. The memory is bounded: the group never holds more than the
+  journal's data bound (the smaller of 1 MiB and one eighth of the journal, at most 2048 sectors; 32704 bytes on a
+  256 KiB journal), at most 30 runs and 4096 freed block spans, on top of the per-mutation limit that already
+  existed. A commit that does not fit beside the group flushes the group first and starts the next one.
 
   `Mounted` is data-ordered (like ext4 `data=ordered`): a commit that wrote file data puts a barrier
   between the data and the metadata that points at it, so no crash image shows a file holding bytes it
-  was never written with (`TestDurabilityNoStaleData`, red without that barrier). `Lazy` is
-  data-writeback, by design: after a crash a file may contain stale bytes of a previously deleted file
-  (a disclosure), so do not use `Lazy` or `Batch` where different users share a volume. Under `Mounted`
-  and `Lazy` the journaled bit stays cleared for the whole held span, not one commit: after a crash in
-  it the volume stays non-journaled until `diskutil enableJournal`. `SetDurability` and `Batch` must not
-  run concurrently with mutators.
+  was never written with (`TestDurabilityNoStaleData`, red without that barrier). On the direct path `Lazy`
+  is data-writeback, by design: after a crash a file may contain stale bytes of a previously deleted file
+  (a disclosure), so do not use `Lazy` or `Batch` on a volume that is not written through its journal where
+  different users share it. On a journaled volume written through its journal this exposure is gone, as far
+  as the tests show: small data is in the transaction, large data is written in place only into blocks no
+  durable state references (blocks the group freed are treated as still referenced and their new data goes
+  through the transaction) and a barrier orders it before the transaction (`TestGroupBatchAtomicCrashOracle`,
+  its `delete-then-reuse` case is red without that rule: the surviving file read the deleted file's bytes).
+  On the direct path, under `Mounted` and `Lazy` the journaled bit stays cleared for the whole held span, not
+  one commit: after a crash in it the volume stays non-journaled until `diskutil enableJournal`; the group
+  commit never clears it. `SetDurability` and `Batch` must not run concurrently with mutators.
 
   Three barriers is the minimum for a commit that leaves the volume clean: the dirty mark must be durable
   before a sector moves, and those sectors before the clean mark. `Mounted` is TN1150's own protocol
@@ -120,8 +132,17 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   durable with one barrier, and `Sync`/`Close` restores the clean marks. Nothing inside a commit is ordered,
   the dirty mark is what protects it: a crash between `Sync`s leaves a volume that `fsck_hfs` checks at
   mount, never one that claims to be clean and is not. `Batch(fn)` runs `fn` lazily then `Sync`s: a group
-  of mutations (an SMB write plus its times) pays one set of barriers, not a transaction (a crash loses
-  the group in whole or in part, with the volume marked dirty). `Close` settles. A failed volume is left
+  of mutations (an SMB write plus its times) pays one set of barriers. On the direct path it is not a
+  transaction (a crash loses the group in whole or in part, with the volume marked dirty). **On a journaled
+  volume written through its journal (v0.19.0) a Batch whose mutations fit one group is ATOMIC**: after a
+  crash the volume shows all of it or none of it, file bytes included (`TestGroupBatchAtomicCrashOracle`,
+  every crash prefix, both write orders; and macOS's own mount and `fsck_hfs` on sampled crash images,
+  `TestDarwinJournalWriterBatchKernelReplay`). A Batch larger than one group is NOT atomic: it is a sequence
+  of groups, each made of whole mutations, so a crash leaves a prefix of the mutations, never part of one
+  (`TestGroupBatchLargerThanOneGroupLeavesAPrefix`); an overwrite or a `Truncate`, which commit twice, are
+  never split by the bound (`TestGroupBatchNeverSplitsAMutation`). A single mutation too large for an empty
+  group is not atomic, as on Strict. If `fn` returns an error the mutations it made stay and
+  are committed by the Batch's `Sync`, as before; the error is returned. `Close` settles. A failed volume is left
   dirty. Checked by `TestDurabilityCrashModel` (both crash models plus every write of every fsync group
   landing alone or missing alone) and `TestDarwinCrashImagesFsck` at every level.
 
@@ -286,15 +307,17 @@ commit, 1 after, instead of 3, or 2 and 1 for `Mounted`), the volume reads `last
 (not `GoHF`) and not-cleanly-unmounted while the session runs, and `Close` writes a last transaction and
 empties the journal, so **`Close` (or `Sync`) matters more than before**: a volume that is never closed is
 left with a live journal that macOS replays at its next mount, which is correct but is not the clean image
-the direct path left. `Mounted` on a journaled volume no longer keeps a dirty span. `SetDurability(Lazy)`
-and `Batch` still write in place, and empty the journal first; switching between `Strict` and `Mounted` does
-not. A non-journaled volume is written byte for byte as before (`TestNonJournaledVolumeUnchangedByDefault`).
+the direct path left. `Mounted` on a journaled volume no longer keeps a dirty span. (Since v0.19.0
+`SetDurability(Lazy)` and `Batch` are a group commit on a journaled volume: nothing is written until
+`Sync`, `Close` or a level switch, then one transaction; no level switch empties the journal. For an existing
+caller of `Lazy` or `Batch`: the volume is no longer marked dirty or written in place between `Sync`s, a Batch
+that fits one group is atomic, and `Bytes()` of an in-memory journaled volume flushes the open group first, so it shows the last
+mutation (`TestGroupBytesIsCurrent`).) A non-journaled volume is written byte for byte as before (`TestNonJournaledVolumeUnchangedByDefault`).
 When the checks fail (not journaled, no `Sync` on the writer, journal never initialised, `jhdr_size` not
 512, ...) the open still succeeds, silently, and the volume writes directly exactly as in v0.17.0:
 `(*Volume).JournalWritesReason()` returns nil when the journal is on and otherwise the reason, wrapping
 `ErrJournalWritesUnavailable`. There is no opt-out switch: no caller in the go-filesystems organisation
-used `EnableJournalWrites`, and a caller that wants in-place writes on a journaled volume has
-`DurabilityLazy`/`Batch`; say so on hfsplus#45 if you need one. `EnableJournalWrites()` stays, a no-op when
+used `EnableJournalWrites`; say so on hfsplus#45 if you need an in-place mode. `EnableJournalWrites()` stays, a no-op when
 the journal is already on, and re-tries the checks after a fallback.
 
 `v.EnableJournalWrites()` is what the opens call. When on, a **metadata-only commit at
@@ -341,8 +364,8 @@ transaction is live: a commit that carries a sector which verifies as a block li
 sector past the journal's end, and catalog nodes hold file names a user chooses; every 512-byte sector of
 every journaled block is checked, in both byte orders, before the transaction is written, and the writer
 never emits sequence number 0; a planted sector makes every commit that touches the poisoned catalog node take the direct path, whoever makes it; and, since v0.15.2 (hfsplus#58), the first journaled commit of a session first scrubs the ring: it reads the journal once, 64 KiB at a time, and zeroes every 512-byte sector that verifies as a block list header in either byte order (a sector a v0.15.0 session wrote before the guard, or another implementation left), with one extra barrier that makes the zeroes durable before the transaction lands, and only when a sector was zeroed. Unproven: whether the kernel's replay or `fsck_hfs` follows a forged list, since the proof covers this driver's replayer only), a commit
-that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit even an empty journal, and `DurabilityLazy` and `Batch` (`SetDurability`
-empties the journal first; PR 7 of hfsplus#45 covers them). A commit that fits an empty journal but not the live one (three transactions
+that changes more than 30 runs of 512-byte sectors, a run that is not whole sectors, or does not fit even an empty journal, (`DurabilityLazy` and `Batch` are a group commit since PR 7 of hfsplus#45, see "Durability levels"; a group the
+journal cannot take is flushed and the commit goes the Strict way). A commit that fits an empty journal but not the live one (three transactions
 must fit, TN1150 leaves one sector free) is **journal full**, no longer a fallback (PR 5): the journal is
 emptied (2 barriers) and the commit goes in as a first commit (2 more), numbered previous + 1, with no
 ring scrub. Every such fallback ("bypass") empties the journal first and writes `GoHF` as before. At `Mounted`
@@ -377,7 +400,7 @@ ordered path instead (in place, barrier, then the transaction).
 | `(*Volume) Sync() error` | Final fsync; at `DurabilityMounted`/`DurabilityLazy` also makes everything durable and restores the clean marks |
 | `(*Volume) JournalWritesReason() error` | nil when commits go through the journal (default on a journaled volume, v0.18.0), `ErrReadOnly` on a read-only volume, else why the volume writes directly (wraps `ErrJournalWritesUnavailable`) |
 | `(*Volume) SetDurability(Durability) error` / `Durability()` | Choose `DurabilityStrict` (default), `DurabilityMounted` or `DurabilityLazy`; see "Durability levels" |
-| `(*Volume) Batch(fn func() error) error` | Run `fn` lazily, then one `Sync` |
+| `(*Volume) Batch(fn func() error) error` | Run `fn` lazily, then one `Sync`; on a journaled volume one atomic journal transaction when `fn`'s mutations fit one group |
 | `(*Volume) ListDir / ReadFile / Stat / ReadLink` | Read paths |
 | `(*Volume) Chtimes` | `Chtimes(path, atime, mtime)`: contentModDate and accessDate as whole GMT seconds since 1904 (rounded down), attributeModDate (ctime) set to the clock, createDate untouched; a zero time leaves its field unchanged; a time outside 1904-01-01 00:00:01 .. 2040-02-06 06:28:15 GMT (the date 0 reads as "not recorded") is a `*TimeRangeError` (`errors.Is(err, ErrTimeOutOfRange)`), nothing written; the catalog record is patched in place, so the B-tree is unchanged in shape. Checked with `fsck_hfs` and a macOS mount |
 | `(*Volume) Chmod`, `Chown` | with `Chtimes`, the whole `filesystem.MetadataSetter` (what SMB/NFS/SFTP servers probe for). `Chmod` replaces the 12 permission bits (setuid/setgid/sticky included) of `HFSPlusBSDInfo.fileMode`, keeping the type bits; `Chown` sets ownerID/groupID; both patch the catalog record in place (file or folder), set attributeModDate to the clock, refuse the root folder, and `Stat` now reports a folder's recorded mode. Checked with a macOS mount (`stat -f %Lp`) |
