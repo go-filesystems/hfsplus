@@ -190,9 +190,6 @@ func (v *Volume) overlayGroup(p []byte, off int64) int {
 	hiMax := 0
 	apply := func(s int64, b []byte) {
 		lo, hi := max(s, off), min(s+jwBlockSize, end)
-		if lo >= hi {
-			return
-		}
 		copy(p[lo-off:hi-off], b[lo-s:hi-s])
 		hiMax = max(hiMax, int(hi-off))
 	}
