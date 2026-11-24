@@ -31,9 +31,10 @@ func TestEnableJournalWritesReasons(t *testing.T) {
 
 	// A journal info block that says "needs init": the header holds nothing yet.
 	img, _, _ := journaledImage(t, kJIJournalInFSMask|kJIJournalNeedInitMask, make([]byte, 512), size)
-	if v, err = OpenWritable(img, nil); err == nil {
-		reason(v.EnableJournalWrites(), "never initialised")
+	if v, err = OpenWritable(img, nil); err != nil {
+		t.Fatalf("OpenWritable on a never-initialised journal: %v", err)
 	}
+	reason(v.EnableJournalWrites(), "never initialised")
 
 	// Calling it twice keeps the first writer (its state is the session's).
 	img, _ = journalImage(t, size, 1000, 0x4400)
