@@ -53,8 +53,8 @@ const (
 	//
 	// On a journaled volume written through its journal (the default) Lazy is a
 	// GROUP COMMIT: a commit writes nothing and pays no barrier, its sectors (and
-	// small file data) are kept in memory, and Sync, Close, a switch away from Lazy
-	// or the group's size bound write them as ONE journal transaction (one barrier,
+	// small file data) are kept in memory, and Sync, Close, a switch away from Lazy,
+	// Bytes (an in-memory volume only) or the group's size bound write them as ONE journal transaction (one barrier,
 	// two for a session's first; a Sync right after pays one more for the flush's in-place
 	// writes, then none). The volume is never
 	// marked dirty, a crash leaves the volume as of the last flush (a prefix of whole

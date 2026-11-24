@@ -17,8 +17,8 @@ import (
 // small data) are copied into jgroup.sectors, and reads see them through
 // overlayGroup. Nothing reaches the medium until the group is flushed, as ONE
 // journal transaction (emitTxn, the same commit protocol as Strict: one barrier,
-// two for a session's first), by Sync, Close, SetDurability away from Lazy (so by
-// Batch's end), or because the next commit would not fit.
+// two for a session's first), by Sync, Close, Bytes (an in-memory volume only),
+// SetDurability away from Lazy (so by Batch's end), or because the next commit would not fit.
 //
 // The group is bounded, which is what bounds the memory of a long Lazy session:
 //

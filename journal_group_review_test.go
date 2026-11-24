@@ -186,6 +186,25 @@ func TestGroupBytesIsCurrent(t *testing.T) {
 	}
 }
 
+// Bytes is nil on a file-backed volume, and asking for it must not commit the group
+// or pay a barrier.
+func TestGroupBytesOnAFileBackedVolumeDoesNotFlush(t *testing.T) {
+	v, c, _ := groupVolume(t)
+	if err := v.MkDir("/lazy", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if v.grp == nil {
+		t.Fatal("the commit was not absorbed into a group")
+	}
+	syncs, w := c.syncs, len(c.writes)
+	if b := v.Bytes(); b != nil {
+		t.Fatalf("Bytes() = %d bytes on a file-backed volume, want nil", len(b))
+	}
+	if v.grp == nil || c.syncs != syncs || len(c.writes) != w {
+		t.Errorf("Bytes() flushed the group: grp %v, %d barriers, %d writes", v.grp != nil, c.syncs-syncs, len(c.writes)-w)
+	}
+}
+
 // Spans more than 2^31 apart sort by value whatever the width of int (a subtraction
 // converted to int wraps on 32 bits).
 func TestMergeSpansFarApart(t *testing.T) {

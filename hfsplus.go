@@ -414,7 +414,7 @@ func OpenWritableAt(rw ReadWriteSyncerAt, size int64) (*Volume, error) {
 // that flush latches like any other write failure and shows in the next call that
 // returns an error.
 func (v *Volume) Bytes() []byte {
-	if v.wr && !v.closed && v.failed == nil && v.grp != nil {
+	if v.img != nil && v.wr && !v.closed && v.failed == nil && v.grp != nil {
 		if err := v.flushGroup(); err != nil {
 			v.failed = err
 		}
