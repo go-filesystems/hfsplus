@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
@@ -93,6 +94,58 @@ func TestGroupSplitKeepsTheMutationsSectors(t *testing.T) {
 		t.Errorf("the freed span was lost: %v", v.grp.freed)
 	}
 	v.grp = nil
+}
+
+// splitGroup and flushGroup outside a scope, or with nothing open.
+func TestGroupSplitEdges(t *testing.T) {
+	v, c, _ := groupVolume(t)
+	if err := v.splitGroup(); err != nil {
+		t.Fatalf("no group: %v", err)
+	}
+	// No scope: the whole group is written and gone.
+	v.grp = &jgroup{sectors: map[int64][]byte{0x30000: pat(512, 1)}}
+	w := len(c.writes)
+	if err := v.splitGroup(); err != nil || v.grp != nil || len(c.writes) == w {
+		t.Fatalf("no scope: err %v, grp %v, %d writes", err, v.grp, len(c.writes)-w)
+	}
+	// A scope with no group left (the mutation changed nothing yet).
+	v.scopeBase = &jgroup{sectors: map[int64][]byte{}}
+	if err := v.splitGroup(); err != nil {
+		t.Fatalf("scope, no group: %v", err)
+	}
+	v.scopeBase = nil
+	// A group identical to the scope's base leaves nothing for the next group.
+	v.grp = &jgroup{sectors: map[int64][]byte{0x30000: pat(512, 1)}}
+	end := v.beginScope()
+	w = len(c.writes)
+	if err := v.splitGroup(); err != nil || v.grp != nil || len(c.writes) == w {
+		t.Fatalf("unchanged group: err %v, grp %v, %d writes", err, v.grp, len(c.writes)-w)
+	}
+	end()
+}
+
+// A mutation whose commits do not fit even an empty group goes alone, and the flush
+// of what it had already staged reports its failure.
+func TestGroupMutationTooBigForAGroupReportsTheFlush(t *testing.T) {
+	v, c, _ := groupVolume(t)
+	end := v.beginScope()
+	defer end()
+	if err := v.MkDir("/a", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if v.grp == nil {
+		t.Fatal("the first commit was not absorbed")
+	}
+	for i := 0; i <= maxGroupFreed; i++ {
+		v.jfreed = append(v.jfreed, span{int64(i) * 1024, int64(i)*1024 + 512})
+	}
+	c.failAt = len(c.writes)
+	err := v.MkDir("/b", 0o755)
+	c.failAt = -1
+	v.jfreed = nil
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("MkDir = %v, want the flush failure", err)
+	}
 }
 
 // Bytes is the current image: the open group is flushed into it first.
