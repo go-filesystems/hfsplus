@@ -82,6 +82,19 @@ func (v *Volume) stageData(p []byte, off int64) error {
 		}
 		piece := p[:n]
 		switch {
+		case forced && v.jforcedBytes+n > v.jw.dataBound():
+			// Past the bound of its own (hfsplus#61): the forced blocks do not all fit one
+			// transaction, so this takes the direct path, as a plan that does not fit does
+			// (store.go flush): empty the journal, and everything staged goes in place with
+			// the piece. Nothing replays over it then, and the staging stays bounded.
+			if err := v.settleForced(); err != nil {
+				return err
+			}
+			if err := v.putAt(piece, off); err != nil {
+				return err
+			}
+			v.dataDirty = true
+			zones = v.allocZones()
 		case forced:
 			v.jforced = appendRun(v.jforced, piece, off)
 			v.jforcedBytes += n
@@ -108,6 +121,20 @@ func (v *Volume) stageData(p []byte, off int64) error {
 func (v *Volume) spillData() error {
 	v.dataSpilled = true
 	return v.writeOrdered()
+}
+
+// settleForced is the direct path of flush, taken early: the open group (Lazy) is
+// flushed, the journal emptied, and every staged byte goes in place.
+func (v *Volume) settleForced() error {
+	if v.groupMode() {
+		if err := v.flushGroup(); err != nil {
+			return err
+		}
+	}
+	if err := v.emptyJournal(); err != nil {
+		return err
+	}
+	return v.writeStaged()
 }
 
 // writeOrdered writes the staged candidates in place and forgets them.

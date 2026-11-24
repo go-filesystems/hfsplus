@@ -106,6 +106,42 @@ func TestJournalDataFaults(t *testing.T) {
 			return err
 		})
 	})
+	t.Run("forced past the bound (hfsplus#61)", func(t *testing.T) {
+		// A candidate, a small forced piece, then a forced piece past the bound: the early
+		// direct path writes all three in place, and a failure of any write is returned.
+		faultSweep(t, "forced-bound", func(v *Volume) {
+			if err := v.MkDir("/m", 0o755); err != nil { // makes the journal live
+				t.Fatal(err)
+			}
+			big := v.jw.dataBound() * 3
+			v.jw.zones = []span{{2 << 20, 2<<20 + big}, {3 << 20, 3<<20 + 8192}}
+		}, func(v *Volume) error {
+			big := int(v.jw.dataBound()) * 3
+			for _, w := range []struct {
+				p   []byte
+				off int64
+			}{{pat(512, 1), 1 << 20}, {pat(8192, 2), 3 << 20}, {pat(big, 3), 2 << 20}} {
+				if err := v.stageData(w.p, w.off); err != nil {
+					return err
+				}
+			}
+			return v.flush()
+		})
+	})
+	t.Run("forced past the bound, Lazy group (hfsplus#61)", func(t *testing.T) {
+		// The open group is flushed first: a failure of its write is returned.
+		faultSweep(t, "forced-bound-lazy", func(v *Volume) {
+			if err := v.SetDurability(DurabilityLazy); err != nil {
+				t.Fatal(err)
+			}
+			if err := v.MkDir("/m", 0o755); err != nil { // joins the group
+				t.Fatal(err)
+			}
+			v.jw.zones = []span{{2 << 20, 2<<20 + v.jw.dataBound()*3}}
+		}, func(v *Volume) error {
+			return v.stageData(pat(int(v.jw.dataBound())*3, 3), 2<<20)
+		})
+	})
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
 			setup(v)
