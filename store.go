@@ -347,8 +347,10 @@ func (v *Volume) flush() error {
 	if v.jw != nil {
 		// Journal writes are on (the default on a journaled volume). A commit at Strict
 		// or Mounted is a journal transaction, its file data journaled or ordered
-		// (journal_data.go); Lazy writes directly, which first empties the journal: a
-		// direct write with transactions pending would be overwritten by their replay.
+		// (journal_data.go); a Lazy commit joins the in-memory group (below). Only a
+		// commit the journal cannot take writes directly, which first empties the
+		// journal: a direct write with transactions pending would be overwritten by
+		// their replay.
 		if v.groupMode() {
 			// Lazy: the commit joins the group (journal_group.go). When it does not fit
 			// beside what the group holds, the group is flushed first and the commit starts
