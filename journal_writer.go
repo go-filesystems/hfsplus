@@ -187,7 +187,8 @@ func (v *Volume) enableJournalWrites() error {
 	// fsync a no-op (store.go), so the journal would run with none and a crash could
 	// leave an emptied or advanced header over blocks that never landed. The same
 	// refusal as the replay at open (replay_write.go). A nil writer is the in-memory
-	// image or a file the volume owns (OpenFileWritable gives it a Sync).
+	// image only; OpenFileWritable passes its *os.File, which has a Sync and so
+	// passes this check (hfsplus#55).
 	if v.wa != nil {
 		if _, ok := v.wa.(interface{ Sync() error }); !ok {
 			return fmt.Errorf("%w: the writer cannot Sync, so the commits could not be ordered", ErrJournalWritesUnavailable)
