@@ -171,9 +171,25 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   Since v0.18.0 (PR 6 of hfsplus#45) the journal is the default at `Strict` and `Mounted` on a journaled
   volume, so on that volume both levels now run the code of the `EnableJournalWrites` row and cost what it
   costs; the `Strict` and `Mounted` rows above are what they cost on a journaled volume that falls back, and on
-  a non-journaled one. **That the default path reproduces the 4.37 ms row has not been re-measured**: the
-  measurement was deferred because the machine's 1-minute load was 63 to 82 at the time (the rule is below 8).
-  The barrier counts, which do not depend on load, are asserted by `TestJournalWritesDefaultOn`: 2, 1, 1 at both levels.
+  a non-journaled one. The barrier counts, which do not depend on load, are asserted by
+  `TestJournalWritesDefaultOn`: 2, 1, 1 at both levels.
+
+  Re-measured at v0.19.0 (2026-11-24, clean checkout of the tag, 1-min load 6.73 at the start, same test,
+  30 interleaved rounds, medians of rounds 2-30), create + 1 byte + fsync:
+
+  | Driver | Time | Barriers |
+  |---|--:|--:|
+  | macOS, HFS+ | 5.25 ms | (kernel) |
+  | macOS, Journaled HFS+ | 8.73 ms | (kernel) |
+  | `Strict` (default), Journaled HFS+ image | **4.27 ms** | 1 |
+  | `EnableJournalWrites`, Journaled HFS+ image | 4.38 ms | 1 |
+  | `Strict`, non-journaled image | 14.76 ms | 3 |
+  | `Mounted`, non-journaled image | 8.71 ms | 2 |
+
+  The default path reproduces the journal-writes row: on a journaled volume `Strict` is now 2.0x faster than
+  macOS's own driver on the same kind of volume, and faster than macOS on plain HFS+. mkdir and Chtimes on the
+  journaled image cost 4.26 ms and 4.38 ms (1 barrier). The first round, which includes the session's first
+  commit (2 barriers), is reported apart in the test log. One run on one machine.
 - **Journaled volumes.** `fsck_hfs -q`, the quick check macOS runs before mounting, exits 0 on a
   journaled volume whatever the unmounted bit says (it trusts the journal), so on a journaled volume
   the cleared bit alone would not get a half-written volume checked. The commit therefore also clears
@@ -337,7 +353,8 @@ them and `fsck_hfs -fn` then exits 0. The volume is not inconsistent; why fsck's
 metadata commit (1 barrier) took 4.2 ms, the first commit of a session (2 barriers) 8.7 ms, against 12.8 ms for
 today's strict path (3 barriers) and 8.6 / 10.3 ms for macOS's own create / mkdir on Journaled HFS+.
 Since v0.16.0 a commit with small file data also takes 1 barrier: 4.37 ms for create + 1 byte + fsync
-on a quiet machine, against 9.41 ms for macOS on Journaled HFS+ (table above). The design's 2.5-3 ms
+on a quiet machine, against 9.41 ms for macOS on Journaled HFS+ (table above); the v0.19.0 default
+measured 4.27 ms against 8.73 ms. The design's 2.5-3 ms
 estimate is still not met, because one `F_FULLFSYNC` costs about 4 ms here. A hypothesis, **not measured**: the kernel's journal barrier is
 `DKIOCSYNCHRONIZE` with the barrier option (`hfs_journal.c:469-482`), roughly `F_BARRIERFSYNC` and cheaper
 than `F_FULLFSYNC`; this driver does not offer it and this PR does not change the barrier.
