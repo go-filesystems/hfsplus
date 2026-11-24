@@ -55,7 +55,8 @@ const (
 	// GROUP COMMIT: a commit writes nothing and pays no barrier, its sectors (and
 	// small file data) are kept in memory, and Sync, Close, a switch away from Lazy
 	// or the group's size bound write them as ONE journal transaction (one barrier,
-	// two for a session's first; none when nothing is pending). The volume is never
+	// two for a session's first; a Sync right after pays one more for the flush's in-place
+	// writes, then none). The volume is never
 	// marked dirty, a crash leaves the volume as of the last flush (a prefix of whole
 	// commits), and the stale-data exposure below does not exist: data written in
 	// place goes only into blocks no durable state references, ordered by a barrier

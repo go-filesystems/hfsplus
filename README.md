@@ -96,7 +96,7 @@ opening costs a few KiB whatever the image size, and the 64 GiB in-memory ceilin
   | `DurabilityMounted` | 2 | 1 | 2 | 1 | yes | marked dirty until `Sync`/`Close` |
   | `DurabilityLazy` | 1 | 0 | 0 | 2 | no, only after `Sync`/`Close` | marked dirty until `Sync`/`Close` |
   | `Strict` or `Mounted`, journaled volume, journal writes on (**default since v0.18.0**) | 2 | 1 | 1 (small data) | 0 or 1 | yes | mounted, journal live; `Close` marks it clean |
-  | `Lazy` or `Batch`, journaled volume, journal writes on (**v0.19.0**) | 0 | 0 | 0 (large data: written in place, ordered by one barrier before the transaction) | 2 for a session's first flush, 1 after, 0 when nothing is pending | no, only after `Sync`/`Close`/a level switch | mounted, journal live, never marked dirty |
+  | `Lazy` or `Batch`, journaled volume, journal writes on (**v0.19.0**) | 0 | 0 | 0 (large data: written in place, ordered by one barrier before the transaction) | 2 for a session's first flush, 1 after; the first `Sync` after a flush pays 1 more (its in-place writes), then 0 | no, only after `Sync`/`Close`/a level switch | mounted, journal live, never marked dirty |
 
   The first three rows are the direct path: every non-journaled volume, and a journaled volume that fell back
   (see "Writing through the journal"). The fourth row replaces the `Strict` and `Mounted` rows on a journaled

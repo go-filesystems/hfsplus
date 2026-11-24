@@ -114,8 +114,12 @@ func TestGroupBarrierCounts(t *testing.T) {
 		}
 		return v.Sync()
 	})
+	// The flush's in-place writes are made durable by the next barrier (jw.pending,
+	// as for Strict): the first Sync after a flush pays it, the next pays nothing.
+	step("Sync after a flush (its in-place writes)", 1, v.Sync)
 	step("Sync with nothing pending", 0, v.Sync)
 	step("Batch", 1, func() error { return v.Batch(func() error { return v.MkDir("/e", 0o755) }) })
+	step("Sync after the Batch", 1, v.Sync)
 	step("Batch of nothing", 0, func() error { return v.Batch(func() error { return nil }) })
 	names := replayedNames(t, path)
 	if want := []string{"b", "d000", "d001", "d002", "d003", "e", "g"}; !slices.Equal(names, want) {
