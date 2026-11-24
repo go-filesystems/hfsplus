@@ -114,7 +114,7 @@ func TestWritableOpenRefusesJournalRewrittenByReplay(t *testing.T) {
 	}{
 		{"flags: not inside the volume", func(jib []byte) { binary.BigEndian.PutUint32(jib[0:], 0) }, "not inside the volume"},
 		{"journal moved outside the volume", func(jib []byte) { binary.BigEndian.PutUint64(jib[36:], 1<<40) }, "outside the volume"},
-		{"journal size changed", func(jib []byte) { binary.BigEndian.PutUint64(jib[44:], 0x40000) }, "differs"},
+		{"journal size changed to one past the volume", func(jib []byte) { binary.BigEndian.PutUint64(jib[44:], 1<<40) }, "outside the volume"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
