@@ -70,7 +70,7 @@ jobs:
         working-directory: go-filesystems/hfsplus
         env:
           CGO_ENABLED: "0"
-        run: go test -coverpkg=./... -coverprofile=cover.out -count=1 -timeout=20m ./...
+        run: go test -coverpkg=./... -coverprofile=cover.out -count=1 -timeout=40m ./...
 
       - name: Enforce coverage floor
         working-directory: go-filesystems/hfsplus

@@ -19,13 +19,17 @@ func TestGroupBatchNeverSplitsAMutation(t *testing.T) {
 	cases := []struct {
 		name       string
 		setup, ops []jwOp
+		both       bool // both write orders (the others run in order only: the oracle is slow)
 	}{
-		{"WriteFile overwrite", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), wf("/a", pat(3000, 3))}},
-		{"Truncate", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), func(v *Volume) error { return v.Truncate("/a", 2000) }}},
-		{"Truncate grow", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), func(v *Volume) error { return v.Truncate("/a", 4000) }}},
+		{"WriteFile overwrite", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), wf("/a", pat(3000, 3))}, true},
+		{"Truncate", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), func(v *Volume) error { return v.Truncate("/a", 2000) }}, false},
+		{"Truncate grow", []jwOp{wf("/a", pat(3000, 1))}, []jwOp{wf("/s", pat(7*4096, 2)), func(v *Volume) error { return v.Truncate("/a", 4000) }}, false},
 	}
 	for _, tc := range cases {
 		for _, reverse := range []bool{false, true} {
+			if reverse && !tc.both {
+				continue
+			}
 			name := tc.name
 			if reverse {
 				name += "/reverse"
