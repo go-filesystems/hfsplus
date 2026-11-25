@@ -35,6 +35,9 @@ func fragmentedImage(t *testing.T) (img, frag []byte) {
 	if err := v.WriteFile("/frag.bin", frag, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := v.Symlink(string(frag[:nblk*int(v.vh.BlockSize)-1]), "/frag.lnk"); err != nil {
+		t.Fatal(err)
+	}
 	r, err := v.lookupPath("/frag.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +141,13 @@ func TestQueryReadFaults(t *testing.T) {
 				return "", fmt.Errorf("wrong bytes: %d, want %d", len(b), len(frag))
 			}
 			return fmt.Sprint(len(b)), err
+		},
+		"ReadLinkFragmented": func(v *Volume) (string, error) {
+			s, err := v.ReadLink("/frag.lnk")
+			if err == nil && s != string(frag[:len(s)]) {
+				return "", fmt.Errorf("wrong target of %d bytes", len(s))
+			}
+			return fmt.Sprint(len(s)), err
 		},
 		"ReadLink": func(v *Volume) (string, error) {
 			return v.ReadLink("/s")

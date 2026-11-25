@@ -133,10 +133,11 @@ func (v *Volume) readUnder(p []byte, off int64) (int, error) {
 }
 
 // dropReadCache forgets every cached page (after anything was written).
+//
+// There is no cacheOn test: a volume without a cache has a nil rcache, and clear of
+// a nil map does nothing, so the guard only skipped an uncontended lock (mutsweep,
+// hfsplus#55: deleting it changed no behaviour any test can see).
 func (v *Volume) dropReadCache() {
-	if !v.cacheOn {
-		return
-	}
 	v.rcMu.Lock()
 	clear(v.rcache)
 	v.rcMu.Unlock()
