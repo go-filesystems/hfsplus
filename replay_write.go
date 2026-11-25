@@ -137,6 +137,9 @@ func replayPending(st replayStore, size int64) error {
 	if _, err := checkWritableExtent(st, size, vh); err != nil {
 		return err
 	}
+	if err := journalPlacement(loc, vh); err != nil {
+		return err
+	}
 	var lmv [4]byte
 	if _, err := st.ReadAt(lmv[:], vhLastMountedVersionOff); err != nil {
 		return fmt.Errorf("%w: lastMountedVersion cannot be read: %v", ErrJournaled, err)

@@ -31,9 +31,11 @@ func TestJournalHeaderOldMagicAndEndianField(t *testing.T) {
 			h    []byte
 			ok   bool
 		}{
-			{"JHDR", legacyJournalHeader(bo, nil), true},
-			{"JHDR, endian field zero", legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[4:], 0) }), true},
-			{"JHDR, no checksum", legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[36:], 0) }), true},
+			// 'JHDR' as found (little-endian) only: a swapped one fails Apple's
+			// journal_open at :1979 (the security review of v0.19.0..main).
+			{"JHDR", legacyJournalHeader(bo, nil), bo == binary.LittleEndian},
+			{"JHDR, endian field zero", legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[4:], 0) }), bo == binary.LittleEndian},
+			{"JHDR, no checksum", legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[36:], 0) }), bo == binary.LittleEndian},
 			{"JNLx, endian field zero", func() []byte {
 				h := buildJournalHeader(bo, 0x4400, 0x4400, 0x80000, false)
 				bo.PutUint32(h[4:], 0)
@@ -46,7 +48,8 @@ func TestJournalHeaderOldMagicAndEndianField(t *testing.T) {
 				resignJournalHeader(h)
 				return h
 			}(), true},
-			// The checksum is Apple's for 'JNLx' only (hfs_journal.c:1986-1994).
+			// This reader checks the 'JNLx' checksum; Apple's check does not refuse
+			// (hfs_journal.c:1988-1993), so this is stricter than Apple.
 			{"JNLx, bad checksum", buildJournalHeader(bo, 0x4400, 0x4400, 0x80000, true), false},
 			{"unknown magic", legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[0:], 0x4a484453) }), false},
 		}
@@ -74,7 +77,8 @@ func TestJournalHeaderOldMagicAndEndianField(t *testing.T) {
 // no longer refuses it), and the writer leaves a 'JNLx' header with a valid
 // checksum and the endian field, in the journal's byte order.
 func TestJournalOldMagicOpensAndIsRewritten(t *testing.T) {
-	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+	// Little-endian only: a swapped 'JHDR' is refused (TestJournalSwappedOldMagicIsRefused).
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian} {
 		h := legacyJournalHeader(bo, func(h []byte) { bo.PutUint32(h[4:], 0) })
 		img, _, jBlock := journaledImage(t, kJIJournalInFSMask, h, 0x80000)
 		v, err := OpenWritable(img, nil)

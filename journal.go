@@ -86,10 +86,12 @@ func decodeJournalHeader(h []byte) (journalHeader, error) {
 	if len(h) < journalHeaderLen {
 		return journalHeader{}, fmt.Errorf("%w: journal header is truncated", ErrJournaled)
 	}
-	// The magic alone says the byte order and the era of the header: Apple's
-	// journal_open takes JOURNAL_HEADER_MAGIC ('JNLx') or OLD_JOURNAL_HEADER_MAGIC
-	// ('JHDR') as found or byte-swapped (core/hfs_journal.c:1979, :1997) and never
-	// reads the endian field (hfsplus#48), so neither does this decoder.
+	// The magic alone says the byte order and the era of the header, and the endian
+	// field is never read (hfsplus#48). Apple's journal_open takes 'JNLx' as found
+	// or byte-swapped and swaps the header for the swapped one only (core/hfs_journal.c
+	// :1969); 'JHDR' is accepted only as found (a swapped 'JHDR' fails at :1979).
+	// The host that wrote the volume is a little-endian Mac, so 'JHDR' is read
+	// little-endian only.
 	var bo binary.ByteOrder
 	var legacy bool
 	switch m := h[0:4]; {
@@ -97,8 +99,6 @@ func decodeJournalHeader(h []byte) (journalHeader, error) {
 		bo = binary.BigEndian
 	case binary.LittleEndian.Uint32(m) == journalHeaderMagic:
 		bo = binary.LittleEndian
-	case binary.BigEndian.Uint32(m) == journalOldHeaderMagic:
-		bo, legacy = binary.BigEndian, true
 	case binary.LittleEndian.Uint32(m) == journalOldHeaderMagic:
 		bo, legacy = binary.LittleEndian, true
 	default:
@@ -117,8 +117,11 @@ func decodeJournalHeader(h []byte) (journalHeader, error) {
 	// means is the journal_header struct (44 bytes, through jhdr_size), not the
 	// whole jhdr_size-byte sector: a header written by macOS 27.2 verifies only
 	// that way (see macJournalHeader in journal_test.go).
-	// Apple verifies it for 'JNLx' only (hfs_journal.c:1986-1994): a 'JHDR' header
-	// predates the checksum and is converted at open, so none is checked for it.
+	// Apple does not enforce the 'JNLx' checksum either: the code that compares it
+	// is there, but the goto that would refuse is commented out
+	// (hfs_journal.c:1988-1993). This reader keeps the check for 'JNLx', which is
+	// stricter than Apple's; a 'JHDR' header predates the checksum, so none is
+	// checked for it.
 	if !legacy {
 		var buf [journalHeaderLen]byte
 		copy(buf[:], h)
@@ -144,6 +147,41 @@ func journalChecksum(b []byte) uint32 {
 		c = (c << 8) ^ (c + int32(x))
 	}
 	return uint32(^c)
+}
+
+// journalPlacement refuses a journal whose ring [off, off+size) covers the primary
+// volume header, the alternate one, or the journal info block: the writes of a
+// replay or of the journal writer would overwrite them (hfsplus#48 review). Apple
+// does not check it, and a reader never writes the ring, so only the writable
+// opens call it.
+func journalPlacement(loc journalLoc, vh *volumeHeader) error {
+	lo, hi := loc.off, loc.off+loc.hdr.size
+	bs := uint64(vh.BlockSize)
+	volEnd := uint64(vh.TotalBlocks) * bs
+	jib := uint64(vh.JournalInfoBlock) * bs
+	for _, p := range []struct {
+		name   string
+		lo, hi uint64
+	}{
+		{"primary volume header", volumeHeaderOffset, volumeHeaderOffset + 512},
+		{"alternate volume header", volEnd - 1024, volEnd - 512},
+		{"journal info block", jib, jib + bs},
+	} {
+		if lo < p.hi && p.lo < hi {
+			return fmt.Errorf("%w: the journal [%d, %d) covers the %s at %d", ErrJournaled, lo, hi, p.name, p.lo)
+		}
+	}
+	return nil
+}
+
+// checkJournalPlacement is journalPlacement for a volume still to be opened for
+// writing; a volume with no journal, or a journal never initialised, passes.
+func checkJournalPlacement(r io.ReaderAt, imgSize int64, vh *volumeHeader) error {
+	// Whatever else is wrong with the journal is reported by checkJournal, which every
+	// writable open runs first; loadJournalAt leaves loc empty for no journal, a journal
+	// never initialised, and every error, and an empty ring [0, 0) covers nothing.
+	_, loc, _ := loadJournalAt(r, imgSize, vh)
+	return journalPlacement(loc, vh)
 }
 
 // checkJournal inspects the journal of the volume held in img. A volume that is
@@ -204,8 +242,16 @@ func inspectJournalAt(r io.ReaderAt, imgSize int64, vh *volumeHeader, loc *journ
 		return st, fmt.Errorf("%w: journal is not inside the volume (flags %#x)", ErrJournaled, flags)
 	}
 	off, size := binary.BigEndian.Uint64(jib[36:44]), binary.BigEndian.Uint64(jib[44:52])
-	if off > uint64(imgSize) || size > uint64(imgSize)-off || size < journalHeaderLen {
+	if off > uint64(imgSize) || size > uint64(imgSize)-off {
 		return st, fmt.Errorf("%w: journal at %d, size %d, is outside the volume", ErrJournaled, off, size)
+	}
+	// The journal info block's size is held to what Apple's journal_open holds the
+	// size it is given: 256 KiB to 1 GiB (core/hfs_journal.c:1905) and a multiple of
+	// the sector size (:1918), 512 here; hfs_vfsutils.c:2628 passes the info block's
+	// jib_size. Without it the replay rewrites a 512-byte header past a declared
+	// extent of 44 bytes.
+	if size < 256*1024 || size > 1<<30 || size%512 != 0 {
+		return st, fmt.Errorf("%w: journal info block size %d is outside [256 KiB, 1 GiB] or not a multiple of 512", ErrJournaled, size)
 	}
 	hdr := make([]byte, min(uint64(imgSize)-off, maxJournalHeaderBytes))
 	if n, err := r.ReadAt(hdr, int64(off)); n < len(hdr) {

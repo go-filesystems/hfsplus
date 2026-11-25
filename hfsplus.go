@@ -300,6 +300,9 @@ func (v *Volume) enableWrites(under io.ReaderAt, size int64, cache bool) error {
 	if err != nil {
 		return err
 	}
+	if err := checkJournalPlacement(under, size, v.vh); err != nil {
+		return err
+	}
 	v.altOff = volEnd - 1024
 	v.wr = true
 	v.under = under
