@@ -192,7 +192,7 @@ func TestCheckJournal(t *testing.T) {
 		// Apple never compares the header's size with the info block's (hfsplus#48).
 		{"info block size larger than the header's", kJIJournalInFSMask, empty, size + 4096, nil, ""},
 		{"info block size smaller than the header's", kJIJournalInFSMask, empty, size - 4096, nil, ""},
-		{"size too small", kJIJournalInFSMask, empty, 8, nil, "outside the volume"},
+		{"size too small", kJIJournalInFSMask, empty, 8, nil, "info block size"},
 		{"size past the volume", kJIJournalInFSMask, empty, 1 << 40, nil, "outside the volume"},
 		// What Apple's journal_open refuses (hfs_journal.c:2019-2033 start/end <= 0
 		// or above size; :2046, :2053 not a multiple of 512).
@@ -416,6 +416,14 @@ func FuzzCheckJournal(f *testing.F) {
 	f.Add(true, int64(36), bytes.Repeat([]byte{0xff}, 16))
 	f.Add(false, int64(8), []byte{0x00, 0x60})
 	f.Add(false, int64(0), []byte{0})
+	// The cases of hfsplus#48 and its security review: the old magic as found, and
+	// byte-swapped (refused); a header size that differs from the info block's, both
+	// ways; an info block size that is not a sector multiple.
+	f.Add(false, int64(0), []byte("RDHJ"))
+	f.Add(false, int64(0), []byte("JHDR"))
+	f.Add(true, int64(44), []byte{0, 0, 0, 0, 0, 0x10, 0, 0})
+	f.Add(true, int64(44), []byte{0, 0, 0, 0, 0, 0x04, 0, 0})
+	f.Add(true, int64(44), []byte{0, 0, 0, 0, 0, 0x08, 0, 7})
 	f.Fuzz(func(t *testing.T, inJIB bool, off int64, patch []byte) {
 		if off < 0 || off > 512 || len(patch) == 0 || len(patch) > 512 {
 			return
@@ -455,15 +463,27 @@ func FuzzCheckJournal(f *testing.F) {
 		}
 		joff, size := be.Uint64(jib[36:44]), be.Uint64(jib[44:52])
 		h := img[joff:]
-		var bo binary.ByteOrder = binary.LittleEndian
-		if be.Uint32(h[0:4]) == journalHeaderMagic {
+		// The rules of Apple's journal_open (hfs_journal.c, hfs-715.100.10) and of
+		// hfsplus#48: 'JNLx' in either order, 'JHDR' as found (little-endian) only,
+		// the endian field and the header-vs-info-block size comparison ignored; the
+		// info block's size within [256 KiB, 1 GiB] and a multiple of 512 (:1905, :1918).
+		var bo binary.ByteOrder
+		switch m := h[0:4]; {
+		case be.Uint32(m) == journalHeaderMagic:
 			bo = be
+		case binary.LittleEndian.Uint32(m) == journalHeaderMagic, binary.LittleEndian.Uint32(m) == journalOldHeaderMagic:
+			bo = binary.LittleEndian
+		default:
+			t.Fatalf("accepted the magic % x", m)
 		}
 		start, end, jsize, jhdr := bo.Uint64(h[8:16]), bo.Uint64(h[16:24]), bo.Uint64(h[24:32]), uint64(bo.Uint32(h[40:44]))
 		if start != end {
 			t.Fatalf("accepted start %d != end %d", start, end)
 		}
-		if jsize != size || jsize < 256*1024 || jsize > 1<<30 || jhdr < journalHeaderLen || jhdr > jsize || start == 0 || start > jsize || start%512 != 0 {
+		if size < 256*1024 || size > 1<<30 || size%512 != 0 {
+			t.Fatalf("accepted the info block size %d", size)
+		}
+		if jsize < 256*1024 || jsize > 1<<30 || jsize > uint64(len(img))-joff || jhdr < journalHeaderLen || jhdr > jsize || start == 0 || start > jsize || start%512 != 0 {
 			t.Fatalf("accepted out-of-range header: start %d end %d size %d (info block %d) jhdr_size %d", start, end, jsize, size, jhdr)
 		}
 	})
