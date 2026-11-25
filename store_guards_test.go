@@ -353,3 +353,19 @@ func TestReopenOnAnUnreadableImage(t *testing.T) {
 		t.Errorf("reopen = %v, want the read's error", err)
 	}
 }
+
+// readAll reports a fork whose last byte is past the end of the image as corrupt,
+// and a read that FAILED as that failure (not as a corrupt image).
+func TestForkProbeErrors(t *testing.T) {
+	v := openMem(t, 4<<20, FormatConfig{Label: "PROBE"})
+	past := &fork{vol: v, size: 100, extents: []extentDescriptor{{StartBlock: 1 << 28, BlockCount: 1}}}
+	if _, err := past.readAll(); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("a fork past the end of the image: %v, want ErrCorrupt", err)
+	}
+	v.under = erringReaderAt{}
+	v.cacheOn = false
+	broken := &fork{vol: v, size: 100, extents: []extentDescriptor{{StartBlock: 10, BlockCount: 1}}}
+	if _, err := broken.readAll(); !errors.Is(err, errInjectedRead) || errors.Is(err, ErrCorrupt) {
+		t.Errorf("a fork whose read fails: %v, want the read's error alone", err)
+	}
+}

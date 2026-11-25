@@ -4,6 +4,7 @@
 package hfsplus
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -114,7 +115,11 @@ func (f *fork) readAll() ([]byte, error) {
 	// 4 MiB image.
 	var probe [1]byte
 	if _, err := f.readAt(probe[:], f.size-1); err != nil {
-		return nil, fmt.Errorf("%w: fork claims %d bytes, past the end of the image", ErrCorrupt, f.size)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: fork claims %d bytes, past the end of the image", ErrCorrupt, f.size)
+		}
+		// A read that failed says nothing about the fork: it is the store's error.
+		return nil, err
 	}
 	capacity := f.vol.capacity()
 	if capacity < 0 {

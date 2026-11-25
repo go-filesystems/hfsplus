@@ -6,6 +6,7 @@ package hfsplus
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -188,6 +189,11 @@ func TestQueryReadFaults(t *testing.T) {
 				got, err := op(v)
 				if err != nil {
 					failed++
+					// The only fault is the injected one: it is the error reported, not a
+					// corrupt-image or not-found error built from the failed read.
+					if !errors.Is(err, errInjectedRead) {
+						t.Errorf("read %d of %s fails: the error is %v, not the injected read failure", n, name, err)
+					}
 					continue
 				}
 				if got != want {
