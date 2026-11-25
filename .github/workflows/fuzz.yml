@@ -4,12 +4,11 @@ name: fuzz
 # intermittently exits non-zero with "context deadline exceeded" when a worker does
 # not wind down within -fuzztime even though no crasher was found, which made it a
 # false-red PR gate. The deterministic seed-corpus run stays in ci.yml (blocking).
-# The fuzz step tolerates fuzzrun's exit 1 when it is the benign deadline flake, but
-# a CRASH is red: the exit status cannot tell the two apart, so the step reads
-# fuzzrun's summary line ("N targets: N PASS, N FAIL, N CRASH") and fails on a
-# non-zero CRASH count. A crasher's input is uploaded as an artifact (add it under
-# testdata/fuzz to turn it into a permanent ci.yml regression case). Exit 2, a run
-# that could not be made, is red.
+# Since fuzzrun v0.7.0 (go-fleettools/fuzzrun#17) that deadline flake is a verdict
+# of its own, DEADLINE, which exits 0; exit 1 is a CRASH or a FAIL and exit 2 a run
+# that could not be made. So the step takes fuzzrun's exit status as it is, and every
+# non-zero one is red. A crasher's input is uploaded as an artifact (add it under
+# testdata/fuzz to turn it into a permanent ci.yml regression case).
 #
 # The targets are NOT listed here. fuzzrun finds every `func FuzzXxx(f *testing.F)`
 # by parsing the test files, so a new target is fuzzed without anyone remembering
@@ -31,36 +30,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version: '1.27.4' }
-      # fuzzrun exits 2 when the run could not be made (no targets, go missing,
-      # a toolchain it refuses): that is red. It exits 1 for a CRASH or for the
-      # benign deadline flake: tolerated here, the summary names any crasher and
-      # its corpus is uploaded below. A blanket continue-on-error hid exactly the
-      # first case: a run that never started was reported green.
+      # Exit 0: every target passed or reached the deadline (DEADLINE). Exit 1: a
+      # CRASH or a FAIL. Exit 2: the run could not be made. No tolerance, no
+      # continue-on-error: the step's status is fuzzrun's, so a crasher is red.
       - name: fuzz every target (found by parsing, not listed)
-        run: |
-          set +e
-          go run github.com/go-fleettools/fuzzrun@v0.5.0 run --time 3m --jobs 2 --parallel 2 --logs fuzz-logs > fuzz-summary.txt 2>&1
-          status=$?
-          cat fuzz-summary.txt
-          if [ "$status" -ge 2 ]; then
-            echo "::error::fuzzrun could not run (exit $status)"
-            exit "$status"
-          fi
-          # Exit 1 does not say which: the exit status is the same for a crash and for
-          # the deadline flake, but the summary line "N targets: N PASS, N FAIL, N CRASH"
-          # (fuzzrun cmd.go, v0.5.0) counts a target as CRASH only when go test printed
-          # "Failing input written to testdata/fuzz/...". A crash turns the nightly red;
-          # a run with no such summary line is red too (it did not say what happened).
-          if [ "$status" -eq 1 ]; then
-            if ! grep -Eq '^[0-9]+ targets: [0-9]+ PASS, [0-9]+ FAIL, [0-9]+ CRASH$' fuzz-summary.txt; then
-              echo "::error::fuzzrun exited 1 without its summary line"
-              exit 1
-            fi
-            if grep -Eq ' [1-9][0-9]* CRASH$' fuzz-summary.txt; then
-              echo "::error::a fuzz target crashed (see the summary and the fuzz-findings artifact)"
-              exit 1
-            fi
-          fi
+        run: go run github.com/go-fleettools/fuzzrun@v0.9.0 run --time 3m --jobs 2 --parallel 2 --logs fuzz-logs
       - name: upload any fuzz-discovered corpus
         if: always()
         uses: actions/upload-artifact@v7
