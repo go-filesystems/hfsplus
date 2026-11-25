@@ -5,6 +5,7 @@ package hfsplus
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -102,12 +103,31 @@ func TestOpenWritableRefusals(t *testing.T) {
 // and does not leave the file open (hfsplus#55).
 func TestOpenFilePathRefusals(t *testing.T) {
 	dir := t.TempDir()
-	if v, err := OpenFile(filepath.Join(dir, "missing.img")); err == nil || v != nil {
-		t.Errorf("a missing file: %v, %v", v, err)
+	// The error is the open's own, not a later stat of a nil file (which also fails).
+	if v, err := OpenFile(filepath.Join(dir, "missing.img")); !errors.Is(err, fs.ErrNotExist) || v != nil {
+		t.Errorf("a missing file: %v, %v; want ErrNotExist", v, err)
+	}
+	// A handle whose Stat fails (here: closed) is refused as a stat error, with no panic.
+	closed, err := os.Create(filepath.Join(dir, "closed.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	if v, err := openHandle(closed, "closed.img"); !errors.Is(err, os.ErrClosed) || v != nil {
+		t.Errorf("a closed handle: %v, %v; want os.ErrClosed", v, err)
 	}
 	junk := filepath.Join(dir, "junk.img")
 	if err := os.WriteFile(junk, make([]byte, 8192), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if v, err := OpenFileWritable(filepath.Join(dir, "missing.img")); !errors.Is(err, fs.ErrNotExist) || v != nil {
+		t.Errorf("a missing file, writable: %v, %v; want ErrNotExist", v, err)
+	}
+	if v, err := openWritableHandle(closed, "closed.img"); !errors.Is(err, os.ErrClosed) || v != nil {
+		t.Errorf("a closed handle, writable: %v, %v; want os.ErrClosed", v, err)
+	}
+	if v, err := OpenFileWritable(junk); err == nil || v != nil {
+		t.Errorf("a file of zeros, writable: %v, %v", v, err)
 	}
 	if v, err := OpenFile(junk); err == nil || v != nil {
 		t.Errorf("a file of zeros: %v, %v", v, err)

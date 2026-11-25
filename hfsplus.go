@@ -234,6 +234,11 @@ func OpenFile(path string, opts ...OpenOption) (*Volume, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hfsplus: open %s: %w", path, err)
 	}
+	return openHandle(f, path, opts...)
+}
+
+// openHandle opens the volume in the already-opened f, which it closes on failure.
+func openHandle(f *os.File, path string, opts ...OpenOption) (*Volume, error) {
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -339,6 +344,12 @@ func OpenFileWritable(path string) (*Volume, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hfsplus: open %s: %w", path, err)
 	}
+	return openWritableHandle(f, path)
+}
+
+// openWritableHandle opens the volume in the already-opened f for read/write; f is
+// closed on failure and, on success, by Volume.Close.
+func openWritableHandle(f *os.File, path string) (*Volume, error) {
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -430,9 +441,10 @@ func (v *Volume) Bytes() []byte {
 // primary volume header, with an fsync after each stage), so this is a final
 // fsync; it is a no-op for read-only or purely in-memory volumes.
 func (v *Volume) Sync() error {
-	if !v.wr {
-		return nil
-	}
+	// No test of v.wr here: on a volume that was not opened for writing, failed,
+	// held, unsynced, jw, grp and wa are all unset (only enableWrites and the
+	// mutators set them), so settle reaches fsync with no writer and returns nil
+	// without touching anything (TestSyncReadOnlyIsANoOp).
 	if v.failed != nil {
 		// A write or fsync failed earlier. A retried fsync may succeed (the
 		// kernel reports an error once, then forgets it: fsyncgate) without the
