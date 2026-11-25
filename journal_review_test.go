@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,28 @@ func TestJournalInfoBlockSizeIsHeld(t *testing.T) {
 				t.Error("the refused open changed the image")
 			}
 		})
+	}
+}
+
+// The same placement, with transactions pending: the replay at open would write
+// the ring's blocks and the header over the info block, so it is refused before
+// anything is written (replay_write.go).
+func TestReplayOfAJournalOverTheInfoBlockIsRefused(t *testing.T) {
+	const size = 0x80000
+	h := buildJournalHeader(binary.LittleEndian, 512, 1024, size, false)
+	img, jibBlock, _ := journaledImage(t, kJIJournalInFSMask, h, size)
+	jibOff := int64(jibBlock) * 4096
+	at := jibOff - 512
+	binary.BigEndian.PutUint64(img[jibOff+36:], uint64(at))
+	copy(img[at:at+512], h)
+	copy(img[vhLastMountedVersionOff:], "HFSJ")
+	before := bytes.Clone(img)
+	v, err := OpenWritable(img, nil)
+	if !errors.Is(err, ErrJournaled) || v != nil || !strings.Contains(err.Error(), "covers") {
+		t.Fatalf("volume %t, err %v; want ErrJournaled naming the covered structure", v != nil, err)
+	}
+	if !bytes.Equal(img, before) {
+		t.Error("the refused open changed the image")
 	}
 }
 

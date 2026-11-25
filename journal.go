@@ -177,12 +177,12 @@ func journalPlacement(loc journalLoc, vh *volumeHeader) error {
 // checkJournalPlacement is journalPlacement for a volume still to be opened for
 // writing; a volume with no journal, or a journal never initialised, passes.
 func checkJournalPlacement(r io.ReaderAt, imgSize int64, vh *volumeHeader) error {
-	if vh.Attributes&kHFSVolumeJournaledBit == 0 {
+	// Whatever else is wrong with the journal is reported by checkJournal, which every
+	// writable open runs first; loadJournalAt leaves loc empty for no journal, a journal
+	// never initialised, and every error.
+	_, loc, _ := loadJournalAt(r, imgSize, vh)
+	if loc.hdr.size == 0 {
 		return nil
-	}
-	_, loc, err := loadJournalAt(r, imgSize, vh)
-	if err != nil || loc.hdr.size == 0 {
-		return err
 	}
 	return journalPlacement(loc, vh)
 }
