@@ -179,11 +179,8 @@ func journalPlacement(loc journalLoc, vh *volumeHeader) error {
 func checkJournalPlacement(r io.ReaderAt, imgSize int64, vh *volumeHeader) error {
 	// Whatever else is wrong with the journal is reported by checkJournal, which every
 	// writable open runs first; loadJournalAt leaves loc empty for no journal, a journal
-	// never initialised, and every error.
+	// never initialised, and every error, and an empty ring [0, 0) covers nothing.
 	_, loc, _ := loadJournalAt(r, imgSize, vh)
-	if loc.hdr.size == 0 {
-		return nil
-	}
 	return journalPlacement(loc, vh)
 }
 
