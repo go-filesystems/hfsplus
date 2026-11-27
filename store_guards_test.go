@@ -250,8 +250,56 @@ func TestStampOnAnUnreadableHeader(t *testing.T) {
 	v := openMem(t, 4<<20, FormatConfig{Label: "STAMP"})
 	v.altOff = 1 << 40
 	var p, a []writeRun
-	if err := v.stampLastMountedVersion(&p, &a); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := v.stampLastMountedVersion(&p, &a); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("stamp with the alternate header outside the image: %v, want ErrCorrupt", err)
+	}
+}
+
+// flush itself refuses when the stamp cannot load a header, and writes nothing: the
+// guard after stampLastMountedVersion is held by this assertion, not by the panic
+// a nil header buffer would raise further down.
+func TestFlushOnAnUnreadableAlternateHeader(t *testing.T) {
+	// Strict is the commit that uses the stamped buffers directly: with the guard
+	// deleted it indexes a nil buffer. The recover turns that panic into this test's
+	// own failure, so the guard is held by an assertion and not by the crash.
+	v := openMem(t, 4<<20, FormatConfig{Label: "STAMPF"})
+	if err := v.SetDurability(DurabilityStrict); err != nil {
+		t.Fatal(err)
+	}
+	v.altOff = 1 << 40
+	v.dataDirty = true // otherwise there is nothing to flush
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("flush with the alternate header outside the image panicked: %v, want ErrCorrupt", r)
+		}
+	}()
+	if err := v.flush(); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("flush with the alternate header outside the image = %v, want ErrCorrupt", err)
+	}
+}
+
+// The invariant that lets flush not ask region for the headers a second time
+// (hfsplus#55): stamp hands back the live buffers of both header regions, and asking
+// region again returns those very slices with no error, so the second call was a
+// branch that could not be taken.
+func TestStampReturnsTheLiveHeaders(t *testing.T) {
+	v := openMem(t, 4<<20, FormatConfig{Label: "STAMP"})
+	var p, a []writeRun
+	bp, ba, err := v.stampLastMountedVersion(&p, &a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []struct {
+		off int64
+		buf []byte
+	}{{volumeHeaderOffset, bp}, {v.altOff, ba}} {
+		again, err := v.region(h.off, 512)
+		if err != nil {
+			t.Fatalf("region(%d) after stamp: %v", h.off, err)
+		}
+		if len(h.buf) != 512 || &again[0] != &h.buf[0] {
+			t.Errorf("region(%d) after stamp is not the buffer stamp returned", h.off)
+		}
 	}
 }
 
