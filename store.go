@@ -391,7 +391,8 @@ func (v *Volume) flush() error {
 			return err
 		}
 	}
-	if err := v.stampLastMountedVersion(&hdrP, &hdrA); err != nil {
+	bufP, bufA, err := v.stampLastMountedVersion(&hdrP, &hdrA)
+	if err != nil {
 		return err
 	}
 	old := make([]byte, 512)
@@ -420,12 +421,10 @@ func (v *Volume) flush() error {
 		// that), which the bracket write below takes away.
 		for _, h := range []struct {
 			off int64
+			buf []byte
 			dst *[]writeRun
-		}{{pOff, &hdrP}, {aOff, &hdrA}} {
-			b, err := v.region(h.off, 512)
-			if err != nil {
-				return err
-			}
+		}{{pOff, bufP, &hdrP}, {aOff, bufA, &hdrA}} {
+			b := h.buf
 			if v.cleanOnDisk {
 				b[vhAttributes+2] |= kHFSVolumeUnmountedBit >> 8
 			}
@@ -487,22 +486,29 @@ const vhLastMountedVersion = 8
 // stampLastMountedVersion sets lastMountedVersion in the primary and alternate
 // header of the transaction being committed, and refreshes their changed runs.
 // A volume already carrying the signature is not touched.
-func (v *Volume) stampLastMountedVersion(hdrP, hdrA *[]writeRun) error {
-	for _, h := range []struct {
+//
+// It returns the live buffers of the two headers (primary, alternate): they are
+// regions of this transaction from here on, so a caller needing them again is
+// handed them rather than asking region a second time, which would be a branch
+// that cannot fail (TestStampReturnsTheLiveHeaders asserts the identity).
+func (v *Volume) stampLastMountedVersion(hdrP, hdrA *[]writeRun) (bufP, bufA []byte, err error) {
+	var bufs [2][]byte
+	for i, h := range []struct {
 		off int64
 		dst *[]writeRun
 	}{{volumeHeaderOffset, hdrP}, {v.altOff, hdrA}} {
 		b, err := v.region(h.off, 512)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
+		bufs[i] = b
 		if string(b[vhLastMountedVersion:vhLastMountedVersion+4]) == lastMountedVersion {
 			continue
 		}
 		copy(b[vhLastMountedVersion:], lastMountedVersion)
 		*h.dst = changedRuns(v.regions[h.off])
 	}
-	return nil
+	return bufs[0], bufs[1], nil
 }
 
 // commitDone drops the transaction's edit state after a commit reached the store.

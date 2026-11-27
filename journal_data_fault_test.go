@@ -142,6 +142,21 @@ func TestJournalDataFaults(t *testing.T) {
 			return v.stageData(pat(int(v.jw.dataBound())*3, 3), 2<<20)
 		})
 	})
+	t.Run("forged forced block reaches flush's writeStaged (hfsplus#55)", func(t *testing.T) {
+		// A revoke-forced block (one a replay could reach) that verifies as a block list
+		// header can be neither journaled nor written in place under the journal: the
+		// commit takes the direct path, empties the journal, and flush's own writeStaged
+		// puts the staged block in place. A failure of that write is returned and nothing
+		// follows it.
+		data := forgedHeader(binary.LittleEndian, 0)
+		faultSweep(t, "forced-forged", setup, func(v *Volume) error {
+			err := v.WriteFile("/b", data, 0o644)
+			if err == nil && v.journaling() && v.jw.active {
+				t.Error("the commit did not fall back: the sweep reaches no flush writeStaged")
+			}
+			return err
+		})
+	})
 	t.Run("direct fallback with data", func(t *testing.T) {
 		faultSweep(t, "fallback", func(v *Volume) {
 			setup(v)
