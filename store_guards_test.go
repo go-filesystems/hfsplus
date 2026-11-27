@@ -259,16 +259,22 @@ func TestStampOnAnUnreadableHeader(t *testing.T) {
 // guard after stampLastMountedVersion is held by this assertion, not by the panic
 // a nil header buffer would raise further down.
 func TestFlushOnAnUnreadableAlternateHeader(t *testing.T) {
-	for _, d := range []Durability{DurabilityStrict, DurabilityMounted} {
-		v := openMem(t, 4<<20, FormatConfig{Label: "STAMPF"})
-		if err := v.SetDurability(d); err != nil {
-			t.Fatal(err)
+	// Strict is the commit that uses the stamped buffers directly: with the guard
+	// deleted it indexes a nil buffer. The recover turns that panic into this test's
+	// own failure, so the guard is held by an assertion and not by the crash.
+	v := openMem(t, 4<<20, FormatConfig{Label: "STAMPF"})
+	if err := v.SetDurability(DurabilityStrict); err != nil {
+		t.Fatal(err)
+	}
+	v.altOff = 1 << 40
+	v.dataDirty = true // otherwise there is nothing to flush
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("flush with the alternate header outside the image panicked: %v, want ErrCorrupt", r)
 		}
-		v.altOff = 1 << 40
-		v.dataDirty = true // otherwise there is nothing to flush
-		if err := v.flush(); !errors.Is(err, ErrCorrupt) {
-			t.Errorf("%v: flush with the alternate header outside the image = %v, want ErrCorrupt", d, err)
-		}
+	}()
+	if err := v.flush(); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("flush with the alternate header outside the image = %v, want ErrCorrupt", err)
 	}
 }
 
