@@ -255,6 +255,23 @@ func TestStampOnAnUnreadableHeader(t *testing.T) {
 	}
 }
 
+// flush itself refuses when the stamp cannot load a header, and writes nothing: the
+// guard after stampLastMountedVersion is held by this assertion, not by the panic
+// a nil header buffer would raise further down.
+func TestFlushOnAnUnreadableAlternateHeader(t *testing.T) {
+	for _, d := range []Durability{DurabilityStrict, DurabilityMounted} {
+		v := openMem(t, 4<<20, FormatConfig{Label: "STAMPF"})
+		if err := v.SetDurability(d); err != nil {
+			t.Fatal(err)
+		}
+		v.altOff = 1 << 40
+		v.dataDirty = true // otherwise there is nothing to flush
+		if err := v.flush(); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%v: flush with the alternate header outside the image = %v, want ErrCorrupt", d, err)
+		}
+	}
+}
+
 // The invariant that lets flush not ask region for the headers a second time
 // (hfsplus#55): stamp hands back the live buffers of both header regions, and asking
 // region again returns those very slices with no error, so the second call was a
